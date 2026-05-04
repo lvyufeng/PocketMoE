@@ -521,6 +521,14 @@ def generate(
     decode_profile_rank = int(os.environ.get("DEEPSEEK_DECODE_PROFILE_RANK", "0") or "0")
     decode_step_idx = 0
     profiler_active = None  # holds the torch.profiler context manager when sampling.
+    # Phase 1 MTP probe: when DEEPSEEK_MTP_LOG=1 we run mtp[0] after each
+    # decode step to produce a draft token, then on the NEXT step compare
+    # the draft against the actual main argmax. This validates the MTP
+    # head's IO contract without changing decode behavior.
+    mtp_log_enabled = os.environ.get("DEEPSEEK_MTP_LOG", "0").lower() in {"1", "true", "yes"}
+    pending_drafts = None  # tensor [b] of last-step MTP drafts, or None
+    mtp_accept = 0
+    mtp_total = 0
     prev_pos = 0
     finished = torch.tensor([False] * len(prompt_tokens))
     prompt_mask = tokens != -1
@@ -558,8 +566,16 @@ def generate(
         step_start = time.perf_counter()
         if temperature > 0:
             logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            last_hidden = None
         else:
-            next_token = model.forward(tokens[:, prev_pos:cur_pos], prev_pos, return_next_token=True)
+            if mtp_log_enabled and prev_pos > 0:
+                next_token, last_hidden = model.forward(
+                    tokens[:, prev_pos:cur_pos], prev_pos,
+                    return_next_token=True, return_hidden=True,
+                )
+            else:
+                next_token = model.forward(tokens[:, prev_pos:cur_pos], prev_pos, return_next_token=True)
+                last_hidden = None
             logits = None
         step_time = time.perf_counter() - step_start
         if capture_this and profiler_active is not None:
@@ -600,10 +616,36 @@ def generate(
             next_token = sample(logits, temperature)
         next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
         tokens[:, cur_pos] = next_token
+        # Phase 1 MTP probe: verify the previous step's MTP draft against this
+        # step's actual main argmax (only meaningful for unmasked positions in
+        # decode mode). Then run MTP once to produce the next draft.
+        if mtp_log_enabled and temperature == 0 and last_hidden is not None and prev_pos > 0:
+            unmasked = ~prompt_mask[:, cur_pos]
+            if pending_drafts is not None and unmasked.any():
+                match = (pending_drafts == next_token) & unmasked
+                mtp_accept += int(match.sum().item())
+                mtp_total += int(unmasked.sum().item())
+            # Produce draft for position cur_pos+1 using h at position cur_pos-1
+            # and the just-sampled token at position cur_pos.
+            try:
+                pending_drafts = model.draft_with_mtp(
+                    last_hidden[:, -1:],
+                    next_token.unsqueeze(-1),
+                    cur_pos - 1,
+                )
+            except Exception as exc:
+                if not dist.is_initialized() or dist.get_rank() == 0:
+                    print(f"[mtp_log] draft failed at cur_pos={cur_pos}: {exc}", flush=True)
+                pending_drafts = None
         finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
         prev_pos = cur_pos
         if finished.all():
             break
+    if mtp_log_enabled and (not dist.is_initialized() or dist.get_rank() == 0):
+        if mtp_total > 0:
+            print(f"[mtp_log] accept_rate {mtp_accept}/{mtp_total} = {mtp_accept / mtp_total:.3f}", flush=True)
+        else:
+            print("[mtp_log] no decode steps were measured", flush=True)
     completion_tokens = []
     for i, toks in enumerate(tokens.tolist()):
         toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]

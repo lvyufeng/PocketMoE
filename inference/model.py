@@ -1991,7 +1991,7 @@ class Transformer(nn.Module):
             layer.release_gpu_prefill_moe_cache()
 
     @torch.inference_mode()
-    def forward(self, input_ids: torch.Tensor, start_pos: int = 0, return_next_token: bool = False):
+    def forward(self, input_ids: torch.Tensor, start_pos: int = 0, return_next_token: bool = False, return_hidden: bool = False):
         h = self.embed(input_ids)
         # Expand to hc_mult copies for Hyper-Connections
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
@@ -2001,9 +2001,35 @@ class Transformer(nn.Module):
             prefetch_next = self.layers[layer_idx + 1] if layer_idx + 1 < len(self.layers) else None
             h = layer(h, start_pos, input_ids, prefetch_next=prefetch_next)
         if return_next_token:
-            return self.head.next_token(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
+            next_token = self.head.next_token(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
+            if return_hidden:
+                return next_token, h
+            return next_token
         logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
+        if return_hidden:
+            return logits, h
         return logits
+
+    @torch.inference_mode()
+    def draft_with_mtp(self, h: torch.Tensor, input_ids: torch.Tensor, start_pos: int) -> torch.Tensor:
+        """Run a single MTP block over (h, input_ids) and return the greedy draft token.
+
+        h:         [b, s, hc_mult, dim] — last main backbone hidden state at positions
+                   [start_pos-s+1 .. start_pos]. Caller typically slices h[:, -1:] when
+                   only the most recent position matters.
+        input_ids: [b, s] — the tokens at the same positions as h.
+        start_pos: position of the FIRST entry in input_ids (matches the convention used
+                   by Transformer.forward / Block.forward).
+
+        Returns a token tensor of shape [b] — argmax of the MTP logits at the last
+        position, i.e. the draft token for position (start_pos + s).
+        """
+        if not self.mtp:
+            raise RuntimeError("draft_with_mtp called but Transformer has no MTP layers")
+        logits = self.mtp[0](h, start_pos, input_ids)  # MTPBlock already calls head; returns [b, vocab]
+        # head.get_logits already slices x[:, -1] internally and head.forward all-gathers
+        # across TP world_size, so logits is [b, vocab] for the LAST position only.
+        return logits.argmax(dim=-1)
 
 
 if __name__ == "__main__":

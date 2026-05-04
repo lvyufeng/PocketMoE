@@ -72,16 +72,25 @@
 #    extra condition-variable handshake; left at default off.
 #
 # Tried but NOT adopted (rationale documented so we do not retry blindly):
-# - pmaddubsw sign-trick rewrite of dot_i8_avx2 / dot_i8_avx2_pair.
+# - pmaddubsw sign-trick rewrite of dot_i8_avx2 / dot_i8_avx2_pair / dot_i8_avx2_4.
 #   dot_microbench.cpp shows ~2.0x throughput on the inner kernel
 #   (30 -> 60 GiB/s @ dim=2048/4096) and is exact-match in [-127,127] domain.
-#   End-to-end on long_long, however, the gain disappears even under the
-#   performance governor: A/B over 7 runs gave baseline {1.846, 1.914, 1.536,
-#   1.926} vs pmaddubsw {1.930, 1.865, 1.925} TPS -- mean delta +0.6%, well
-#   inside the per-run +/-10% jitter. The kernel is ~7% of decode wallclock,
-#   and OMP barrier + GPU phase switch + allreduce dominate. Re-evaluate only
-#   if the OMP synchronization path becomes much shorter or VNNI hardware
-#   replaces this AVX2-only Broadwell node.
+#   First A/B (pre-overlap, inline CPU MoE): mean delta +0.6%, dismissed as
+#   inside +/-10% jitter because OMP was not on the critical path then.
+#   Re-A/B'd under the async-overlap config (this build, optimization #6) on
+#   the hypothesis that with submit_forward dispatching off-thread the OMP
+#   wall is now the bottleneck. DEEPSEEK_BENCH_GOVERNOR_PIN=1 long_long over
+#   3 runs: pmaddubsw {2.473, 2.393, 2.323} TPS (mean 2.396) vs
+#   baseline {2.417, 2.370, 2.392} (mean 2.393), delta +0.1% -- still
+#   indistinguishable from jitter. Why: the overlap path means sync_forward
+#   only blocks for `max(0, OMP_done_after - GPU_done_after)`. With shared
+#   experts + NCCL allreduce on the side stream covering ~1.7 ms of GPU
+#   time per layer and OMP taking only ~3 ms, the residual blocking wait
+#   is small enough that compressing OMP further mostly converts it into
+#   slack the side stream cannot use. Re-evaluate after CPU MoE itself
+#   becomes the dominant unhidden critical path again (e.g. with much
+#   larger batches, or after CUDA Graph capture cuts GPU time so OMP
+#   no longer fits in the side-stream window).
 #   Source preserved as research artefact: dot_microbench.cpp.
 # - cuBLAS IMMA replacement of int8_gemm_rows_kernel for the per-token decode
 #   GEMMs (wq_a / wq_b / wkv / wo_b / indexer.wq_b / shared_expert pair).

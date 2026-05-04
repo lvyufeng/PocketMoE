@@ -2307,6 +2307,10 @@ __global__ void fused_kv_rope_actquant_kernel(
     const float* __restrict__ norm_w,           // [kv_dim], fp32 (matches RMSNorm.weight)
     const float* __restrict__ freqs_real,
     const float* __restrict__ freqs_imag,
+    c10::BFloat16* __restrict__ kv_cache_out,   // optional [B, cache_len, kv_dim] dest
+    int cache_stride_batch,                     // kv_cache.stride(0) (== cache_len * kv_dim)
+    int cache_slot,                             // slot inside cache (= start_pos % win)
+    int batches_per_kvcache,                    // == B; row -> b = row / S
     int total_rows,
     int S,
     int kv_dim,
@@ -2398,6 +2402,18 @@ __global__ void fused_kv_rope_actquant_kernel(
     __syncthreads();
 
     for (int i = tid; i < kv_dim; i += kThreads) kv_row[i] = float_to_bf16(buf[i]);
+
+    // Optional: also write the produced row into kv_cache_out[b, cache_slot, :].
+    // Decode path uses S == 1 and a single slot per batch, so we just pick row->b
+    // and write to the same offset inside the cache buffer. This eliminates the
+    // Python-side `self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)` and its
+    // 80+ select/copy_/as_strided dispatcher ops per layer per step.
+    if (kv_cache_out != nullptr) {
+        const int b = row / S;
+        c10::BFloat16* cache_row =
+            kv_cache_out + b * cache_stride_batch + cache_slot * kv_dim;
+        for (int i = tid; i < kv_dim; i += kThreads) cache_row[i] = float_to_bf16(buf[i]);
+    }
 }
 
 }  // namespace (fused attn prefuse)
@@ -2432,7 +2448,9 @@ void fused_kv_rope_actquant_inplace_cuda(
     const torch::Tensor& freqs_real,
     const torch::Tensor& freqs_imag,
     int64_t block_size,
-    double norm_eps) {
+    double norm_eps,
+    const c10::optional<torch::Tensor>& kv_cache_out,
+    int64_t cache_slot) {
     c10::cuda::CUDAGuard device_guard(kv.device());
     const int B = static_cast<int>(kv.size(0));
     const int S = static_cast<int>(kv.size(1));
@@ -2444,14 +2462,312 @@ void fused_kv_rope_actquant_inplace_cuda(
     const int q_dim = kv_dim - rd;
     const int n_blocks = q_dim / static_cast<int>(block_size);
     const size_t smem_bytes = sizeof(float) * (kv_dim + kWarps + n_blocks);
+
+    c10::BFloat16* cache_ptr = nullptr;
+    int cache_stride_batch = 0;
+    int slot = 0;
+    if (kv_cache_out.has_value() && kv_cache_out->defined()) {
+        const auto& cache = *kv_cache_out;
+        cache_ptr = cache.data_ptr<c10::BFloat16>();
+        cache_stride_batch = static_cast<int>(cache.stride(0));
+        slot = static_cast<int>(cache_slot);
+    }
+
     fused_kv_rope_actquant_kernel<kThreads>
         <<<total_rows, kThreads, smem_bytes, at::cuda::getCurrentCUDAStream()>>>(
             kv.data_ptr<c10::BFloat16>(),
             norm_weight.data_ptr<float>(),
             freqs_real.data_ptr<float>(),
             freqs_imag.data_ptr<float>(),
+            cache_ptr,
+            cache_stride_batch,
+            slot,
+            B,
             total_rows, S, kv_dim, rd,
             static_cast<int>(block_size),
             static_cast<float>(norm_eps));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// =====================================================================
+// cuBLAS IMMA INT8 GEMM (Plan #1)
+//
+// Replaces int8_gemm_rows_kernel for the per-token decode INT8 GEMMs
+// (wq_a / wq_b / wkv / wo_b / indexer.wq_b / shared_expert pair). cuBLAS
+// IMMA on Turing SM75 needs M/N/K aligned to 16; all decode shapes here
+// satisfy that. Output is dequantized straight to bf16, which also
+// removes the outer .to(bf16) the Python caller used to do after the
+// dp4a path returned fp32.
+//
+// quantize_rows_kernel above already produces x_q [rows, K] int8 +
+// x_scale [rows] fp32; we reuse it. cuBLAS produces int32 [rows, N];
+// then dequant_int32_to_bf16_kernel multiplies by x_scale[row] *
+// weight_s[col] and writes bf16.
+// =====================================================================
+
+namespace {
+
+__global__ void dequant_int32_to_bf16_kernel(
+    const int32_t* __restrict__ acc,        // [rows, n]
+    const float* __restrict__ x_scale,      // [rows]
+    const float* __restrict__ weight_s,     // [n]
+    c10::BFloat16* __restrict__ out,        // [rows, n]
+    int rows,
+    int n) {
+    const int row = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= n || row >= rows) return;
+    const float xs = x_scale[row];
+    const float ws = weight_s[col];
+    const float v = static_cast<float>(acc[row * n + col]) * xs * ws;
+    out[row * n + col] = c10::BFloat16(v);
+}
+
+}  // namespace
+
+torch::Tensor int8_gemm_imma_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_q,
+    const torch::Tensor& weight_s) {
+    c10::cuda::CUDAGuard device_guard(x.device());
+    auto x_contig = x.contiguous();
+    auto wq_contig = weight_q.contiguous();
+    auto ws_contig = weight_s.contiguous();
+
+    const auto k = static_cast<int>(x_contig.size(-1));
+    const auto n = static_cast<int>(weight_q.size(0));
+    const auto rows = static_cast<int>(x_contig.numel() / k);
+
+    auto x_q = torch::empty({rows, k}, x.options().dtype(torch::kInt8));
+    auto x_scale = torch::empty({rows}, x.options().dtype(torch::kFloat32));
+    auto acc = torch::empty({rows, n}, x.options().dtype(torch::kInt32));
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const dim3 quant_grid(rows, 1);
+    const dim3 quant_block(kQuantThreads);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x_contig.scalar_type(), "imma_quantize", [&] {
+        quantize_rows_kernel<scalar_t><<<quant_grid, quant_block, 0, stream>>>(
+            x_contig.data_ptr<scalar_t>(),
+            x_q.data_ptr<int8_t>(),
+            x_scale.data_ptr<float>(),
+            rows,
+            1,
+            k);
+    });
+
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetStream(handle, stream);
+    const int alpha = 1;
+    const int beta = 0;
+    // cuBLAS is column-major. We want C [rows, n] = X [rows, k] * W^T [k, n]
+    // with X row-major and W stored row-major as [N, K]. Treat both as
+    // column-major transposed: compute (W * X^T)^T = X * W^T by issuing
+    //   GEMM(op_a=T, op_b=N, m=n, n=rows, k=k, A=W [n,k]^T row-major == col-major [k,n]^T,
+    //        B=X^T row-major == col-major [k,rows], ldc=n).
+    // The simpler/equivalent formulation used elsewhere in this file is
+    //   cublasGemmEx(OP_T, OP_N, n, m=rows, k, A=W row-major, lda=k,
+    //                B=X row-major (but logically X^T col-major), ldb=k, ldc=n).
+    auto status = cublasGemmEx(
+        handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        n,
+        rows,
+        k,
+        &alpha,
+        wq_contig.data_ptr<int8_t>(),
+        CUDA_R_8I,
+        k,
+        x_q.data_ptr<int8_t>(),
+        CUDA_R_8I,
+        k,
+        &beta,
+        acc.data_ptr<int32_t>(),
+        CUDA_R_32I,
+        n,
+        CUBLAS_COMPUTE_32I,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "int8_gemm_imma cublasGemmEx failed: ", status);
+
+    auto out = torch::empty({rows, n}, x.options().dtype(torch::kBFloat16));
+    constexpr int kThreads = 128;
+    const dim3 deq_grid(ceil_div(n, kThreads), rows);
+    const dim3 deq_block(kThreads);
+    dequant_int32_to_bf16_kernel<<<deq_grid, deq_block, 0, stream>>>(
+        acc.data_ptr<int32_t>(),
+        x_scale.data_ptr<float>(),
+        ws_contig.data_ptr<float>(),
+        out.data_ptr<c10::BFloat16>(),
+        rows,
+        n);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    auto out_shape = x.sizes().vec();
+    out_shape.back() = n;
+    return out.view(out_shape);
+}
+
+torch::Tensor int8_gemm_pair_imma_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_q0,
+    const torch::Tensor& weight_s0,
+    const torch::Tensor& weight_q1,
+    const torch::Tensor& weight_s1) {
+    c10::cuda::CUDAGuard device_guard(x.device());
+    auto x_contig = x.contiguous();
+    auto wq0_contig = weight_q0.contiguous();
+    auto ws0_contig = weight_s0.contiguous();
+    auto wq1_contig = weight_q1.contiguous();
+    auto ws1_contig = weight_s1.contiguous();
+
+    const auto k = static_cast<int>(x_contig.size(-1));
+    const auto n = static_cast<int>(weight_q0.size(0));
+    const auto rows = static_cast<int>(x_contig.numel() / k);
+
+    auto x_q = torch::empty({rows, k}, x.options().dtype(torch::kInt8));
+    auto x_scale = torch::empty({rows}, x.options().dtype(torch::kFloat32));
+    auto acc0 = torch::empty({rows, n}, x.options().dtype(torch::kInt32));
+    auto acc1 = torch::empty({rows, n}, x.options().dtype(torch::kInt32));
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const dim3 quant_grid(rows, 1);
+    const dim3 quant_block(kQuantThreads);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x_contig.scalar_type(), "imma_pair_quantize", [&] {
+        quantize_rows_kernel<scalar_t><<<quant_grid, quant_block, 0, stream>>>(
+            x_contig.data_ptr<scalar_t>(),
+            x_q.data_ptr<int8_t>(),
+            x_scale.data_ptr<float>(),
+            rows,
+            1,
+            k);
+    });
+
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetStream(handle, stream);
+    const int alpha = 1;
+    const int beta = 0;
+
+    auto run_gemm = [&](int8_t* w_ptr, int32_t* out_ptr) {
+        auto status = cublasGemmEx(
+            handle,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            n,
+            rows,
+            k,
+            &alpha,
+            w_ptr,
+            CUDA_R_8I,
+            k,
+            x_q.data_ptr<int8_t>(),
+            CUDA_R_8I,
+            k,
+            &beta,
+            out_ptr,
+            CUDA_R_32I,
+            n,
+            CUBLAS_COMPUTE_32I,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "int8_gemm_pair_imma cublasGemmEx failed: ", status);
+    };
+    run_gemm(wq0_contig.data_ptr<int8_t>(), acc0.data_ptr<int32_t>());
+    run_gemm(wq1_contig.data_ptr<int8_t>(), acc1.data_ptr<int32_t>());
+
+    auto out_shape = x.sizes().vec();
+    out_shape.back() = n;
+    auto out0 = torch::empty({rows, n}, x.options().dtype(torch::kBFloat16));
+    auto out1 = torch::empty({rows, n}, x.options().dtype(torch::kBFloat16));
+
+    constexpr int kThreads = 128;
+    const dim3 deq_grid(ceil_div(n, kThreads), rows);
+    const dim3 deq_block(kThreads);
+    dequant_int32_to_bf16_kernel<<<deq_grid, deq_block, 0, stream>>>(
+        acc0.data_ptr<int32_t>(),
+        x_scale.data_ptr<float>(),
+        ws0_contig.data_ptr<float>(),
+        out0.data_ptr<c10::BFloat16>(),
+        rows,
+        n);
+    dequant_int32_to_bf16_kernel<<<deq_grid, deq_block, 0, stream>>>(
+        acc1.data_ptr<int32_t>(),
+        x_scale.data_ptr<float>(),
+        ws1_contig.data_ptr<float>(),
+        out1.data_ptr<c10::BFloat16>(),
+        rows,
+        n);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return torch::stack({out0.view(out_shape), out1.view(out_shape)}, 0);
+}
+
+// =====================================================================
+// Inverse RoPE on the trailing rd dims of o [B, S, H, D] (Plan #2).
+//
+// Replaces apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True) which
+// is 6 PyTorch dispatches per layer (unflatten/view_as_complex/conj/mul/
+// view_as_real/flatten + copy_). Inverse rope uses conj(freqs_cis), i.e.
+// (a + bi) * (cr - ci*i) = (a*cr + b*ci) + (b*cr - a*ci) i.
+//
+// One block per (token, head); blockDim covers rd/2 pairs.
+// =====================================================================
+
+namespace {
+
+template <int kThreads>
+__global__ void fused_o_inverse_rope_kernel(
+    c10::BFloat16* __restrict__ o,
+    const float* __restrict__ freqs_real,
+    const float* __restrict__ freqs_imag,
+    int total_rows,
+    int H,
+    int S,
+    int D,
+    int rd) {
+    const int row = blockIdx.x;
+    if (row >= total_rows) return;
+    const int s_idx = (row / H) % S;
+    const int tid = threadIdx.x;
+
+    c10::BFloat16* o_row = o + row * D;
+    const int rope_start = D - rd;
+    const int npairs = rd >> 1;
+    for (int p = tid; p < npairs; p += kThreads) {
+        int re_idx = rope_start + 2 * p;
+        int im_idx = re_idx + 1;
+        float a = static_cast<float>(o_row[re_idx]);
+        float b = static_cast<float>(o_row[im_idx]);
+        float cr = freqs_real[s_idx * npairs + p];
+        float ci = freqs_imag[s_idx * npairs + p];
+        // inverse rope == multiply by conjugate(freqs):
+        // (a + bi)(cr - ci*i) = (a*cr + b*ci) + (b*cr - a*ci) i.
+        // Match apply_rotary_emb: complex multiply in fp32 then bf16
+        // round-trip on copy_.
+        o_row[re_idx] = c10::BFloat16(a * cr + b * ci);
+        o_row[im_idx] = c10::BFloat16(b * cr - a * ci);
+    }
+}
+
+}  // namespace (inverse rope)
+
+void fused_o_inverse_rope_inplace_cuda(
+    torch::Tensor& o,
+    const torch::Tensor& freqs_real,
+    const torch::Tensor& freqs_imag) {
+    c10::cuda::CUDAGuard device_guard(o.device());
+    const int B = static_cast<int>(o.size(0));
+    const int S = static_cast<int>(o.size(1));
+    const int H = static_cast<int>(o.size(2));
+    const int D = static_cast<int>(o.size(3));
+    const int rd = static_cast<int>(freqs_real.size(-1)) * 2;
+    const int total_rows = B * S * H;
+    constexpr int kThreads = 32;
+    fused_o_inverse_rope_kernel<kThreads>
+        <<<total_rows, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            o.data_ptr<c10::BFloat16>(),
+            freqs_real.data_ptr<float>(),
+            freqs_imag.data_ptr<float>(),
+            total_rows, H, S, D, rd);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

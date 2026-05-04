@@ -62,18 +62,60 @@
 #   if the OMP synchronization path becomes much shorter or VNNI hardware
 #   replaces this AVX2-only Broadwell node.
 #   Source preserved as research artefact: dot_microbench.cpp.
+# - cuBLAS IMMA replacement of int8_gemm_rows_kernel for the per-token decode
+#   GEMMs (wq_a / wq_b / wkv / wo_b / indexer.wq_b / shared_expert pair).
+#   Kernel is bit-identical to the dp4a baseline on every actual decode
+#   shape (test_int8_gemm_imma.py: max_abs=0 across 8 cases). End-to-end
+#   long_long under DEEPSEEK_BENCH_GOVERNOR_PIN=1: baseline TPS {2.057,
+#   2.097} vs IMMA {2.030, 1.847}, mean delta -6.6%. The dp4a kernel is
+#   36% of GPU time but GPU is ~92% idle waiting for the dispatcher and
+#   CPU MoE; saving GPU time does not help wallclock and the extra dequant
+#   kernel + int32 buffer allocations cost more dispatch overhead than
+#   they save. Code path remains in the tree behind DEEPSEEK_INT8_GEMM_IMMA=1
+#   so the analysis can be re-run after dispatcher overhead drops (e.g.
+#   after CUDA Graph capture). Source: cuda_kernel_impl.cu
+#   int8_gemm_imma_cuda / int8_gemm_pair_imma_cuda.
+# - Fused inverse-rope kernel for the attention back-end (collapses
+#   apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True) into one CUDA
+#   launch). Kernel is bit-exact (test_fused_attn_prefuse.py [o_inv]
+#   max_abs=0). End-to-end long_long under DEEPSEEK_BENCH_GOVERNOR_PIN=1:
+#   baseline {1.761, 2.074, 2.002} TPS (mean 1.946) vs inv-rope {2.089,
+#   2.007, 1.841} TPS (mean 1.979), delta +1.7% -- inside the per-run
+#   +/-10% jitter (baseline alone spans 17%). Same root cause as IMMA: the
+#   inverse rope is ~5 PyTorch dispatches/layer but GPU is dispatcher-bound,
+#   so trimming a handful of launches does not move wallclock. Code path
+#   stays in the tree behind DEEPSEEK_FUSED_ATTN_INV_ROPE=1 so the analysis
+#   can be re-run after CUDA Graph capture. Source: cuda_kernel_impl.cu
+#   fused_o_inverse_rope_inplace_cuda.
+# - Fold kv_cache write into fused_kv_rope_actquant_inplace (Plan B-小-v3).
+#   Kernel writes the produced row directly into kv_cache[:, start_pos %
+#   win, :], eliminating the Python-side `self.kv_cache[:bsz, slot] =
+#   kv.squeeze(1)` and its 80+ select/copy_/as_strided dispatcher ops per
+#   layer per step. Kernel bit-exact (test_fused_attn_prefuse.py
+#   [kv_cache] max_abs=0, no spillage to other slots). short_short greedy
+#   output bit-identical. End-to-end long_long under
+#   DEEPSEEK_BENCH_GOVERNOR_PIN=1: baseline {2.049, 2.054, 2.014} TPS (mean
+#   2.039) vs fold {2.036, 2.103, 1.797, 2.061} TPS (mean 1.999), delta
+#   -2.0% -- inside the +/-10% jitter. THIRD per-op fusion to hit the same
+#   dispatcher-bound ceiling (after IMMA and inv-rope). decode profile shows
+#   GPU is only ~12% of wallclock so trimming dispatches at the per-op level
+#   does not move TPS. Code stays in the tree behind
+#   DEEPSEEK_FUSED_KV_CACHE_FOLD=1 so it can be re-bench'd after CUDA Graph
+#   capture or async double-buffered CPU MoE lands. Source:
+#   cuda_kernel_impl.cu fused_kv_rope_actquant_kernel (kv_cache_out arm).
 #
 #
 # Reference numbers (4x RTX 2080 Ti, /tmp/dsv4_long_input_single.txt ~2k tokens,
-# arena ON + thread_local kernel + OMP=12, generate.py max_new=64 unless noted):
+# arena ON + thread_local kernel + OMP=12 + fused attn prefuse,
+# generate.py max_new=64 unless noted):
 #   schedutil governor (default):
 #     long/long  decode 1.63-1.85 TPS (high run-to-run jitter)
 #   performance governor (DEEPSEEK_BENCH_GOVERNOR_PIN=1):
-#     long/long  decode 1.85-1.93 TPS  (steady; outlier 1.54 if machine load spikes)
-#   short/short  prefill 4.81s   decode 1.81 TPS  (7 decoded tokens)
-#   short/long   prefill 3.63s   decode 1.80 TPS  (9 decoded tokens)
-#   long/short   prefill 13.02s  decode 1.72 TPS  (7 decoded tokens)
-#   long/long    prefill 13.6s   decode 1.87 TPS  (63 decoded tokens, sustained)
+#     long/long  decode 2.03-2.10 TPS  (steady)
+#   short/short  prefill 5.62s   decode 2.10 TPS  (7 decoded tokens)
+#   short/long   prefill 3.63s   decode 1.80 TPS  (9 decoded tokens, pre-prefuse)
+#   long/short   prefill 13.02s  decode 1.72 TPS  (7 decoded tokens, pre-prefuse)
+#   long/long    prefill 14.5s   decode 2.06 TPS  (63 decoded tokens, sustained)
 set -eo pipefail
 
 ROOT="/mnt/data1/dsv4_inference/inference"

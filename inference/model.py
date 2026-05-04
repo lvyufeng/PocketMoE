@@ -745,6 +745,33 @@ class Attention(nn.Module):
             # Built extension does not contain the new ops; disable rather than crash.
             self._fused_attn_prefuse_enabled = False
             self._fused_attn_prefuse_ext = None
+        # Plan B-小-v3 gate: fold the per-step kv_cache write into the fused_kv
+        # kernel. The kernel writes the produced row directly into
+        # kv_cache[:, start_pos % win, :] in addition to the inplace kv buffer,
+        # so the Python-side `self.kv_cache[:bsz, slot] = kv.squeeze(1)` and its
+        # 80+ select/copy_/as_strided dispatcher ops per layer per step are
+        # skipped. Default OFF: A/B over 7 long_long runs (governor pinned)
+        # gave baseline {2.049, 2.054, 2.014} vs fold {2.036, 2.103, 1.797,
+        # 2.061} -- mean delta -2.0% (1.999 vs 2.039), inside +/-10% jitter.
+        # Same dispatcher-bound failure pattern as IMMA / inv-rope: GPU is
+        # ~92% idle, so per-op fusion does not move wallclock. Re-test once
+        # CUDA Graph capture or async double-buffered MoE lands.
+        self._fused_kv_cache_fold_enabled = (
+            self._fused_attn_prefuse_enabled
+            and os.environ.get("DEEPSEEK_FUSED_KV_CACHE_FOLD", "0") == "1"
+        )
+
+        # Separate gate for the inverse-rope back-end fuse so we can A/B it
+        # without disabling the prefuse front-end. Default OFF: kernel is
+        # bit-exact but A/B over 6 long_long runs (governor pinned) showed mean
+        # delta +1.7% (baseline {1.761, 2.074, 2.002} vs inv-rope {2.089, 2.007,
+        # 1.841}), well inside the ±10% per-run jitter. Same pattern as IMMA:
+        # GPU is ~92% idle so saving 5 dispatches/layer does not move wallclock.
+        # Re-test once CUDA Graph capture lands.
+        self._fused_attn_inv_rope_enabled = (
+            self._fused_attn_prefuse_enabled
+            and os.environ.get("DEEPSEEK_FUSED_ATTN_INV_ROPE", "0") == "1"
+        )
 
         if self.compress_ratio:
             self.compressor = Compressor(args, self.compress_ratio, self.head_dim)
@@ -841,12 +868,28 @@ class Attention(nn.Module):
         t_q = mark()
 
         # win kv & topk_idxs
+        # Decide if the fused-kv kernel can also fold in the kv_cache slot
+        # write (decode-only fast path: seqlen == 1 and start_pos != 0).
+        kv_cache_fold = (
+            use_prefuse
+            and self._fused_kv_cache_fold_enabled
+            and seqlen == 1
+            and start_pos != 0
+            and bsz <= self.kv_cache.size(0)
+        )
         kv = self.wkv(x)
         if use_prefuse:
             fr, fi = self._get_prefuse_freqs(start_pos, seqlen)
-            self._fused_attn_prefuse_ext.fused_kv_rope_actquant_inplace(
-                kv, self.kv_norm.weight, fr, fi, 64, float(self.kv_norm.eps)
-            )
+            if kv_cache_fold:
+                self._fused_attn_prefuse_ext.fused_kv_rope_actquant_inplace(
+                    kv, self.kv_norm.weight, fr, fi, 64,
+                    float(self.kv_norm.eps),
+                    self.kv_cache, int(start_pos % win),
+                )
+            else:
+                self._fused_attn_prefuse_ext.fused_kv_rope_actquant_inplace(
+                    kv, self.kv_norm.weight, fr, fi, 64, float(self.kv_norm.eps)
+                )
         else:
             kv = self.kv_norm(kv)
             apply_rotary_emb(kv[..., -rd:], freqs_cis)
@@ -880,13 +923,18 @@ class Attention(nn.Module):
                 t_compressor = mark()
             o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         else:
-            self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
+            if not kv_cache_fold:
+                self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
             if self.compress_ratio:
                 self.compressor(x, start_pos)
                 t_compressor = mark()
             o = sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
         t_sparse = mark()
-        apply_rotary_emb(o[..., -rd:], freqs_cis, True)
+        if use_prefuse and self._fused_attn_inv_rope_enabled and o.is_cuda and o.dtype == torch.bfloat16 and hasattr(self._fused_attn_prefuse_ext, "fused_o_inverse_rope_inplace"):
+            fr, fi = self._get_prefuse_freqs(start_pos, seqlen)
+            self._fused_attn_prefuse_ext.fused_o_inverse_rope_inplace(o, fr, fi)
+        else:
+            apply_rotary_emb(o[..., -rd:], freqs_cis, True)
 
         # o
         o = o.view(bsz, seqlen, self.n_local_groups, -1)

@@ -1,5 +1,7 @@
 #include <torch/extension.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 torch::Tensor int8_gemm_forward_cuda(
@@ -142,7 +144,26 @@ void fused_kv_rope_actquant_inplace_cuda(
     const torch::Tensor& freqs_real,
     const torch::Tensor& freqs_imag,
     int64_t block_size,
-    double norm_eps);
+    double norm_eps,
+    const c10::optional<torch::Tensor>& kv_cache_out,
+    int64_t cache_slot);
+
+torch::Tensor int8_gemm_imma_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_q,
+    const torch::Tensor& weight_s);
+
+torch::Tensor int8_gemm_pair_imma_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_q0,
+    const torch::Tensor& weight_s0,
+    const torch::Tensor& weight_q1,
+    const torch::Tensor& weight_s1);
+
+void fused_o_inverse_rope_inplace_cuda(
+    torch::Tensor& o,
+    const torch::Tensor& freqs_real,
+    const torch::Tensor& freqs_imag);
 
 
 namespace {
@@ -151,6 +172,18 @@ void check_tensor(const torch::Tensor& tensor, const char* name, c10::ScalarType
     TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
     TORCH_CHECK(tensor.scalar_type() == dtype, name, " has unexpected dtype");
     TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+bool int8_gemm_imma_enabled() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("DEEPSEEK_INT8_GEMM_IMMA");
+        if (!v || !*v) return false;
+        if (std::strcmp(v, "0") == 0) return false;
+        if (std::strcmp(v, "false") == 0) return false;
+        if (std::strcmp(v, "False") == 0) return false;
+        return true;
+    }();
+    return enabled;
 }
 
 }  // namespace
@@ -176,6 +209,9 @@ torch::Tensor int8_gemm_forward(
         x.scalar_type() == torch::kFloat32,
         "x must be float16, bfloat16, or float32");
 
+    if (int8_gemm_imma_enabled() && (x.size(-1) % 16 == 0) && (weight_q.size(0) % 16 == 0)) {
+        return int8_gemm_imma_cuda(x, weight_q, weight_s);
+    }
     return int8_gemm_forward_cuda(x, weight_q, weight_s);
 }
 
@@ -202,6 +238,9 @@ torch::Tensor int8_gemm_pair_forward(
         x.scalar_type() == torch::kBFloat16 ||
         x.scalar_type() == torch::kFloat32,
         "x must be float16, bfloat16, or float32");
+    if (int8_gemm_imma_enabled() && (x.size(-1) % 16 == 0) && (weight_q0.size(0) % 16 == 0)) {
+        return int8_gemm_pair_imma_cuda(x, weight_q0, weight_s0, weight_q1, weight_s1);
+    }
     return int8_gemm_pair_forward_cuda(x, weight_q0, weight_s0, weight_q1, weight_s1);
 }
 
@@ -686,7 +725,9 @@ void fused_kv_rope_actquant_inplace(
     const torch::Tensor& freqs_real,
     const torch::Tensor& freqs_imag,
     int64_t block_size,
-    double norm_eps) {
+    double norm_eps,
+    const c10::optional<torch::Tensor>& kv_cache_out,
+    int64_t cache_slot) {
     TORCH_CHECK(kv.is_cuda() && kv.scalar_type() == at::kBFloat16 && kv.is_contiguous(), "kv must be CUDA bf16 contiguous");
     TORCH_CHECK(kv.dim() == 3, "kv must be [B, S, kv_dim]");
     TORCH_CHECK(norm_weight.is_cuda() && norm_weight.scalar_type() == at::kFloat, "norm_weight must be CUDA float32");
@@ -703,7 +744,42 @@ void fused_kv_rope_actquant_inplace(
     TORCH_CHECK(rd > 0 && rd < kv_dim && (rd % 2) == 0, "rd must be even and < kv_dim");
     const int q_dim = kv_dim - rd;
     TORCH_CHECK(block_size > 0 && (q_dim % block_size) == 0, "block_size must divide kv_dim - rd");
-    fused_kv_rope_actquant_inplace_cuda(kv, norm_weight, freqs_real, freqs_imag, block_size, norm_eps);
+    if (kv_cache_out.has_value() && kv_cache_out->defined()) {
+        const auto& cache = *kv_cache_out;
+        TORCH_CHECK(cache.is_cuda() && cache.scalar_type() == at::kBFloat16, "kv_cache_out must be CUDA bf16");
+        TORCH_CHECK(cache.dim() == 3, "kv_cache_out must be [B, cache_len, kv_dim]");
+        TORCH_CHECK(cache.size(0) >= kv.size(0), "kv_cache_out batch dim too small");
+        TORCH_CHECK(cache.size(2) == kv_dim, "kv_cache_out last dim must equal kv_dim");
+        TORCH_CHECK(cache.stride(2) == 1 && cache.stride(1) == kv_dim,
+                    "kv_cache_out must be contiguous on last two dims");
+        TORCH_CHECK(cache_slot >= 0 && cache_slot < cache.size(1),
+                    "cache_slot out of range");
+        // Decode-only fast path: writing one slot per batch row.
+        TORCH_CHECK(S == 1, "kv_cache_out path requires S == 1 (decode)");
+    }
+    fused_kv_rope_actquant_inplace_cuda(kv, norm_weight, freqs_real, freqs_imag,
+                                         block_size, norm_eps,
+                                         kv_cache_out, cache_slot);
+}
+
+void fused_o_inverse_rope_inplace(
+    torch::Tensor& o,
+    const torch::Tensor& freqs_real,
+    const torch::Tensor& freqs_imag) {
+    TORCH_CHECK(o.is_cuda(), "o must be CUDA");
+    TORCH_CHECK(o.scalar_type() == at::kBFloat16, "o must be bfloat16");
+    TORCH_CHECK(o.dim() == 4, "o must be [B, S, H, D]");
+    TORCH_CHECK(o.is_contiguous(), "o must be contiguous");
+    TORCH_CHECK(freqs_real.is_cuda() && freqs_imag.is_cuda(), "freqs must be CUDA");
+    TORCH_CHECK(freqs_real.scalar_type() == at::kFloat && freqs_imag.scalar_type() == at::kFloat, "freqs must be float32");
+    TORCH_CHECK(freqs_real.is_contiguous() && freqs_imag.is_contiguous(), "freqs must be contiguous");
+    TORCH_CHECK(freqs_real.dim() == 2 && freqs_imag.dim() == 2, "freqs must be [S, rd/2]");
+    const int S = static_cast<int>(o.size(1));
+    TORCH_CHECK(freqs_real.size(0) == S && freqs_imag.size(0) == S, "freqs S mismatch");
+    const int rd = static_cast<int>(freqs_real.size(1)) * 2;
+    const int D = static_cast<int>(o.size(3));
+    TORCH_CHECK(rd > 0 && rd <= D && (rd % 2) == 0, "rd must be even and <= D");
+    fused_o_inverse_rope_inplace_cuda(o, freqs_real, freqs_imag);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -724,5 +800,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_prefill_int8_grouped_gemm_forward", &moe_prefill_int8_grouped_gemm_forward, "prefill MoE grouped-GEMM int8 forward (CUDA)");
     m.def("moe_prefill_int8_fused_forward", &moe_prefill_int8_fused_forward, "prefill MoE fused gather/grouped/scatter int8 forward (CUDA)");
     m.def("fused_q_rmsnorm_rope_inplace", &fused_q_rmsnorm_rope_inplace, "fused per-head rmsnorm + rope on q (CUDA, bf16, in-place)");
-    m.def("fused_kv_rope_actquant_inplace", &fused_kv_rope_actquant_inplace, "fused kv_norm + rope + block-FP8 act_quant (CUDA, bf16, in-place)");
+    m.def("fused_kv_rope_actquant_inplace", &fused_kv_rope_actquant_inplace,
+          "fused kv_norm + rope + block-FP8 act_quant (CUDA, bf16, in-place); "
+          "optionally writes the result row into kv_cache_out[b, cache_slot, :] (decode S==1).",
+          pybind11::arg("kv"), pybind11::arg("norm_weight"),
+          pybind11::arg("freqs_real"), pybind11::arg("freqs_imag"),
+          pybind11::arg("block_size"), pybind11::arg("norm_eps"),
+          pybind11::arg("kv_cache_out") = c10::optional<torch::Tensor>(),
+          pybind11::arg("cache_slot") = static_cast<int64_t>(0));
+    m.def("fused_o_inverse_rope_inplace", &fused_o_inverse_rope_inplace, "inverse rope on attention output o (CUDA, bf16, in-place)");
 }

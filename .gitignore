@@ -249,3 +249,7 @@ lmms-eval
 **/.serena/
 ctags/
 outputs/
+
+# Local runtime artifacts
+.tmp/
+checkpoints/

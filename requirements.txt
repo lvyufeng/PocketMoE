@@ -1,0 +1,7 @@
+torch>=2.0
+transformers>=4.40
+safetensors>=0.4
+tqdm>=4.66
+setuptools>=68
+ninja>=1.11
+triton>=2.0

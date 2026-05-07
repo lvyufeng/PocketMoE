@@ -19,6 +19,7 @@ _TENSOR_CORE_ATTN = os.getenv("DEEPSEEK_TENSOR_CORE_ATTN", "0").lower() in {"1",
 _TENSOR_CORE_ATTN_CUDA = os.getenv("DEEPSEEK_TENSOR_CORE_ATTN_CUDA", "0").lower() in {"1", "true", "yes"}
 _FLASHINFER_STYLE_ATTN_CUDA = os.getenv("DEEPSEEK_FLASHINFER_STYLE_ATTN_CUDA", "0").lower() in {"1", "true", "yes"}
 _PREFILL_SPARSE_ATTN_CUDA = os.getenv("DEEPSEEK_PREFILL_SPARSE_ATTN_CUDA", "1").lower() in {"1", "true", "yes"}
+_PREFILL_SPARSE_ATTN_HEADPAIR_CUDA = os.getenv("DEEPSEEK_PREFILL_SPARSE_ATTN_HEADPAIR_CUDA", "1").lower() in {"1", "true", "yes"}
 _SHARED_EXPERT_PAIR_INT8_CUDA = os.getenv("DEEPSEEK_SHARED_EXPERT_PAIR_INT8_CUDA", "0").lower() in {"1", "true", "yes"}
 _INT8_CUDA_EXT = None
 
@@ -950,13 +951,28 @@ def fp4_act_quant(
     scales = _round_scale_pow2(scales)
     scale_full = scales.repeat_interleave(block_size, dim=-1)
     normalized = torch.clamp(flat / scale_full, _FP4_MIN, _FP4_MAX)
-    codes = _quantize_fp4_codes(normalized)
+    quant_chunk_rows = max(1, int(os.getenv("DEEPSEEK_FP4_QUANT_CHUNK_ROWS", "8192")))
+    if flat.size(0) > quant_chunk_rows:
+        levels = _fp4_levels(z.device)
+        if inplace:
+            for start in range(0, flat.size(0), quant_chunk_rows):
+                end = min(start + quant_chunk_rows, flat.size(0))
+                codes = _quantize_fp4_codes(normalized[start:end])
+                flat[start:end].copy_(levels[codes.long()] * scale_full[start:end])
+            x.copy_(flat.to(z.dtype).view_as(z))
+            return x
+        codes = torch.empty_like(flat, dtype=torch.uint8)
+        for start in range(0, flat.size(0), quant_chunk_rows):
+            end = min(start + quant_chunk_rows, flat.size(0))
+            codes[start:end] = _quantize_fp4_codes(normalized[start:end])
+    else:
+        codes = _quantize_fp4_codes(normalized)
+        if inplace:
+            dequant = (_fp4_levels(z.device)[codes.long()] * scale_full).to(z.dtype).view_as(z)
+            x.copy_(dequant)
+            return x
     packed = _pack_fp4_codes(codes).view(*z.shape[:-1], n // 2)
     out_scales = scales.to(torch.float8_e8m0fnu).view(*z.shape[:-1], n // block_size)
-    if inplace:
-        dequant = (_fp4_levels(z.device)[codes.long()] * scale_full).to(z.dtype).view_as(z)
-        x.copy_(dequant)
-        return x
     return packed, out_scales
 
 
@@ -1057,6 +1073,18 @@ def sparse_attn(
     if _PREFILL_SPARSE_ATTN_CUDA and q.is_cuda and q.size(1) > 1 and q.size(-1) == 512:
         if _INT8_CUDA_EXT is None:
             _INT8_CUDA_EXT = load_cuda_kernel()
+        if (
+            _PREFILL_SPARSE_ATTN_HEADPAIR_CUDA
+            and _INT8_CUDA_EXT is not None
+            and hasattr(_INT8_CUDA_EXT, "prefill_sparse_attn_headpair_forward")
+        ):
+            return _INT8_CUDA_EXT.prefill_sparse_attn_headpair_forward(
+                q.contiguous(),
+                kv.contiguous(),
+                attn_sink.contiguous(),
+                topk_idxs.contiguous().to(torch.int32),
+                float(softmax_scale),
+            )
         if _INT8_CUDA_EXT is not None and hasattr(_INT8_CUDA_EXT, "prefill_sparse_attn_forward"):
             return _INT8_CUDA_EXT.prefill_sparse_attn_forward(
                 q.contiguous(),

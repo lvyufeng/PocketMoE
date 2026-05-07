@@ -67,6 +67,7 @@ class GPUPrefillMoEBackend:
         self._stage_pending = False
         self.profile_enabled = os.getenv("DEEPSEEK_GPU_PREFILL_MOE_PROFILE", "0").lower() in {"1", "true", "yes"}
         self.grouped_gemm_enabled = os.getenv("DEEPSEEK_GPU_PREFILL_MOE_GROUPED_GEMM", "0").lower() in {"1", "true", "yes"}
+        self.bucketed_gemm_enabled = os.getenv("DEEPSEEK_GPU_PREFILL_MOE_BUCKETED_GEMM", "0").lower() in {"1", "true", "yes"}
         self.single_token_group_enabled = os.getenv("DEEPSEEK_GPU_MOE_SINGLE_TOKEN_GROUP", "1").lower() in {"1", "true", "yes"}
 
     @staticmethod
@@ -534,7 +535,21 @@ class GPUPrefillMoEBackend:
         self.wait_for_stage(x.device)
         self._record_staged_weights_on_current_stream(x.device)
         self._touch_cache(x.device)
-        if self.grouped_gemm_enabled and hasattr(self._cuda_ext, "moe_prefill_int8_grouped_gemm_forward"):
+        if self.grouped_gemm_enabled and self.bucketed_gemm_enabled and hasattr(self._cuda_ext, "moe_prefill_int8_grouped_gemm_bucketed_forward"):
+            y = self._cuda_ext.moe_prefill_int8_grouped_gemm_bucketed_forward(
+                x.contiguous(),
+                route_tokens,
+                route_weights.contiguous(),
+                seg_starts,
+                self._w1q,
+                self._w1s,
+                self._w2q,
+                self._w2s,
+                self._w3q,
+                self._w3s,
+                float(swiglu_limit),
+            )
+        elif self.grouped_gemm_enabled and hasattr(self._cuda_ext, "moe_prefill_int8_grouped_gemm_forward"):
             y = self._cuda_ext.moe_prefill_int8_grouped_gemm_forward(
                 x.contiguous(),
                 route_tokens,

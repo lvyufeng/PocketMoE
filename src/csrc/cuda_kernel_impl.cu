@@ -10,6 +10,11 @@
 #include <cublas_v2.h>
 #include <mma.h>
 
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 namespace {
 
 constexpr int kQuantThreads = 256;
@@ -814,6 +819,139 @@ __global__ void prefill_sparse_attn_kernel(
             }
         }
         out_ptr[d] = static_cast<scalar_t>(acc / denom);
+    }
+}
+
+template <typename scalar_t>
+__global__ void prefill_sparse_attn_headpair_kernel(
+    const scalar_t* __restrict__ q,
+    const scalar_t* __restrict__ kv,
+    const float* __restrict__ attn_sink,
+    const int32_t* __restrict__ topk_idxs,
+    scalar_t* __restrict__ out,
+    int bsz,
+    int seqlen,
+    int heads,
+    int kv_len,
+    int topk,
+    int dim,
+    float softmax_scale) {
+    const int head_pairs = (heads + 1) / 2;
+    const int bsp = blockIdx.x;
+    const int pair = bsp % head_pairs;
+    const int s = (bsp / head_pairs) % seqlen;
+    const int b = bsp / (seqlen * head_pairs);
+    const int h0 = pair * 2;
+    const int h1 = h0 + 1;
+    const bool has_h1 = h1 < heads;
+    const int tid = threadIdx.x;
+
+    extern __shared__ float smem[];
+    float* scores0 = smem;
+    float* scores1 = scores0 + topk;
+    float* q0_shared = scores1 + topk;
+    float* q1_shared = q0_shared + dim;
+    int32_t* idx_shared = reinterpret_cast<int32_t*>(q1_shared + dim);
+    float* reduce0 = reinterpret_cast<float*>(idx_shared + topk);
+    float* reduce1 = reduce0 + blockDim.x;
+
+    const scalar_t* q0_ptr = q + (((b * seqlen + s) * heads + h0) * dim);
+    const scalar_t* q1_ptr = has_h1 ? q + (((b * seqlen + s) * heads + h1) * dim) : q0_ptr;
+    const scalar_t* kv_base = kv + b * kv_len * dim;
+    const int32_t* idx_base = topk_idxs + (b * seqlen + s) * topk;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        q0_shared[d] = static_cast<float>(q0_ptr[d]);
+        if (has_h1) q1_shared[d] = static_cast<float>(q1_ptr[d]);
+    }
+    for (int t = tid; t < topk; t += blockDim.x) {
+        idx_shared[t] = idx_base[t];
+    }
+    __syncthreads();
+
+    for (int t = tid; t < topk; t += blockDim.x) {
+        const int idx = idx_shared[t];
+        float score0 = -INFINITY;
+        float score1 = -INFINITY;
+        if (idx >= 0 && idx < kv_len) {
+            float acc0 = 0.0f;
+            float acc1 = 0.0f;
+            const scalar_t* kv_ptr = kv_base + idx * dim;
+            for (int d = 0; d < dim; ++d) {
+                const float v = static_cast<float>(kv_ptr[d]);
+                acc0 += q0_shared[d] * v;
+                if (has_h1) acc1 += q1_shared[d] * v;
+            }
+            score0 = acc0 * softmax_scale;
+            if (has_h1) score1 = acc1 * softmax_scale;
+        }
+        scores0[t] = score0;
+        if (has_h1) scores1[t] = score1;
+    }
+    __syncthreads();
+
+    float local_max0 = -INFINITY;
+    float local_max1 = -INFINITY;
+    for (int t = tid; t < topk; t += blockDim.x) {
+        local_max0 = fmaxf(local_max0, scores0[t]);
+        if (has_h1) local_max1 = fmaxf(local_max1, scores1[t]);
+    }
+    reduce0[tid] = local_max0;
+    if (has_h1) reduce1[tid] = local_max1;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce0[tid] = fmaxf(reduce0[tid], reduce0[tid + stride]);
+            if (has_h1) reduce1[tid] = fmaxf(reduce1[tid], reduce1[tid + stride]);
+        }
+        __syncthreads();
+    }
+    const float max_score0 = fmaxf(reduce0[0], attn_sink[h0]);
+    const float max_score1 = has_h1 ? fmaxf(reduce1[0], attn_sink[h1]) : -INFINITY;
+
+    float local_denom0 = 0.0f;
+    float local_denom1 = 0.0f;
+    for (int t = tid; t < topk; t += blockDim.x) {
+        const float w0 = expf(scores0[t] - max_score0);
+        scores0[t] = w0;
+        local_denom0 += w0;
+        if (has_h1) {
+            const float w1 = expf(scores1[t] - max_score1);
+            scores1[t] = w1;
+            local_denom1 += w1;
+        }
+    }
+    if (tid == 0) {
+        local_denom0 += expf(attn_sink[h0] - max_score0);
+        if (has_h1) local_denom1 += expf(attn_sink[h1] - max_score1);
+    }
+    reduce0[tid] = local_denom0;
+    if (has_h1) reduce1[tid] = local_denom1;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce0[tid] += reduce0[tid + stride];
+            if (has_h1) reduce1[tid] += reduce1[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float denom0 = reduce0[0];
+    const float denom1 = has_h1 ? reduce1[0] : 1.0f;
+
+    scalar_t* out0_ptr = out + (((b * seqlen + s) * heads + h0) * dim);
+    scalar_t* out1_ptr = has_h1 ? out + (((b * seqlen + s) * heads + h1) * dim) : out0_ptr;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        for (int t = 0; t < topk; ++t) {
+            const int idx = idx_shared[t];
+            if (idx >= 0 && idx < kv_len) {
+                const float v = static_cast<float>(kv_base[idx * dim + d]);
+                acc0 += scores0[t] * v;
+                if (has_h1) acc1 += scores1[t] * v;
+            }
+        }
+        out0_ptr[d] = static_cast<scalar_t>(acc0 / denom0);
+        if (has_h1) out1_ptr[d] = static_cast<scalar_t>(acc1 / denom1);
     }
 }
 
@@ -2001,7 +2139,7 @@ std::vector<torch::Tensor> moe_group_routes_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {local_ids, route_tokens, route_weights, seg_starts};
 }
-torch::Tensor moe_prefill_int8_grouped_gemm_forward_cuda(
+torch::Tensor moe_prefill_int8_grouped_gemm_range_forward_cuda(
     const torch::Tensor& x,
     const torch::Tensor& route_tokens,
     const torch::Tensor& route_weights_sorted,
@@ -2012,26 +2150,56 @@ torch::Tensor moe_prefill_int8_grouped_gemm_forward_cuda(
     const torch::Tensor& w2s,
     const torch::Tensor& w3q,
     const torch::Tensor& w3s,
-    double swiglu_limit) {
+    double swiglu_limit,
+    int expert_begin,
+    int expert_end,
+    torch::Tensor* y_out) {
 
     c10::cuda::CUDAGuard device_guard(x.device());
     const int routes = static_cast<int>(route_tokens.size(0));
     const int dim = static_cast<int>(x.size(1));
-    const int n_experts = static_cast<int>(w1q.size(0));
+    const int n_experts_total = static_cast<int>(w1q.size(0));
     const int inter_dim = static_cast<int>(w1q.size(1));
-    if (routes == 0) {
-        return torch::zeros({x.size(0), x.size(1)}, x.options().dtype(torch::kFloat32));
+    expert_begin = std::max(0, expert_begin);
+    expert_end = std::min(n_experts_total, expert_end);
+    const int n_experts = expert_end - expert_begin;
+    if (routes == 0 || n_experts <= 0) {
+        return y_out == nullptr ? torch::zeros({x.size(0), x.size(1)}, x.options().dtype(torch::kFloat32)) : *y_out;
     }
-    auto seg_i32 = seg_starts.scalar_type() == torch::kInt32 ? seg_starts.contiguous() : seg_starts.to(torch::kInt32);
-    auto counts_i32 = seg_i32.slice(0, 1, n_experts + 1) - seg_i32.slice(0, 0, n_experts);
+    auto seg_i32_full = seg_starts.scalar_type() == torch::kInt32 ? seg_starts.contiguous() : seg_starts.to(torch::kInt32);
+    auto seg_cpu = seg_i32_full.to(torch::kCPU, false);
+    const int32_t* seg_cpu_ptr = seg_cpu.data_ptr<int32_t>();
+    auto seg_i32 = seg_i32_full.slice(0, expert_begin, expert_end + 1);
+    const int route_begin = static_cast<int>(seg_cpu_ptr[expert_begin]);
+    const int route_end = static_cast<int>(seg_cpu_ptr[expert_end]);
+    const int range_routes = route_end - route_begin;
+    if (range_routes <= 0) {
+        return y_out == nullptr ? torch::zeros({x.size(0), x.size(1)}, x.options().dtype(torch::kFloat32)) : *y_out;
+    }
+    torch::Tensor seg_local;
+    if (route_begin == 0) {
+        seg_local = seg_i32;
+    } else {
+        seg_local = (seg_i32 - route_begin).contiguous();
+    }
+    auto counts_i32 = seg_local.slice(0, 1, n_experts + 1) - seg_local.slice(0, 0, n_experts);
     const int max_count = counts_i32.max().item<int>();
     if (max_count <= 0) {
-        return torch::zeros({x.size(0), x.size(1)}, x.options().dtype(torch::kFloat32));
+        return y_out == nullptr ? torch::zeros({x.size(0), x.size(1)}, x.options().dtype(torch::kFloat32)) : *y_out;
     }
 
-    auto x_sorted = torch::empty({routes, dim}, x.options());
-    auto x_q = torch::empty({routes, 1, dim}, x.options().dtype(torch::kInt8));
-    auto x_scale = torch::empty({routes, 1}, x.options().dtype(torch::kFloat32));
+    auto route_tokens_range = route_tokens.slice(0, route_begin, route_end).contiguous();
+    auto route_weights_range = route_weights_sorted.slice(0, route_begin, route_end).contiguous();
+    auto w1q_range = w1q.slice(0, expert_begin, expert_end);
+    auto w1s_range = w1s.slice(0, expert_begin, expert_end);
+    auto w2q_range = w2q.slice(0, expert_begin, expert_end);
+    auto w2s_range = w2s.slice(0, expert_begin, expert_end);
+    auto w3q_range = w3q.slice(0, expert_begin, expert_end);
+    auto w3s_range = w3s.slice(0, expert_begin, expert_end);
+
+    auto x_sorted = torch::empty({range_routes, dim}, x.options());
+    auto x_q = torch::empty({range_routes, 1, dim}, x.options().dtype(torch::kInt8));
+    auto x_scale = torch::empty({range_routes, 1}, x.options().dtype(torch::kFloat32));
     auto x_pad = torch::empty({n_experts, max_count, dim}, x.options().dtype(torch::kInt8));
     auto x_scale_pad = torch::empty({n_experts, max_count}, x.options().dtype(torch::kFloat32));
     auto gate_i32 = torch::empty({n_experts, max_count, inter_dim}, x.options().dtype(torch::kInt32));
@@ -2039,23 +2207,23 @@ torch::Tensor moe_prefill_int8_grouped_gemm_forward_cuda(
     auto hidden_pad = torch::empty({n_experts, max_count, inter_dim}, x.options().dtype(torch::kInt8));
     auto hidden_scale_pad = torch::empty({n_experts, max_count}, x.options().dtype(torch::kFloat32));
     auto out_i32 = torch::empty({n_experts, max_count, dim}, x.options().dtype(torch::kInt32));
-    auto y = torch::zeros({x.size(0), x.size(1)}, x.options().dtype(torch::kFloat32));
+    torch::Tensor y = y_out == nullptr ? torch::zeros({x.size(0), x.size(1)}, x.options().dtype(torch::kFloat32)) : *y_out;
     const int threads = 256;
-    const int gather_blocks = static_cast<int>((static_cast<int64_t>(routes) * dim + threads - 1) / threads);
-    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "moe_grouped_gemm_gather", [&] {
+    const int gather_blocks = static_cast<int>((static_cast<int64_t>(range_routes) * dim + threads - 1) / threads);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "moe_grouped_gemm_gather_range", [&] {
         gather_routes_kernel<scalar_t><<<gather_blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
             x.data_ptr<scalar_t>(),
-            route_tokens.data_ptr<int64_t>(),
+            route_tokens_range.data_ptr<int64_t>(),
             x_sorted.data_ptr<scalar_t>(),
-            routes,
+            range_routes,
             dim);
     });
-    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "moe_grouped_gemm_quantize_x", [&] {
-        quantize_rows_kernel<scalar_t><<<routes, kQuantThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "moe_grouped_gemm_quantize_x_range", [&] {
+        quantize_rows_kernel<scalar_t><<<range_routes, kQuantThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
             x_sorted.data_ptr<scalar_t>(),
             x_q.data_ptr<int8_t>(),
             x_scale.data_ptr<float>(),
-            routes,
+            range_routes,
             1,
             dim);
     });
@@ -2063,7 +2231,7 @@ torch::Tensor moe_prefill_int8_grouped_gemm_forward_cuda(
     moe_pad_q_rows_kernel<<<ceil_div(pad_x_total, threads), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         x_q.data_ptr<int8_t>(),
         x_scale.data_ptr<float>(),
-        seg_i32.data_ptr<int32_t>(),
+        seg_local.data_ptr<int32_t>(),
         x_pad.data_ptr<int8_t>(),
         x_scale_pad.data_ptr<float>(),
         n_experts,
@@ -2081,7 +2249,7 @@ torch::Tensor moe_prefill_int8_grouped_gemm_forward_cuda(
         max_count,
         dim,
         &alpha,
-        w1q.data_ptr<int8_t>(),
+        w1q_range.data_ptr<int8_t>(),
         CUDA_R_8I,
         dim,
         static_cast<long long>(inter_dim) * dim,
@@ -2097,7 +2265,7 @@ torch::Tensor moe_prefill_int8_grouped_gemm_forward_cuda(
         n_experts,
         CUBLAS_COMPUTE_32I,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "w1 cublasGemmStridedBatchedEx failed");
+    TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "w1 range cublasGemmStridedBatchedEx failed");
     status = cublasGemmStridedBatchedEx(
         handle,
         CUBLAS_OP_T,
@@ -2106,7 +2274,7 @@ torch::Tensor moe_prefill_int8_grouped_gemm_forward_cuda(
         max_count,
         dim,
         &alpha,
-        w3q.data_ptr<int8_t>(),
+        w3q_range.data_ptr<int8_t>(),
         CUDA_R_8I,
         dim,
         static_cast<long long>(inter_dim) * dim,
@@ -2122,15 +2290,15 @@ torch::Tensor moe_prefill_int8_grouped_gemm_forward_cuda(
         n_experts,
         CUBLAS_COMPUTE_32I,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "w3 cublasGemmStridedBatchedEx failed");
+    TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "w3 range cublasGemmStridedBatchedEx failed");
     moe_pair_swiglu_quantize_padded_kernel<<<dim3(n_experts, max_count), kQuantThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
         gate_i32.data_ptr<int32_t>(),
         up_i32.data_ptr<int32_t>(),
         x_scale_pad.data_ptr<float>(),
-        seg_i32.data_ptr<int32_t>(),
-        route_weights_sorted.data_ptr<float>(),
-        w1s.data_ptr<float>(),
-        w3s.data_ptr<float>(),
+        seg_local.data_ptr<int32_t>(),
+        route_weights_range.data_ptr<float>(),
+        w1s_range.data_ptr<float>(),
+        w3s_range.data_ptr<float>(),
         hidden_pad.data_ptr<int8_t>(),
         hidden_scale_pad.data_ptr<float>(),
         n_experts,
@@ -2145,7 +2313,7 @@ torch::Tensor moe_prefill_int8_grouped_gemm_forward_cuda(
         max_count,
         inter_dim,
         &alpha,
-        w2q.data_ptr<int8_t>(),
+        w2q_range.data_ptr<int8_t>(),
         CUDA_R_8I,
         inter_dim,
         static_cast<long long>(dim) * inter_dim,
@@ -2161,19 +2329,102 @@ torch::Tensor moe_prefill_int8_grouped_gemm_forward_cuda(
         n_experts,
         CUBLAS_COMPUTE_32I,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "w2 cublasGemmStridedBatchedEx failed");
+    TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "w2 range cublasGemmStridedBatchedEx failed");
     const int out_total = n_experts * max_count * dim;
     moe_depad_scatter_i32_kernel<<<ceil_div(out_total, threads), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         out_i32.data_ptr<int32_t>(),
         hidden_scale_pad.data_ptr<float>(),
-        route_tokens.data_ptr<int64_t>(),
-        seg_i32.data_ptr<int32_t>(),
-        w2s.data_ptr<float>(),
+        route_tokens_range.data_ptr<int64_t>(),
+        seg_local.data_ptr<int32_t>(),
+        w2s_range.data_ptr<float>(),
         y.data_ptr<float>(),
         n_experts,
         max_count,
         dim);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
+
+torch::Tensor moe_prefill_int8_grouped_gemm_forward_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& route_tokens,
+    const torch::Tensor& route_weights_sorted,
+    const torch::Tensor& seg_starts,
+    const torch::Tensor& w1q,
+    const torch::Tensor& w1s,
+    const torch::Tensor& w2q,
+    const torch::Tensor& w2s,
+    const torch::Tensor& w3q,
+    const torch::Tensor& w3s,
+    double swiglu_limit) {
+    auto y = moe_prefill_int8_grouped_gemm_range_forward_cuda(
+        x,
+        route_tokens,
+        route_weights_sorted,
+        seg_starts,
+        w1q,
+        w1s,
+        w2q,
+        w2s,
+        w3q,
+        w3s,
+        swiglu_limit,
+        0,
+        static_cast<int>(w1q.size(0)),
+        nullptr);
+    if (const char* v = std::getenv("DEEPSEEK_GPU_PREFILL_MOE_PAD_PROFILE")) {
+        if (std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0 && std::strcmp(v, "False") != 0) {
+            auto seg_i32 = seg_starts.scalar_type() == torch::kInt32 ? seg_starts.contiguous() : seg_starts.to(torch::kInt32);
+            auto counts_i32 = seg_i32.slice(0, 1, seg_i32.size(0)) - seg_i32.slice(0, 0, seg_i32.size(0) - 1);
+            const int max_count = counts_i32.max().item<int>();
+            const int n_experts = static_cast<int>(w1q.size(0));
+            const int routes = static_cast<int>(route_tokens.size(0));
+            const long long padded_rows = static_cast<long long>(n_experts) * max_count;
+            const double ratio = routes > 0 ? static_cast<double>(padded_rows) / static_cast<double>(routes) : 0.0;
+            std::printf("gpu_prefill_moe_pad_profile routes=%d experts=%d max_count=%d padded_rows=%lld padding_ratio=%.3f\n", routes, n_experts, max_count, padded_rows, ratio);
+            std::fflush(stdout);
+        }
+    }
+    return y;
+}
+
+torch::Tensor moe_prefill_int8_grouped_gemm_bucketed_forward_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& route_tokens,
+    const torch::Tensor& route_weights_sorted,
+    const torch::Tensor& seg_starts,
+    const torch::Tensor& w1q,
+    const torch::Tensor& w1s,
+    const torch::Tensor& w2q,
+    const torch::Tensor& w2s,
+    const torch::Tensor& w3q,
+    const torch::Tensor& w3s,
+    double swiglu_limit) {
+    c10::cuda::CUDAGuard device_guard(x.device());
+    const int n_experts = static_cast<int>(w1q.size(0));
+    auto y = torch::zeros({x.size(0), x.size(1)}, x.options().dtype(torch::kFloat32));
+    if (route_tokens.size(0) == 0 || n_experts <= 0) {
+        return y;
+    }
+    const int bucket = std::max(1, std::min(n_experts, static_cast<int>(std::atoi(std::getenv("DEEPSEEK_GPU_PREFILL_MOE_BUCKET_EXPERTS") ? std::getenv("DEEPSEEK_GPU_PREFILL_MOE_BUCKET_EXPERTS") : "16"))));
+    for (int begin = 0; begin < n_experts; begin += bucket) {
+        const int end = std::min(n_experts, begin + bucket);
+        moe_prefill_int8_grouped_gemm_range_forward_cuda(
+            x,
+            route_tokens,
+            route_weights_sorted,
+            seg_starts,
+            w1q,
+            w1s,
+            w2q,
+            w2s,
+            w3q,
+            w3s,
+            swiglu_limit,
+            begin,
+            end,
+            &y);
+    }
     return y;
 }
 
@@ -2258,19 +2509,31 @@ torch::Tensor wo_a_int8_forward_cuda(
             k);
     });
 
-    const dim3 gemm_grid(ceil_div(n, kGemmThreads), rows, groups);
+    // CUDA grid Y/Z dim is capped at 65535 (gridDimY = blockIdx.y bound). For very
+    // long prefill (e.g. seqlen >= 64k) `rows` exceeds that limit and the launch
+    // returns cudaErrorInvalidConfiguration. Slice rows into chunks <= 65535 and
+    // dispatch one GEMM launch per chunk; the kernel itself reads `rows` only via
+    // pointer arithmetic on `(row * groups + group)`, so a row offset on the input
+    // pointers is sufficient.
+    const int kMaxGridY = 65535;
     const dim3 gemm_block(kGemmThreads);
     const size_t shared_bytes = static_cast<size_t>(k / 4) * sizeof(int);
-    int8_gemm_rows_kernel<<<gemm_grid, gemm_block, shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
-        x_q.data_ptr<int8_t>(),
-        x_scale.data_ptr<float>(),
-        wq_contig.data_ptr<int8_t>(),
-        ws_contig.data_ptr<float>(),
-        out.data_ptr<float>(),
-        rows,
-        groups,
-        n,
-        k);
+    int row_offset = 0;
+    while (row_offset < rows) {
+        const int chunk_rows = std::min(rows - row_offset, kMaxGridY);
+        const dim3 gemm_grid(ceil_div(n, kGemmThreads), chunk_rows, groups);
+        int8_gemm_rows_kernel<<<gemm_grid, gemm_block, shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            x_q.data_ptr<int8_t>() + static_cast<size_t>(row_offset) * groups * k,
+            x_scale.data_ptr<float>() + static_cast<size_t>(row_offset) * groups,
+            wq_contig.data_ptr<int8_t>(),
+            ws_contig.data_ptr<float>(),
+            out.data_ptr<float>() + static_cast<size_t>(row_offset) * groups * n,
+            chunk_rows,
+            groups,
+            n,
+            k);
+        row_offset += chunk_rows;
+    }
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out.view({bsz, seqlen, groups, n});
@@ -2350,6 +2613,53 @@ torch::Tensor prefill_sparse_attn_forward_cuda(
         static_cast<size_t>(kAttnThreads) * sizeof(float);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, q_contig.scalar_type(), "prefill_sparse_attn", [&] {
         prefill_sparse_attn_kernel<scalar_t><<<grid, block, shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            q_contig.data_ptr<scalar_t>(),
+            kv_contig.data_ptr<scalar_t>(),
+            sink_contig.data_ptr<float>(),
+            idx_contig.data_ptr<int32_t>(),
+            out.data_ptr<scalar_t>(),
+            bsz,
+            seqlen,
+            heads,
+            kv_len,
+            topk,
+            dim,
+            static_cast<float>(softmax_scale));
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+torch::Tensor prefill_sparse_attn_headpair_forward_cuda(
+    const torch::Tensor& q,
+    const torch::Tensor& kv,
+    const torch::Tensor& attn_sink,
+    const torch::Tensor& topk_idxs,
+    double softmax_scale) {
+    c10::cuda::CUDAGuard device_guard(q.device());
+    const auto bsz = static_cast<int>(q.size(0));
+    const auto seqlen = static_cast<int>(q.size(1));
+    const auto heads = static_cast<int>(q.size(2));
+    const auto dim = static_cast<int>(q.size(3));
+    const auto kv_len = static_cast<int>(kv.size(1));
+    const auto topk = static_cast<int>(topk_idxs.size(2));
+
+    auto q_contig = q.contiguous();
+    auto kv_contig = kv.contiguous();
+    auto sink_contig = attn_sink.contiguous();
+    auto idx_contig = topk_idxs.contiguous();
+    auto out = torch::empty_like(q_contig);
+
+    const int head_pairs = (heads + 1) / 2;
+    const dim3 grid(bsz * seqlen * head_pairs);
+    const dim3 block(kAttnThreads);
+    const size_t shared_bytes =
+        static_cast<size_t>(topk * 2) * sizeof(float) +
+        static_cast<size_t>(dim * 2) * sizeof(float) +
+        static_cast<size_t>(topk) * sizeof(int32_t) +
+        static_cast<size_t>(kAttnThreads * 2) * sizeof(float);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, q_contig.scalar_type(), "prefill_sparse_attn_headpair", [&] {
+        prefill_sparse_attn_headpair_kernel<scalar_t><<<grid, block, shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
             q_contig.data_ptr<scalar_t>(),
             kv_contig.data_ptr<scalar_t>(),
             sink_contig.data_ptr<float>(),

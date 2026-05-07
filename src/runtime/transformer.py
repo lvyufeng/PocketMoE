@@ -239,6 +239,7 @@ class Linear(nn.Module):
         self.online_int8_enabled = False
         self._online_int8_ready = False
         self.phase_env_suffix: str | None = None
+        self.online_int8_chunk_tokens = max(0, int(os.getenv("DEEPSEEK_ONLINE_INT8_CHUNK_TOKENS", "4096")))
         dtype = dtype or default_dtype
         if dtype == torch.float4_e2m1fn_x2:
             # FP4: weight is [out, in//2] in float4_e2m1fn_x2, logically [out, in] in fp4
@@ -311,10 +312,25 @@ class Linear(nn.Module):
         self.register_buffer("online_int8_scale", weight_s, persistent=False)
         self._online_int8_ready = True
 
+    def _online_int8_forward(self, x: torch.Tensor) -> torch.Tensor:
+        self._ensure_online_int8()
+        chunk = self.online_int8_chunk_tokens
+        if chunk > 0 and x.numel() // x.shape[-1] > chunk:
+            flat = x.reshape(-1, x.shape[-1])
+            y = torch.empty((flat.size(0), self.out_features), device=x.device, dtype=torch.get_default_dtype())
+            for start in range(0, flat.size(0), chunk):
+                end = min(start + chunk, flat.size(0))
+                y[start:end].copy_(soft_bf16_weight_gemm_int8(
+                    flat[start:end].contiguous(),
+                    self.online_int8_weight,
+                    self.online_int8_scale,
+                ))
+            return y.view(*x.shape[:-1], self.out_features)
+        return soft_bf16_weight_gemm_int8(x, self.online_int8_weight, self.online_int8_scale)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._online_int8_active():
-            self._ensure_online_int8()
-            return soft_bf16_weight_gemm_int8(x, self.online_int8_weight, self.online_int8_scale)
+            return self._online_int8_forward(x)
         return linear(x, self.weight, self.bias)
 
 
@@ -325,10 +341,25 @@ class ColumnParallelLinear(Linear):
         self.part_out_features = out_features // world_size
         super().__init__(in_features, self.part_out_features, bias, dtype)
 
+    def _online_int8_forward(self, x: torch.Tensor) -> torch.Tensor:
+        self._ensure_online_int8()
+        chunk = self.online_int8_chunk_tokens
+        if chunk > 0 and x.numel() // x.shape[-1] > chunk:
+            flat = x.reshape(-1, x.shape[-1])
+            y = torch.empty((flat.size(0), self.out_features), device=x.device, dtype=torch.get_default_dtype())
+            for start in range(0, flat.size(0), chunk):
+                end = min(start + chunk, flat.size(0))
+                y[start:end].copy_(soft_bf16_weight_gemm_int8(
+                    flat[start:end].contiguous(),
+                    self.online_int8_weight,
+                    self.online_int8_scale,
+                ))
+            return y.view(*x.shape[:-1], self.out_features)
+        return soft_bf16_weight_gemm_int8(x, self.online_int8_weight, self.online_int8_scale)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._online_int8_active():
-            self._ensure_online_int8()
-            return soft_bf16_weight_gemm_int8(x, self.online_int8_weight, self.online_int8_scale)
+            return self._online_int8_forward(x)
         return linear(x, self.weight, self.bias)
 
 
@@ -341,8 +372,7 @@ class RowParallelLinear(Linear):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._online_int8_active():
-            self._ensure_online_int8()
-            y = soft_bf16_weight_gemm_int8(x, self.online_int8_weight, self.online_int8_scale)
+            y = self._online_int8_forward(x)
         else:
             y = linear(x, self.weight, None)
         if world_size > 1:
@@ -620,6 +650,9 @@ class Indexer(torch.nn.Module):
         self.freqs_cis = None
         self.fused_c4_indexer_enabled = _env_enabled("DEEPSEEK_FUSED_C4_INDEXER_CUDA")
         self._fused_c4_indexer_ext = load_cuda_kernel() if self.fused_c4_indexer_enabled else None
+        self._prefill_chunk_tokens = max(
+            1, int(os.getenv("DEEPSEEK_INDEXER_PREFILL_CHUNK_TOKENS", "512"))
+        )
 
     def _fused_decode_forward(self, x: torch.Tensor, q: torch.Tensor, start_pos: int, offset: int):
         if self._fused_c4_indexer_ext is None or start_pos == 0 or x.size(1) != 1 or self.compress_ratio != 4:
@@ -688,39 +721,71 @@ class Indexer(torch.nn.Module):
             self.compressor(x, start_pos)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
         # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
-        index_score = torch.einsum("bshd,btd->bsht", q, self.kv_cache[:bsz, :end_pos // ratio])
-        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+        kv_window = self.kv_cache[:bsz, :end_pos // ratio]
+        if seqlen > self._prefill_chunk_tokens:
+            t_dim = kv_window.size(1)
+            index_score = q.new_empty((bsz, seqlen, t_dim))
+            chunk = self._prefill_chunk_tokens
+            for qs in range(0, seqlen, chunk):
+                qe = min(qs + chunk, seqlen)
+                chunk_score = torch.einsum("bshd,btd->bsht", q[:, qs:qe], kv_window)
+                chunk_score = (chunk_score.relu_() * weights[:, qs:qe].unsqueeze(-1)).sum(dim=2)
+                index_score[:, qs:qe] = chunk_score
+                del chunk_score
+        else:
+            index_score = torch.einsum("bshd,btd->bsht", q, kv_window)
+            index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
         if world_size > 1 and not self.replicated_c4_indexer:
             dist.all_reduce(index_score)
         if start_pos == 0:
-            mask = torch.arange(seqlen // ratio).repeat(seqlen, 1) >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
-            index_score += torch.where(mask, float("-inf"), 0)
+            t_dim = index_score.size(-1)
+            t_idx = torch.arange(t_dim, device=index_score.device).unsqueeze(0)
+            chunk = self._prefill_chunk_tokens
+            for qs in range(0, seqlen, chunk):
+                qe = min(qs + chunk, seqlen)
+                valid_per_row = ((torch.arange(qs + 1, qe + 1, device=index_score.device)) // ratio).unsqueeze(-1)
+                mask = t_idx >= valid_per_row
+                index_score[:, qs:qe].masked_fill_(mask.unsqueeze(0), float("-inf"))
         elif seqlen > 1:
             # Speculative-verify decode: each query position `i` may only attend
             # to compressor cells `[0 .. (start_pos+i+1)//ratio)`. Mask the
             # later ones (which exist in the slice because end_pos//ratio
             # rounds up over the seqlen=2 window).
             t_dim = index_score.size(-1)
-            valid_per_row = torch.tensor(
-                [min(t_dim, (start_pos + i + 1) // ratio) for i in range(seqlen)],
-                device=index_score.device,
-            )
             t_idx = torch.arange(t_dim, device=index_score.device).unsqueeze(0)  # [1, t]
-            mask = t_idx >= valid_per_row.unsqueeze(-1)  # [seqlen, t]
-            index_score = index_score.masked_fill(mask.unsqueeze(0), float("-inf"))
+            chunk = self._prefill_chunk_tokens
+            for qs in range(0, seqlen, chunk):
+                qe = min(qs + chunk, seqlen)
+                valid_per_row = torch.tensor(
+                    [min(t_dim, (start_pos + i + 1) // ratio) for i in range(qs, qe)],
+                    device=index_score.device,
+                )
+                mask = t_idx >= valid_per_row.unsqueeze(-1)  # [chunk, t]
+                index_score[:, qs:qe].masked_fill_(mask.unsqueeze(0), float("-inf"))
         topk_idxs = index_score.topk(min(self.index_topk, end_pos // ratio), dim=-1)[1]
         if start_pos == 0:
-            mask = topk_idxs >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
-            topk_idxs = torch.where(mask, -1, topk_idxs + offset)
+            chunk = self._prefill_chunk_tokens
+            for qs in range(0, seqlen, chunk):
+                qe = min(qs + chunk, seqlen)
+                part = topk_idxs[:, qs:qe]
+                valid_per_row = ((torch.arange(qs + 1, qe + 1, device=part.device)) // ratio).view(1, qe - qs, 1)
+                invalid = part >= valid_per_row
+                part.add_(offset)
+                part.masked_fill_(invalid, -1)
         elif seqlen > 1:
             # Per-row masking: position i can only validly index cells up to
             # (start_pos+i+1)//ratio. Beyond that, mark as -1.
-            valid_per_row = torch.tensor(
-                [(start_pos + i + 1) // ratio for i in range(seqlen)],
-                device=topk_idxs.device,
-            )
-            invalid_mask = topk_idxs >= valid_per_row.view(1, seqlen, 1)
-            topk_idxs = torch.where(invalid_mask, torch.full_like(topk_idxs, -1), topk_idxs + offset)
+            chunk = self._prefill_chunk_tokens
+            for qs in range(0, seqlen, chunk):
+                qe = min(qs + chunk, seqlen)
+                part = topk_idxs[:, qs:qe]
+                valid_per_row = torch.tensor(
+                    [(start_pos + i + 1) // ratio for i in range(qs, qe)],
+                    device=part.device,
+                ).view(1, qe - qs, 1)
+                invalid = part >= valid_per_row
+                part.add_(offset)
+                part.masked_fill_(invalid, -1)
         else:
             topk_idxs += offset
         return topk_idxs
@@ -1147,6 +1212,7 @@ class Expert(nn.Module):
         self._shared_w13_fp16 = None
         self._shared_w2_fp16 = None
         self._shared_int8_ready = False
+        self.shared_expert_chunk_tokens = max(0, int(os.getenv("DEEPSEEK_SHARED_EXPERT_CHUNK_TOKENS", "8192")))
 
     def _predequantize_fp4_weights_on_gpu(self):
         if self._cpu_predequantized or self.w1.weight.dtype != torch.float4_e2m1fn_x2:
@@ -1258,6 +1324,14 @@ class Expert(nn.Module):
 
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         dtype = x.dtype
+        chunk = self.shared_expert_chunk_tokens if self.shared_expert_int8_enabled or self.shared_expert_fp16_enabled else 0
+        if chunk > 0 and x.dim() == 2 and x.size(0) > chunk:
+            parts = []
+            for start in range(0, x.size(0), chunk):
+                end = min(start + chunk, x.size(0))
+                weight_part = weights[start:end] if weights is not None else None
+                parts.append(self.forward(x[start:end].contiguous(), weight_part))
+            return torch.cat(parts, dim=0).to(dtype)
         if self.shared_expert_fp16_enabled and x.is_cuda:
             self._ensure_shared_fp16()
             gate_up = F.linear(x.to(torch.float16), self.shared_w13_fp16).float()
@@ -1421,7 +1495,24 @@ class MoE(nn.Module):
         self.gpu_decode_active_moe_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_GPU_MOE_DECODE_ACTIVE")
         self.gpu_spec_token2_moe_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_GPU_MOE_SPEC_TOKEN2")
         self.gpu_prefill_moe_min_tokens = int(os.getenv("DEEPSEEK_GPU_PREFILL_MOE_MIN_TOKENS", "64"))
+        self.gpu_prefill_moe_chunk_tokens = max(0, int(os.getenv("DEEPSEEK_GPU_PREFILL_MOE_CHUNK_TOKENS", "0")))
+        self.moe_reduce_cast_chunk_tokens = max(0, int(os.getenv("DEEPSEEK_MOE_REDUCE_CAST_CHUNK_TOKENS", "8192")))
         self.gpu_prefill_backend = None
+
+    def _finalize_reduced_moe(self, y_reduce: torch.Tensor, shared: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+        chunk = self.moe_reduce_cast_chunk_tokens
+        if chunk > 0 and y_reduce.dim() == 2 and y_reduce.size(0) > chunk:
+            out = torch.empty((y_reduce.size(0), y_reduce.size(1)), device=y_reduce.device, dtype=out_dtype)
+            for start in range(0, y_reduce.size(0), chunk):
+                end = min(start + chunk, y_reduce.size(0))
+                part = y_reduce[start:end].to(torch.float32)
+                part.add_(shared[start:end])
+                out[start:end].copy_(part)
+                del part
+            return out
+        y = y_reduce.to(torch.float32)
+        y += shared
+        return y.to(out_dtype)
 
     def _pd_active_phase(self) -> Optional[str]:
         if not self.pd_phase_auto_select_enabled:
@@ -1599,15 +1690,31 @@ class MoE(nn.Module):
             local = ((indices >= self.experts_start_idx) & (indices < self.experts_end_idx)).sum().item()
             print(f"rank_route layer={self.layer_id} rank={rank} local={int(local)} ids={indices.flatten().tolist()}", flush=True)
         used_gpu_prefill_moe = False
+        reduced_moe_ready = False
         used_remote_only = False
         if self.routed_experts_device == "cpu" and self._should_use_gpu_prefill_moe(x):
             shared = self.shared_experts(x)
-            y = self._ensure_gpu_prefill_backend().forward(
-                x,
-                indices,
-                weights,
-                self.cpu_backend._swiglu_limit,
-            )
+            backend = self._ensure_gpu_prefill_backend()
+            chunk = self.gpu_prefill_moe_chunk_tokens
+            if chunk > 0 and x.shape[0] > chunk:
+                y = torch.empty((x.shape[0], self.dim), device=x.device, dtype=torch.float32)
+                for start in range(0, x.shape[0], chunk):
+                    end = min(start + chunk, x.shape[0])
+                    y_part = backend.forward(
+                        x[start:end].contiguous(),
+                        indices[start:end].contiguous(),
+                        weights[start:end].contiguous(),
+                        self.cpu_backend._swiglu_limit,
+                    )
+                    y[start:end].copy_(y_part)
+                    del y_part
+            else:
+                y = backend.forward(
+                    x,
+                    indices,
+                    weights,
+                    self.cpu_backend._swiglu_limit,
+                )
             used_gpu_prefill_moe = True
         elif self.routed_experts_device == "cpu" and self._should_use_gpu_spec_token2_moe(x):
             # Speculative verify mixed path: keep the first token on the normal
@@ -1712,11 +1819,22 @@ class MoE(nn.Module):
                         torch.cuda.synchronize()
                     t_sync = time.perf_counter() if profile else 0.0
                     y_reduce = y.to(torch.float16 if self.reduce_fp16_enabled else x.dtype)
+                    chunked_finalize = (
+                        self.moe_reduce_cast_chunk_tokens > 0
+                        and y_reduce.dim() == 2
+                        and y_reduce.size(0) > self.moe_reduce_cast_chunk_tokens
+                    )
+                    if chunked_finalize:
+                        del y
                     dist.all_reduce(y_reduce, async_op=False)
                     if profile and torch.cuda.is_available():
                         torch.cuda.synchronize()
                     t_reduce = time.perf_counter() if profile else 0.0
-                    y = y_reduce.to(torch.float32)
+                    if chunked_finalize:
+                        y = y_reduce
+                        reduced_moe_ready = True
+                    else:
+                        y = y_reduce.to(torch.float32)
             torch.cuda.current_stream(y.device).wait_stream(self._allreduce_stream)
             if 'host_sync_time' in locals():
                 if profile and torch.cuda.is_available():
@@ -1750,7 +1868,8 @@ class MoE(nn.Module):
                 idx, top = torch.where(indices == i)
                 y[idx] += expert(x[idx], weights[idx, top, None])
             shared = self.shared_experts(x)
-        if world_size > 1 and not (
+        reduced_moe = False
+        if not reduced_moe_ready and world_size > 1 and not (
             self.routed_experts_device == "cpu"
             and (
                 (self.async_allreduce_enabled and not used_gpu_prefill_moe and not used_remote_only)
@@ -1762,10 +1881,26 @@ class MoE(nn.Module):
         ):
             reduce_dtype = torch.float16 if self.reduce_fp16_enabled else x.dtype
             y_reduce = y.to(reduce_dtype)
+            chunked_finalize = (
+                self.moe_reduce_cast_chunk_tokens > 0
+                and y_reduce.dim() == 2
+                and y_reduce.size(0) > self.moe_reduce_cast_chunk_tokens
+            )
+            if chunked_finalize:
+                del y
             dist.all_reduce(y_reduce)
-            y = y_reduce.to(torch.float32)
-        y += shared
-        return y.type_as(x).view(shape)
+            if chunked_finalize:
+                y = self._finalize_reduced_moe(y_reduce, shared, x.dtype)
+                reduced_moe = True
+            else:
+                y = y_reduce.to(torch.float32)
+        if reduced_moe_ready and not reduced_moe:
+            y = self._finalize_reduced_moe(y, shared, x.dtype)
+            reduced_moe = True
+        if not reduced_moe:
+            y += shared
+            y = y.type_as(x)
+        return y.view(shape)
 
 
 class Block(nn.Module):
@@ -1804,6 +1939,7 @@ class Block(nn.Module):
         self._hc_post_cuda_available = self._hc_cuda_enabled and hasattr(self._hc_cuda_ext, "hc_post_forward")
         self.layer_profile_enabled = _env_enabled("DEEPSEEK_LAYER_PROFILE")
         self.prefetch_moe_before_ffn = _env_enabled("DEEPSEEK_GPU_PREFILL_MOE_PREFETCH_BEFORE_FFN")
+        self.hc_pre_chunk_tokens = max(0, int(os.getenv("DEEPSEEK_HC_PRE_CHUNK_TOKENS", "16384")))
 
     def prefetch_gpu_prefill_moe(self, device: torch.device, token_count: int) -> None:
         self.ffn.prefetch_gpu_prefill_moe(device, token_count)
@@ -1854,9 +1990,7 @@ class Block(nn.Module):
             return False
         return self.hc_fp16_mode in {"1", "true", "yes", "all", kind}
 
-    def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
-        shape, dtype = x.size(), x.dtype
-        x = x.flatten(2).float()
+    def _hc_pre_impl(self, x: torch.Tensor, shape: torch.Size, dtype: torch.dtype, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
         kind = "attn" if hc_fn is self.hc_attn_fn else "ffn"
         if self.hc_int8_enabled:
@@ -1865,7 +1999,7 @@ class Block(nn.Module):
             mixes = self._hc_linear_fp16(x, hc_fn) * rsqrt
         else:
             mixes = F.linear(x, hc_fn) * rsqrt
-        if self.hc_pre_cuda_enabled and self._hc_pre_cuda_available and x.is_cuda and x.size(0) == 1 and x.size(1) == 1 and self.hc_mult == 4:
+        if self.hc_pre_cuda_enabled and self._hc_pre_cuda_available and x.is_cuda and self.hc_mult == 4:
             y, _pre, post, comb = self._hc_cuda_ext.hc_split_pre_forward(
                 mixes.contiguous(),
                 x.view(shape).contiguous(),
@@ -1880,8 +2014,43 @@ class Block(nn.Module):
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
         return y.to(dtype), post, comb
 
+    def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
+        shape, dtype = x.size(), x.dtype
+        chunk = self.hc_pre_chunk_tokens
+        if chunk > 0 and x.size(1) > chunk:
+            y = torch.empty((shape[0], shape[1], shape[3]), device=x.device, dtype=dtype)
+            post = torch.empty((shape[0], shape[1], self.hc_mult), device=x.device, dtype=torch.float32)
+            comb = torch.empty((shape[0], shape[1], self.hc_mult, self.hc_mult), device=x.device, dtype=torch.float32)
+            for start in range(0, x.size(1), chunk):
+                end = min(start + chunk, x.size(1))
+                part = x[:, start:end].flatten(2).float().contiguous()
+                part_shape = torch.Size((shape[0], end - start, shape[2], shape[3]))
+                y_part, post_part, comb_part = self._hc_pre_impl(
+                    part,
+                    part_shape,
+                    dtype,
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                )
+                y[:, start:end].copy_(y_part)
+                post[:, start:end].copy_(post_part)
+                comb[:, start:end].copy_(comb_part)
+                del part, y_part, post_part, comb_part
+            return y, post, comb
+        return self._hc_pre_impl(x.flatten(2).float(), shape, dtype, hc_fn, hc_scale, hc_base)
+
     def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
-        if self.hc_post_cuda_enabled and self._hc_post_cuda_available and x.is_cuda and x.size(0) == 1 and x.size(1) == 1 and residual.size(2) == 4:
+        if (
+            self.hc_post_cuda_enabled
+            and self._hc_post_cuda_available
+            and x.is_cuda
+            and residual.dim() == 4
+            and residual.size(2) == 4
+            and residual.size(0) == x.size(0)
+            and residual.size(1) == x.size(1)
+            and residual.size(3) == x.size(2)
+        ):
             return self._hc_cuda_ext.hc_post_forward(
                 x.contiguous(),
                 residual.contiguous(),
@@ -1963,7 +2132,8 @@ class ParallelHead(nn.Module):
         return F.linear(x.float(), self.weight)
 
     def forward(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, norm: RMSNorm, keep_all_positions: bool = False):
-        # x: [b,s,hc,d]
+        if not keep_all_positions:
+            x = x[:, -1:]
         x = self.hc_head(x, hc_fn, hc_scale, hc_base)
         logits = self.get_logits(norm(x), keep_all_positions=keep_all_positions)
         if world_size > 1:
@@ -1973,6 +2143,8 @@ class ParallelHead(nn.Module):
         return logits
 
     def next_token(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, norm: RMSNorm, keep_all_positions: bool = False) -> torch.Tensor:
+        if not keep_all_positions:
+            x = x[:, -1:]
         x = self.hc_head(x, hc_fn, hc_scale, hc_base)
         logits = self.get_logits(norm(x), keep_all_positions=keep_all_positions)
         values, indices = logits.max(dim=-1)

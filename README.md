@@ -44,21 +44,20 @@ Best currently validated path:
 
 - Routed MoE expert weights live on CPU.
 - Decode uses active routed-expert H2D staging and GPU MoE compute.
+- Cross-layer MoE prefetch predicts the next layer's local experts and overlaps their H2D staging with current-layer work.
 - Shared experts use INT8 GPU kernels.
 - Logical PD scheduler is enabled.
 - OpenAI service uses the same default optimized environment as the best scheduler script.
 
 Representative benchmark results on this machine:
 
-| Case | Prefill tokens | Decode tokens | Prefill | Decode TPS | Notes |
+| Scenario | Prompt / prefill tokens | Decode tokens | Prefill | Decode TPS | Notes |
 | --- | ---: | ---: | ---: | ---: | --- |
-| short_short | 1 | 7 | ~2.05s in latest smoke | 2.59 tok/s | `PD_CASE=short_short` smoke |
-| short_short | 1 | 7 | ~4.04s | 2.67 tok/s | prior all-case run with active GPU MoE |
-| short_long | 1 | 9 | ~4.67s | 2.71 tok/s | prior all-case run with active GPU MoE |
-| long_short | ~2k | 7 | ~14.00s | 2.73 tok/s | prior all-case run with active GPU MoE |
-| long_long | ~2k | 63 | ~12.75s | 2.64 tok/s | prior all-case run with active GPU MoE |
+| Maximum validated context | 65,536 | 2 | 257.45s (~255 tok/s) | n/a | OpenAI path, content check returned `OK`. |
+| Long prompt decode | 2,148 | 63 | 7.85s (~274 tok/s) | 2.66 tok/s | 2K prompt, pre-cross-layer-prefetch reference. |
+| Current decode best | 29 | 127 | ~1.7-3.2s observed | 3.16 tok/s mean | OpenAI path, K10/local-limit2 cross-layer prefetch, 3 fresh runs: 3.135/3.168/3.170 tok/s. |
 
-The short prefill number is noisy on this machine, so compare decode TPS and long-prompt cases when evaluating optimization changes.
+The runtime has validated 65,536-token prompts on this 4 x RTX 2080 Ti machine. The server script keeps `MAX_MODEL_LEN=4096` by default for normal serving; set `MAX_MODEL_LEN=65536` explicitly when testing the maximum context path. Short prefill numbers are noisy on this machine, so compare decode TPS and long-prompt cases when evaluating optimization changes.
 
 ## Quickstart
 

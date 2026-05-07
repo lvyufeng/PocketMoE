@@ -470,7 +470,7 @@ class GPUPrefillMoEBackend:
             route_count = int(local_ids.numel())
             if self._w1q is None or self._prepared_device != x.device:
                 self._stage_local_experts(x.device, local_ids)
-            else:
+            elif len(self._staged_local_experts) < self.n_local_experts:
                 unstaged_local_ids = [local_id for local_id in local_ids.tolist() if int(local_id) not in self._staged_local_experts]
                 if unstaged_local_ids:
                     self._stage_local_experts(
@@ -522,7 +522,7 @@ class GPUPrefillMoEBackend:
             return torch.zeros((x.shape[0], self.dim), device=x.device, dtype=torch.float32)
         if self._w1q is None or self._prepared_device != x.device:
             self._stage_local_experts(x.device, _local_ids)
-        else:
+        elif len(self._staged_local_experts) < self.n_local_experts:
             unstaged_local_ids = [local_id for local_id in _local_ids.tolist() if int(local_id) not in self._staged_local_experts]
             if unstaged_local_ids:
                 self._stage_local_experts(

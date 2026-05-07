@@ -1039,6 +1039,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("c4_topk_from_scores", &c4_topk_from_scores, "C4 indexer top-k from scores (CUDA)");
     m.def("hc_split_pre_forward", &hc_split_pre_forward, "HC split/sinkhorn/pre-sum forward (CUDA)");
     m.def("hc_post_forward", &hc_post_forward, "HC post forward (CUDA)");
+    m.def("moe_group_routes", &moe_group_routes, "group MoE routes by local expert (CUDA)");
     m.def("moe_single_token_int8_forward", &moe_single_token_int8_forward, "single-token top-k MoE int8 forward (CUDA)");
     m.def("moe_single_token_int8_forward_v2", &moe_single_token_int8_forward_v2, "single-token top-k MoE int8 forward with compact buffer + slot map (CUDA)");
     m.def("moe_prefill_int8_grouped_forward", &moe_prefill_int8_grouped_forward, "prefill MoE grouped int8 forward (CUDA)");

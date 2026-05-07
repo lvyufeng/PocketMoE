@@ -83,6 +83,174 @@ def _phase_env_enabled(suffix: str, default: bool = False) -> bool:
     return default
 
 
+def _parse_int_list_env(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
+    values = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError:
+            continue
+        if value > 0:
+            values.append(value)
+    return tuple(sorted(set(values))) or default
+
+
+class _CrossLayerGateProfiler:
+    def __init__(self):
+        self.enabled = _env_enabled("DEEPSEEK_GPU_MOE_CROSS_LAYER_PROFILE")
+        self.ks = _parse_int_list_env("DEEPSEEK_GPU_MOE_CROSS_LAYER_PROFILE_KS", (6, 8, 12, 16, 24, 32))
+        self.max_k = max(self.ks) if self.ks else 0
+        self.percentile = float(os.getenv("DEEPSEEK_GPU_MOE_CROSS_LAYER_PROFILE_PERCENTILE", "75"))
+        self.print_every = max(1, int(os.getenv("DEEPSEEK_GPU_MOE_CROSS_LAYER_PROFILE_EVERY", "256")))
+        self.max_tokens = max(1, int(os.getenv("DEEPSEEK_GPU_MOE_CROSS_LAYER_PROFILE_MAX_TOKENS", "4")))
+        self.events = 0
+        self.tokens = 0
+        self.routes = 0
+        self.local_true = 0
+        self.hits = {k: 0 for k in self.ks}
+        self.local_hits = {k: 0 for k in self.ks}
+        self.local_pred = {k: 0 for k in self.ks}
+        self.local_waste = {k: 0 for k in self.ks}
+        self.percentile_hits = 0
+        self.percentile_local_hits = 0
+        self.percentile_local_pred = 0
+        self.percentile_local_waste = 0
+        self.percentile_pred = 0
+        self._announced = False
+
+    def should_profile(self, token_count: int) -> bool:
+        return self.enabled and os.getenv("DEEPSEEK_PD_ACTIVE_PHASE", "") == "decode" and token_count <= self.max_tokens
+
+    def observe(
+        self,
+        layer_id: int,
+        source_layer_id: int,
+        pred_topk: torch.Tensor,
+        pred_percentile: torch.Tensor | None,
+        true_indices: torch.Tensor,
+        experts_start_idx: int,
+        experts_end_idx: int,
+    ) -> None:
+        if not self.enabled:
+            return
+        if pred_topk.numel() == 0 or true_indices.numel() == 0:
+            return
+        pred_cpu = pred_topk.detach().to(device="cpu", dtype=torch.long)
+        true_cpu = true_indices.detach().to(device="cpu", dtype=torch.long)
+        pct_cpu = pred_percentile.detach().to(device="cpu", dtype=torch.long) if pred_percentile is not None else None
+        if pred_cpu.dim() != 2 or true_cpu.dim() != 2 or pred_cpu.size(0) != true_cpu.size(0):
+            return
+        self.events += 1
+        self.tokens += int(true_cpu.size(0))
+        self.routes += int(true_cpu.numel())
+        for row in range(true_cpu.size(0)):
+            true_values = [int(v) for v in true_cpu[row].tolist()]
+            true_set = set(true_values)
+            local_true_set = {v for v in true_set if experts_start_idx <= v < experts_end_idx}
+            self.local_true += len(local_true_set)
+            pred_values = [int(v) for v in pred_cpu[row].tolist() if int(v) >= 0]
+            for k in self.ks:
+                pred_set = set(pred_values[:k])
+                self.hits[k] += sum(1 for v in true_values if v in pred_set)
+                local_pred_set = {v for v in pred_set if experts_start_idx <= v < experts_end_idx}
+                self.local_hits[k] += len(local_true_set & local_pred_set)
+                self.local_pred[k] += len(local_pred_set)
+                self.local_waste[k] += len(local_pred_set - local_true_set)
+            if pct_cpu is not None:
+                pct_set = {int(v) for v in pct_cpu[row].tolist() if int(v) >= 0}
+                self.percentile_hits += sum(1 for v in true_values if v in pct_set)
+                pct_local_set = {v for v in pct_set if experts_start_idx <= v < experts_end_idx}
+                self.percentile_local_hits += len(local_true_set & pct_local_set)
+                self.percentile_local_pred += len(pct_local_set)
+                self.percentile_local_waste += len(pct_local_set - local_true_set)
+                self.percentile_pred += len(pct_set)
+        if not self._announced:
+            print(
+                f"cross_layer_gate_profile_config rank={rank} ks={','.join(str(k) for k in self.ks)} "
+                f"percentile={self.percentile:g} max_tokens={self.max_tokens}",
+                flush=True,
+            )
+            self._announced = True
+        if self.events % self.print_every == 0:
+            self.print(layer_id, source_layer_id)
+
+    def print(self, layer_id: int, source_layer_id: int) -> None:
+        routes = max(1, self.routes)
+        local_true = max(1, self.local_true)
+        events = max(1, self.events)
+        parts = []
+        for k in self.ks:
+            parts.append(
+                f"k{k}_route_hit={self.hits[k] / routes:.4f} "
+                f"k{k}_local_hit={self.local_hits[k] / local_true:.4f} "
+                f"k{k}_local_pred_per_event={self.local_pred[k] / events:.2f} "
+                f"k{k}_local_waste_per_event={self.local_waste[k] / events:.2f}"
+            )
+        pct = ""
+        if self.percentile_pred > 0:
+            pct = (
+                f" pct_route_hit={self.percentile_hits / routes:.4f}"
+                f" pct_local_hit={self.percentile_local_hits / local_true:.4f}"
+                f" pct_pred_per_token={self.percentile_pred / max(1, self.tokens):.2f}"
+                f" pct_local_pred_per_event={self.percentile_local_pred / events:.2f}"
+                f" pct_local_waste_per_event={self.percentile_local_waste / events:.2f}"
+            )
+        print(
+            f"cross_layer_gate_profile rank={rank} events={self.events} tokens={self.tokens} "
+            f"routes={self.routes} local_true_per_event={self.local_true / events:.2f} "
+            f"last={source_layer_id}->{layer_id} " + " ".join(parts) + pct,
+            flush=True,
+        )
+
+
+_cross_layer_gate_profiler_instance = None
+_cross_layer_gate_profile_env_enabled = _env_enabled("DEEPSEEK_GPU_MOE_CROSS_LAYER_PROFILE")
+_cross_layer_gate_prefetch_env_enabled = _env_enabled("DEEPSEEK_GPU_MOE_CROSS_LAYER_PREFETCH")
+_cross_layer_gate_prefetch_k = max(0, int(os.getenv("DEEPSEEK_GPU_MOE_CROSS_LAYER_PREFETCH_K", "10")))
+_cross_layer_gate_prefetch_local_limit = max(0, int(os.getenv("DEEPSEEK_GPU_MOE_CROSS_LAYER_PREFETCH_LOCAL_LIMIT", "2")))
+_cross_layer_gate_prediction_max_tokens = max(1, int(os.getenv("DEEPSEEK_GPU_MOE_CROSS_LAYER_PROFILE_MAX_TOKENS", "4")))
+
+
+def _cross_layer_gate_profile_enabled() -> bool:
+    return _cross_layer_gate_profile_env_enabled
+
+
+def _cross_layer_gate_prefetch_enabled() -> bool:
+    return _cross_layer_gate_prefetch_env_enabled and _cross_layer_gate_prefetch_k > 0
+
+
+def _cross_layer_gate_prediction_enabled() -> bool:
+    return _cross_layer_gate_profile_enabled() or _cross_layer_gate_prefetch_enabled()
+
+
+def _cross_layer_gate_prediction_should_run(token_count: int) -> bool:
+    return (
+        _cross_layer_gate_prediction_enabled()
+        and os.getenv("DEEPSEEK_PD_ACTIVE_PHASE", "") == "decode"
+        and token_count <= _cross_layer_gate_prediction_max_tokens
+    )
+
+
+def _cross_layer_gate_prediction_max_k() -> int:
+    max_k = _cross_layer_gate_prefetch_k if _cross_layer_gate_prefetch_enabled() else 0
+    if _cross_layer_gate_profile_enabled():
+        max_k = max(max_k, _cross_layer_gate_profiler().max_k)
+    return max_k
+
+
+def _cross_layer_gate_profiler() -> _CrossLayerGateProfiler:
+    global _cross_layer_gate_profiler_instance
+    if _cross_layer_gate_profiler_instance is None:
+        _cross_layer_gate_profiler_instance = _CrossLayerGateProfiler()
+    return _cross_layer_gate_profiler_instance
+
+
 def _pack_fp4_weight_rows_for_tile_decode(
     weight: Packed4BitWeightAlongK,
     scale: torch.Tensor,
@@ -1163,6 +1331,37 @@ class Gate(nn.Module):
         else:
             self.bias = nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32))
 
+    def predict_indices_from_proxy(
+        self,
+        x: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+        max_k: int,
+        percentile: float,
+        compute_percentile: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.hash:
+            if input_ids is None:
+                return torch.empty((0, 0), device=x.device, dtype=torch.long), None
+            indices = self.tid2eid[input_ids].to(torch.long)
+            return indices, indices if compute_percentile else None
+        scores = linear(x.float(), self.weight.float())
+        if self.score_func == "softmax":
+            scores = scores.softmax(dim=-1)
+        elif self.score_func == "sigmoid":
+            scores = scores.sigmoid()
+        else:
+            scores = F.softplus(scores).sqrt()
+        if self.bias is not None:
+            scores = scores + self.bias
+        topk_count = min(max_k, scores.size(-1))
+        pred_topk = scores.topk(topk_count, dim=-1)[1]
+        if not compute_percentile:
+            return pred_topk, None
+        pct_fraction = max(0.0, min(1.0, (100.0 - percentile) / 100.0))
+        pct_count = min(scores.size(-1), max(self.topk, int(math.ceil(scores.size(-1) * pct_fraction))))
+        pred_percentile = scores.topk(pct_count, dim=-1)[1] if pct_count > 0 else None
+        return pred_topk, pred_percentile
+
     def forward(self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         scores = linear(x.float(), self.weight.float())
         if self.score_func == "softmax":
@@ -1498,6 +1697,98 @@ class MoE(nn.Module):
         self.gpu_prefill_moe_chunk_tokens = max(0, int(os.getenv("DEEPSEEK_GPU_PREFILL_MOE_CHUNK_TOKENS", "0")))
         self.moe_reduce_cast_chunk_tokens = max(0, int(os.getenv("DEEPSEEK_MOE_REDUCE_CAST_CHUNK_TOKENS", "8192")))
         self.gpu_prefill_backend = None
+        self._cross_layer_pred_source_layer_id = -1
+        self._cross_layer_pred_topk = None
+        self._cross_layer_pred_percentile = None
+        self._cross_layer_pred_prefetch_done = False
+
+    def set_cross_layer_gate_prediction(
+        self,
+        source_layer_id: int,
+        pred_topk: torch.Tensor,
+        pred_percentile: torch.Tensor | None,
+    ) -> None:
+        self._cross_layer_pred_source_layer_id = source_layer_id
+        self._cross_layer_pred_topk = pred_topk
+        self._cross_layer_pred_percentile = pred_percentile
+        self._cross_layer_pred_prefetch_done = False
+
+    def prefetch_cross_layer_gate_prediction(self, device: torch.device) -> None:
+        if self._cross_layer_pred_prefetch_done or not _cross_layer_gate_prefetch_enabled():
+            return
+        pred_topk = self._cross_layer_pred_topk
+        if pred_topk is None or pred_topk.numel() == 0:
+            return
+        if (
+            self._pd_active_phase() != "decode"
+            or not self.gpu_decode_active_moe_enabled
+            or self.cpu_backend is None
+            or self.experts_end_idx <= self.experts_start_idx
+            or device.type != "cuda"
+        ):
+            return
+        K = _cross_layer_gate_prefetch_k
+        limit = _cross_layer_gate_prefetch_local_limit
+        if pred_topk.size(0) == 1 and limit > 0:
+            row_ids = pred_topk[0, :K].detach().to("cpu", dtype=torch.long).tolist()
+            start, end = self.experts_start_idx, self.experts_end_idx
+            picked: list[int] = []
+            for eid in row_ids:
+                if start <= eid < end:
+                    picked.append(eid - start)
+                    if len(picked) >= limit:
+                        break
+            if not picked:
+                self._cross_layer_pred_prefetch_done = True
+                return
+            local_tensor = torch.tensor(picked, dtype=torch.long, device="cpu")
+            backend = self._ensure_gpu_prefill_backend()
+            backend._stage_local_experts(device, local_tensor, async_copy=True)
+            self._cross_layer_pred_prefetch_done = True
+            return
+        pred = pred_topk[:, :K].contiguous()
+        if limit > 0:
+            local_mask = (pred >= self.experts_start_idx) & (pred < self.experts_end_idx)
+            if not bool(local_mask.any().item()):
+                self._cross_layer_pred_prefetch_done = True
+                return
+            rows = []
+            for row in range(pred.size(0)):
+                local_row = pred[row][local_mask[row]][:limit]
+                if local_row.numel() > 0:
+                    rows.append(local_row)
+            if not rows:
+                self._cross_layer_pred_prefetch_done = True
+                return
+            max_len = max(row.numel() for row in rows)
+            limited = torch.full((len(rows), max_len), self.experts_start_idx - 1, device=pred.device, dtype=pred.dtype)
+            for row_idx, row in enumerate(rows):
+                limited[row_idx, :row.numel()] = row
+            pred = limited
+        self._ensure_gpu_prefill_backend().prefetch_active_experts(device, pred)
+        self._cross_layer_pred_prefetch_done = True
+
+    def _observe_cross_layer_gate_prediction(self, indices: torch.Tensor) -> None:
+        pred_topk = self._cross_layer_pred_topk
+        if pred_topk is None:
+            return
+        pred_percentile = self._cross_layer_pred_percentile
+        source_layer_id = self._cross_layer_pred_source_layer_id
+        self._cross_layer_pred_source_layer_id = -1
+        self._cross_layer_pred_topk = None
+        self._cross_layer_pred_percentile = None
+        self._cross_layer_pred_prefetch_done = False
+        if not _cross_layer_gate_profile_enabled():
+            return
+        _cross_layer_gate_profiler().observe(
+            layer_id=self.layer_id,
+            source_layer_id=source_layer_id,
+            pred_topk=pred_topk,
+            pred_percentile=pred_percentile,
+            true_indices=indices,
+            experts_start_idx=self.experts_start_idx,
+            experts_end_idx=self.experts_end_idx,
+        )
 
     def _finalize_reduced_moe(self, y_reduce: torch.Tensor, shared: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
         chunk = self.moe_reduce_cast_chunk_tokens
@@ -1682,10 +1973,11 @@ class MoE(nn.Module):
         t_h2d = time.perf_counter() if self._profile_enabled else 0.0
         return y, t_sync - t0, t_reduce - t_sync, t_h2d - t_reduce
 
-    def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, input_ids: torch.Tensor, prefetch_next: Optional[nn.Module] = None) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x, input_ids.flatten())
+        self._observe_cross_layer_gate_prediction(indices)
         if self._rank_route_profile_enabled and x.shape[0] == 1:
             local = ((indices >= self.experts_start_idx) & (indices < self.experts_end_idx)).sum().item()
             print(f"rank_route layer={self.layer_id} rank={rank} local={int(local)} ids={indices.flatten().tolist()}", flush=True)
@@ -1742,6 +2034,8 @@ class MoE(nn.Module):
             backend.prefetch_active_experts(x.device, indices)
             if hasattr(backend, "prefetch_active_experts_to_cache"):
                 backend.prefetch_active_experts_to_cache(x.device, indices)
+            if prefetch_next is not None and hasattr(prefetch_next, "ffn"):
+                prefetch_next.ffn.prefetch_cross_layer_gate_prediction(x.device)
             shared = self.shared_experts(x)
             y = backend.forward(
                 x,
@@ -2081,9 +2375,20 @@ class Block(nn.Module):
         x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         t_hc_ffn_pre = self._profile_sync() if profile else 0.0
         x = self.ffn_norm(x)
+        if input_ids is not None and prefetch_next is not None and _cross_layer_gate_prediction_should_run(input_ids.numel()):
+            max_k = _cross_layer_gate_prediction_max_k()
+            if max_k > 0 and hasattr(prefetch_next, "ffn") and hasattr(prefetch_next.ffn, "gate"):
+                pred_topk, pred_percentile = prefetch_next.ffn.gate.predict_indices_from_proxy(
+                    x.view(-1, x.size(-1)),
+                    input_ids.flatten(),
+                    max_k,
+                    _cross_layer_gate_profiler().percentile if _cross_layer_gate_profile_enabled() else 75.0,
+                    compute_percentile=_cross_layer_gate_profile_enabled(),
+                )
+                prefetch_next.ffn.set_cross_layer_gate_prediction(self.layer_id, pred_topk, pred_percentile)
         if self.prefetch_moe_before_ffn and prefetch_next is not None and input_ids is not None:
             prefetch_next.prefetch_gpu_prefill_moe(x.device, input_ids.numel())
-        x = self.ffn(x, input_ids)
+        x = self.ffn(x, input_ids, prefetch_next=prefetch_next)
         if not self.prefetch_moe_before_ffn and prefetch_next is not None and input_ids is not None:
             prefetch_next.prefetch_gpu_prefill_moe(x.device, input_ids.numel())
         t_moe = self._profile_sync() if profile else 0.0

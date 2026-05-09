@@ -36,7 +36,70 @@ class _ExpertSlabBudget:
         return True
 
 
+
+
+class _HotExpertCache:
+    def __init__(self):
+        self.enabled = os.getenv("DEEPSEEK_GPU_MOE_DECODE_HOT_CACHE", "0").lower() in {"1", "true", "yes"}
+        self.capacity_bytes = int(os.getenv("DEEPSEEK_GPU_MOE_EXPERT_SLAB_BUDGET_BYTES", str(int(3.0 * 1024 ** 3))))
+        self.used_bytes = 0
+        self.entries = OrderedDict()
+        self.profile = os.getenv("DEEPSEEK_GPU_MOE_EXPERT_CACHE_PROFILE", "0").lower() in {"1", "true", "yes"}
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    @staticmethod
+    def _entry_nbytes(entry) -> int:
+        return sum(t.numel() * t.element_size() for t in entry)
+
+    @staticmethod
+    def _src_nbytes(src) -> int:
+        return sum(t.numel() * t.element_size() for t in src)
+
+    def lookup(self, key):
+        entry = self.entries.pop(key, None)
+        if entry is None:
+            self.misses += 1
+            return None
+        self.entries[key] = entry
+        self.hits += 1
+        return entry
+
+    def insert(self, key, src, device: torch.device, copy_stream: torch.cuda.Stream):
+        if not self.enabled:
+            return None
+        existing = self.entries.pop(key, None)
+        if existing is not None:
+            self.used_bytes -= self._entry_nbytes(existing)
+        nbytes = self._src_nbytes(src)
+        if nbytes > self.capacity_bytes:
+            return None
+        while self.entries and self.used_bytes + nbytes > self.capacity_bytes:
+            _old_key, old_entry = self.entries.popitem(last=False)
+            self.used_bytes -= self._entry_nbytes(old_entry)
+            self.evictions += 1
+        if self.used_bytes + nbytes > self.capacity_bytes:
+            return None
+        with torch.cuda.device(device):
+            entry = tuple(torch.empty_like(t, device=device) for t in src)
+        with torch.cuda.stream(copy_stream):
+            for dst, src_tensor in zip(entry, src):
+                dst.copy_(src_tensor, non_blocking=True)
+                dst.record_stream(copy_stream)
+        self.entries[key] = entry
+        self.used_bytes += nbytes
+        if self.profile and (self.hits + self.misses) % 256 == 0:
+            print(
+                f"gpu_moe_hot_cache entries={len(self.entries)} used={self.used_bytes / 1024 ** 2:.1f}MiB "
+                f"hits={self.hits} misses={self.misses} evictions={self.evictions}",
+                flush=True,
+            )
+        return entry
+
+
 _SLAB_BUDGET = _ExpertSlabBudget()
+_HOT_EXPERT_CACHE = _HotExpertCache()
 
 
 class GPUPrefillMoEBackend:
@@ -65,7 +128,14 @@ class GPUPrefillMoEBackend:
         self._staged_local_experts = set()
         self._stage_event: Optional[torch.cuda.Event] = None
         self._stage_pending = False
+        self._staged_arena_format: str = "int8"
         self.profile_enabled = os.getenv("DEEPSEEK_GPU_PREFILL_MOE_PROFILE", "0").lower() in {"1", "true", "yes"}
+        self.decode_profile_enabled = os.getenv("DEEPSEEK_GPU_MOE_DECODE_PROFILE", "0").lower() in {"1", "true", "yes"}
+        self._last_stage_missing = 0
+        self._last_stage_format = "none"
+        self._last_stage_async = False
+        self._last_stage_cache_hits = 0
+        self._last_stage_cache_misses = 0
         self.grouped_gemm_enabled = os.getenv("DEEPSEEK_GPU_PREFILL_MOE_GROUPED_GEMM", "0").lower() in {"1", "true", "yes"}
         self.bucketed_gemm_enabled = os.getenv("DEEPSEEK_GPU_PREFILL_MOE_BUCKETED_GEMM", "0").lower() in {"1", "true", "yes"}
         self.single_token_group_enabled = os.getenv("DEEPSEEK_GPU_MOE_SINGLE_TOKEN_GROUP", "1").lower() in {"1", "true", "yes"}
@@ -193,7 +263,12 @@ class GPUPrefillMoEBackend:
             expert_ids = list(range(self.experts_start_idx, self.experts_end_idx))
         return expert_ids
 
-    def _stage_local_experts(self, device: torch.device, local_experts: torch.Tensor | None = None, async_copy: bool = False) -> None:
+    def _stage_local_experts(self, device: torch.device, local_experts: torch.Tensor | None = None, async_copy: bool = False, prefer_fp4: bool = True) -> None:
+        if self._w1q is not None:
+            if not prefer_fp4 and self._staged_arena_format != "int8":
+                self.release_cache()
+            elif prefer_fp4 and self._staged_arena_format != "fp4" and hasattr(self.cpu_backend, "get_fp4_arena") and self.cpu_backend.get_fp4_arena() is not None:
+                self.release_cache()
         if self._cuda_ext is None:
             self._cuda_ext = load_cuda_kernel()
         if self._cuda_ext is None or not hasattr(self._cuda_ext, "int8_gemm_pair_forward"):
@@ -203,14 +278,27 @@ class GPUPrefillMoEBackend:
             return
         missing = [expert_id for expert_id in expert_ids if expert_id - self.experts_start_idx not in self._staged_local_experts]
         if not missing:
+            self._last_stage_missing = 0
             if self._prepared_device == device:
                 self._touch_cache(device)
             return
+        self._last_stage_missing = len(missing)
         if self._stage_pending:
             self._synchronize_pending_stage()
         t0 = time.perf_counter() if self.profile_enabled else 0.0
         local_ids = sorted(expert_id - self.experts_start_idx for expert_id in missing)
-        arena = self.cpu_backend.get_int8_arena() if hasattr(self.cpu_backend, "get_int8_arena") else None
+        # Prefer FP4 pinned arena when available; falls through to int8 arena
+        # otherwise. The arena type drives _ensure_storage's GPU dtype/shape and
+        # the forward kernel selection (FP4 vs int8) downstream via
+        # `self._staged_arena_format`.
+        arena_format = "int8"
+        arena = None
+        if prefer_fp4 and hasattr(self.cpu_backend, "get_fp4_arena"):
+            arena = self.cpu_backend.get_fp4_arena()
+            if arena is not None:
+                arena_format = "fp4"
+        if arena is None and hasattr(self.cpu_backend, "get_int8_arena"):
+            arena = self.cpu_backend.get_int8_arena()
         if arena is not None:
             first_packed = tuple(buf[0] for buf in arena)
             self._ensure_storage(device, first_packed)
@@ -221,6 +309,8 @@ class GPUPrefillMoEBackend:
             if async_copy:
                 copy_stream.wait_stream(current_stream)
             event = torch.cuda.Event()
+            self._last_stage_cache_hits = 0
+            self._last_stage_cache_misses = 0
             with torch.cuda.stream(copy_stream):
                 if len(local_ids) == self.n_local_experts and local_ids[0] == 0 and local_ids[-1] == self.n_local_experts - 1:
                     self._w1q.copy_(arena[0], non_blocking=True)
@@ -231,12 +321,34 @@ class GPUPrefillMoEBackend:
                     self._w3s.copy_(arena[5], non_blocking=True)
                 else:
                     for local_id in local_ids:
-                        self._w1q[local_id].copy_(arena[0][local_id], non_blocking=True)
-                        self._w1s[local_id].copy_(arena[1][local_id], non_blocking=True)
-                        self._w2q[local_id].copy_(arena[2][local_id], non_blocking=True)
-                        self._w2s[local_id].copy_(arena[3][local_id], non_blocking=True)
-                        self._w3q[local_id].copy_(arena[4][local_id], non_blocking=True)
-                        self._w3s[local_id].copy_(arena[5][local_id], non_blocking=True)
+                        cache_key = None
+                        cached = None
+                        if arena_format == "fp4" and _HOT_EXPERT_CACHE.enabled:
+                            cache_key = (self._device_index(device), int(self.cpu_backend.layer_idx), int(local_id + self.experts_start_idx), arena_format)
+                            cached = _HOT_EXPERT_CACHE.lookup(cache_key)
+                        if cached is not None:
+                            self._last_stage_cache_hits += 1
+                            self._w1q[local_id].copy_(cached[0], non_blocking=True)
+                            self._w1s[local_id].copy_(cached[1], non_blocking=True)
+                            self._w2q[local_id].copy_(cached[2], non_blocking=True)
+                            self._w2s[local_id].copy_(cached[3], non_blocking=True)
+                            self._w3q[local_id].copy_(cached[4], non_blocking=True)
+                            self._w3s[local_id].copy_(cached[5], non_blocking=True)
+                            for tensor in cached:
+                                tensor.record_stream(copy_stream)
+                            continue
+                        if cache_key is not None:
+                            self._last_stage_cache_misses += 1
+                        src = (arena[0][local_id], arena[1][local_id], arena[2][local_id], arena[3][local_id], arena[4][local_id], arena[5][local_id])
+                        self._w1q[local_id].copy_(src[0], non_blocking=True)
+                        self._w1s[local_id].copy_(src[1], non_blocking=True)
+                        self._w2q[local_id].copy_(src[2], non_blocking=True)
+                        self._w2s[local_id].copy_(src[3], non_blocking=True)
+                        self._w3q[local_id].copy_(src[4], non_blocking=True)
+                        self._w3s[local_id].copy_(src[5], non_blocking=True)
+                        if cache_key is not None:
+                            gpu_src = (self._w1q[local_id], self._w1s[local_id], self._w2q[local_id], self._w2s[local_id], self._w3q[local_id], self._w3s[local_id])
+                            _HOT_EXPERT_CACHE.insert(cache_key, gpu_src, device, copy_stream)
                 event.record(copy_stream)
             if async_copy:
                 for tensor in (self._w1q, self._w1s, self._w2q, self._w2s, self._w3q, self._w3s):
@@ -245,12 +357,16 @@ class GPUPrefillMoEBackend:
                 self._staged_local_experts.add(expert_id - self.experts_start_idx)
             self._stage_event = event
             self._stage_pending = True
+            self._last_stage_format = arena_format
+            self._last_stage_async = bool(async_copy)
             self._prepared_device = device
+            self._staged_arena_format = arena_format
             self._touch_cache(device)
             if self.profile_enabled:
                 t_done = time.perf_counter()
                 print(
                     f"gpu_prefill_moe_stage layer={self.cpu_backend.layer_idx} experts={len(missing)} async={int(async_copy)} arena=1 "
+                    f"format={arena_format} "
                     f"prepare={t_prepare - t0:.4f}s pin=0.0000s copy={t_done - t_pin:.4f}s total={t_done - t0:.4f}s",
                     flush=True,
                 )
@@ -296,6 +412,7 @@ class GPUPrefillMoEBackend:
             self._stage_event = event
             self._stage_pending = True
             self._prepared_device = device
+            self._staged_arena_format = "int8"
             self._touch_cache(device)
             if self.profile_enabled:
                 t_done = time.perf_counter()
@@ -365,6 +482,8 @@ class GPUPrefillMoEBackend:
             self._staged_local_experts.add(expert_id - self.experts_start_idx)
         self._stage_event = event
         self._stage_pending = True
+        self._last_stage_format = "int8"
+        self._last_stage_async = bool(async_copy)
         self._prepared_device = device
         self._touch_cache(device)
         if self.profile_enabled:
@@ -375,10 +494,10 @@ class GPUPrefillMoEBackend:
                 flush=True,
             )
 
-    def prefetch(self, device: torch.device) -> None:
+    def prefetch(self, device: torch.device, prefer_fp4: bool = True) -> None:
         if device.type != "cuda":
             return
-        self._stage_local_experts(device, None, async_copy=True)
+        self._stage_local_experts(device, None, async_copy=True, prefer_fp4=prefer_fp4)
 
     def prefetch_active_experts(self, device: torch.device, indices: torch.Tensor) -> None:
         if device.type != "cuda":
@@ -468,7 +587,7 @@ class GPUPrefillMoEBackend:
                 return torch.zeros((1, self.dim), device=x.device, dtype=torch.float32)
             local_ids = local_ids[local_mask].to(torch.long).unique()
             route_count = int(local_ids.numel())
-            if self._w1q is None or self._prepared_device != x.device:
+            if self._w1q is None or self._prepared_device != x.device or (self._staged_arena_format != "fp4" and hasattr(self.cpu_backend, "get_fp4_arena") and self.cpu_backend.get_fp4_arena() is not None):
                 self._stage_local_experts(x.device, local_ids)
             elif len(self._staged_local_experts) < self.n_local_experts:
                 unstaged_local_ids = [local_id for local_id in local_ids.tolist() if int(local_id) not in self._staged_local_experts]
@@ -480,22 +599,59 @@ class GPUPrefillMoEBackend:
             if self.profile_enabled:
                 torch.cuda.synchronize(x.device)
                 t_compute = time.perf_counter()
+            if self.decode_profile_enabled:
+                current_stream = torch.cuda.current_stream(x.device)
+                wait_start_event = torch.cuda.Event(enable_timing=True)
+                wait_done_event = torch.cuda.Event(enable_timing=True)
+                kernel_done_event = torch.cuda.Event(enable_timing=True)
+                wait_start_event.record(current_stream)
             self.wait_for_stage(x.device)
+            if self.decode_profile_enabled:
+                wait_done_event.record(torch.cuda.current_stream(x.device))
             self._record_staged_weights_on_current_stream(x.device)
             self._touch_cache(x.device)
-            y = self._cuda_ext.moe_single_token_int8_forward(
-                x.contiguous(),
-                indices_row,
-                weights_row,
-                self._w1q,
-                self._w1s,
-                self._w2q,
-                self._w2s,
-                self._w3q,
-                self._w3s,
-                int(self.experts_start_idx),
-                float(swiglu_limit),
-            )
+            if self._staged_arena_format == "fp4" and hasattr(self._cuda_ext, "moe_single_token_fp4_forward"):
+                y = self._cuda_ext.moe_single_token_fp4_forward(
+                    x.contiguous(),
+                    indices_row,
+                    weights_row,
+                    self._w1q,
+                    self._w1s,
+                    self._w2q,
+                    self._w2s,
+                    self._w3q,
+                    self._w3s,
+                    int(self.experts_start_idx),
+                    float(swiglu_limit),
+                )
+            else:
+                y = self._cuda_ext.moe_single_token_int8_forward(
+                    x.contiguous(),
+                    indices_row,
+                    weights_row,
+                    self._w1q,
+                    self._w1s,
+                    self._w2q,
+                    self._w2s,
+                    self._w3q,
+                    self._w3s,
+                    int(self.experts_start_idx),
+                    float(swiglu_limit),
+                )
+            if self.decode_profile_enabled:
+                kernel_done_event.record(torch.cuda.current_stream(x.device))
+                kernel_done_event.synchronize()
+                wait_ms = wait_start_event.elapsed_time(wait_done_event)
+                total_ms = wait_start_event.elapsed_time(kernel_done_event)
+                kernel_ms = wait_done_event.elapsed_time(kernel_done_event)
+                print(
+                    f"gpu_moe_decode_profile layer={self.cpu_backend.layer_idx} routes={route_count} "
+                    f"format={self._staged_arena_format} staged={self._last_stage_missing} "
+                    f"cache_hit={self._last_stage_cache_hits} cache_miss={self._last_stage_cache_misses} "
+                    f"async={int(self._last_stage_async)} wait={wait_ms / 1000.0:.4f}s "
+                    f"kernel={kernel_ms / 1000.0:.4f}s total={total_ms / 1000.0:.4f}s",
+                    flush=True,
+                )
             if self.profile_enabled:
                 torch.cuda.synchronize(x.device)
                 t_done = time.perf_counter()
@@ -520,14 +676,15 @@ class GPUPrefillMoEBackend:
         _local_ids, route_tokens, route_weights, seg_starts = grouped
         if _local_ids.numel() == 0:
             return torch.zeros((x.shape[0], self.dim), device=x.device, dtype=torch.float32)
-        if self._w1q is None or self._prepared_device != x.device:
-            self._stage_local_experts(x.device, _local_ids)
+        if self._w1q is None or self._prepared_device != x.device or self._staged_arena_format != "int8":
+            self._stage_local_experts(x.device, _local_ids, prefer_fp4=False)
         elif len(self._staged_local_experts) < self.n_local_experts:
             unstaged_local_ids = [local_id for local_id in _local_ids.tolist() if int(local_id) not in self._staged_local_experts]
             if unstaged_local_ids:
                 self._stage_local_experts(
                     x.device,
                     torch.tensor(unstaged_local_ids, device=indices.device, dtype=torch.long),
+                    prefer_fp4=False,
                 )
         if self.profile_enabled:
             torch.cuda.synchronize(x.device)
@@ -535,7 +692,25 @@ class GPUPrefillMoEBackend:
         self.wait_for_stage(x.device)
         self._record_staged_weights_on_current_stream(x.device)
         self._touch_cache(x.device)
-        if self.grouped_gemm_enabled and self.bucketed_gemm_enabled and hasattr(self._cuda_ext, "moe_prefill_int8_grouped_gemm_bucketed_forward"):
+        if (
+            os.getenv("DEEPSEEK_GPU_PREFILL_MOE_FP4_DIRECT_GROUPED", "0").lower() in {"1", "true", "yes"}
+            and self._staged_arena_format == "fp4"
+            and hasattr(self._cuda_ext, "moe_prefill_fp4_grouped_gemm_forward")
+        ):
+            y = self._cuda_ext.moe_prefill_fp4_grouped_gemm_forward(
+                x.contiguous(),
+                route_tokens,
+                route_weights.contiguous(),
+                seg_starts,
+                self._w1q,
+                self._w1s,
+                self._w2q,
+                self._w2s,
+                self._w3q,
+                self._w3s,
+                float(swiglu_limit),
+            )
+        elif self.grouped_gemm_enabled and self.bucketed_gemm_enabled and hasattr(self._cuda_ext, "moe_prefill_int8_grouped_gemm_bucketed_forward"):
             y = self._cuda_ext.moe_prefill_int8_grouped_gemm_bucketed_forward(
                 x.contiguous(),
                 route_tokens,

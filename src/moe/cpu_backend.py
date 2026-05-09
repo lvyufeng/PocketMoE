@@ -9,7 +9,8 @@ import time
 import torch
 from torch.autograd.profiler import record_function
 
-from src.kernels.ops import _dequant_fp4_weight_torch, _quantize_int8_weight_torch
+from src.kernels.cuda_loader import load_cuda_kernel
+from src.kernels.ops import Packed4BitWeightAlongK, _dequant_fp4_weight_torch, _quantize_int8_weight_torch
 
 
 _EXT_DIR = Path(__file__).resolve().parents[2] / "build" / "extensions"
@@ -321,6 +322,7 @@ class CPURoutedExpertsBackend:
         self.output_dim = output_dim
         self._pending: _PendingTask | None = None
         self._native_mod = _load_native_mod()
+        self._cuda_ext = None
         self._native_ready = False
         self._native_enabled = False
         self._inter_dim = 0
@@ -329,6 +331,7 @@ class CPURoutedExpertsBackend:
             expert is not None and expert.w1.weight.dtype == torch.int8 for expert in experts
         )
         self._native_int8_enabled = False
+        self._native_fp4_raw_enabled = False
         self._native_w1_ptrs = None
         self._native_w2_ptrs = None
         self._native_w3_ptrs = None
@@ -352,6 +355,13 @@ class CPURoutedExpertsBackend:
         self._int8_arena_enabled = _env_enabled_default_on("DEEPSEEK_GPU_PREFILL_MOE_ARENA")
         self._int8_arena = None  # tuple of 6 pinned tensors or None
         self._int8_arena_filled = False
+        # FP4 arena: single CPU-side store for official FP4 routed experts. It holds
+        # raw [n, O, K/2] weight bytes plus raw ue8m0 [n, O, K/32] scale bytes, and
+        # both CPU prefill and GPU active-expert decode read from this arena.
+        self._fp4_arena_enabled = _env_enabled_default_on("DEEPSEEK_GPU_PREFILL_MOE_FP4_ARENA")
+        self._fp4_arena = None
+        self._expert_fp4_cache = {}
+        self._fp4_weights_prepared = False
         self._executor = _get_worker_executor()
         self._persistent_worker_enabled = _env_enabled("DEEPSEEK_CPU_PERSISTENT_WORKER")
         self._native_persistent_team_enabled = _env_enabled("DEEPSEEK_CPU_NATIVE_PERSISTENT_TEAM")
@@ -491,6 +501,24 @@ class CPURoutedExpertsBackend:
             w3s = expert._cpu_w3_scale if expert._cpu_w3_scale.is_contiguous() else expert._cpu_w3_scale.contiguous()
             cached = self._store_int8_cached(expert_id, (w1, w1s, w2, w2s, w3, w3s))
             return cached
+        if isinstance(expert._cpu_w1, torch.Tensor) and expert._cpu_w1.dtype == torch.uint8:
+            gpu_cached = self._gpu_convert_fp4_expert_to_int8(expert_id)
+            if gpu_cached is not None:
+                return gpu_cached
+            w1_packed = Packed4BitWeightAlongK.convert_from(expert._cpu_w1.view(torch.int8).view(torch.float4_e2m1fn_x2))
+            w2_packed = Packed4BitWeightAlongK.convert_from(expert._cpu_w2.view(torch.int8).view(torch.float4_e2m1fn_x2))
+            w3_packed = Packed4BitWeightAlongK.convert_from(expert._cpu_w3.view(torch.int8).view(torch.float4_e2m1fn_x2))
+            w1_scale = expert._cpu_w1_scale.view(torch.float8_e8m0fnu).to(torch.float32).contiguous()
+            w2_scale = expert._cpu_w2_scale.view(torch.float8_e8m0fnu).to(torch.float32).contiguous()
+            w3_scale = expert._cpu_w3_scale.view(torch.float8_e8m0fnu).to(torch.float32).contiguous()
+            w1 = _dequant_fp4_weight_torch(w1_packed, w1_scale, block_size=_FP4_BLOCK_SIZE).contiguous()
+            w2 = _dequant_fp4_weight_torch(w2_packed, w2_scale, block_size=_FP4_BLOCK_SIZE).contiguous()
+            w3 = _dequant_fp4_weight_torch(w3_packed, w3_scale, block_size=_FP4_BLOCK_SIZE).contiguous()
+            w1_q, w1_s = _quantize_int8_weight_torch(w1)
+            w2_q, w2_s = _quantize_int8_weight_torch(w2)
+            w3_q, w3_s = _quantize_int8_weight_torch(w3)
+            cached = self._store_int8_cached(expert_id, (w1_q, w1_s, w2_q, w2_s, w3_q, w3_s))
+            return cached
         if not hasattr(expert._cpu_w1, "layout_tensor"):
             return None
         w1 = _dequant_fp4_weight_torch(expert._cpu_w1, expert._cpu_w1_scale, block_size=_FP4_BLOCK_SIZE).contiguous()
@@ -549,17 +577,26 @@ class CPURoutedExpertsBackend:
 
     @staticmethod
     def _release_expert_parameter_storage(expert) -> None:
-        """Replace the int8 weight/scale storages on the expert's nn.Linear modules with empty
-        placeholder tensors so the original 12.5GB-per-rank checkpoint copy can be freed. The
-        arena slices we just wrote into remain the only physical backing store."""
-        empty_int8 = torch.empty(0, dtype=torch.int8)
-        empty_fp32 = torch.empty(0, dtype=torch.float32)
         for sub in (expert.w1, expert.w2, expert.w3):
             scale = getattr(sub.weight, "scale", None)
-            sub.weight.data = empty_int8
+            empty_like_dtype = torch.empty(0, dtype=sub.weight.dtype)
+            empty_scale_like_dtype = torch.empty(0, dtype=scale.dtype) if scale is not None else None
+            try:
+                sub.weight.requires_grad_(False)
+            except Exception:
+                pass
+            sub.weight.data = empty_like_dtype
             if scale is not None:
                 try:
-                    sub.weight.scale = empty_fp32
+                    scale.requires_grad_(False)
+                except Exception:
+                    pass
+                try:
+                    scale.data = empty_scale_like_dtype
+                except Exception:
+                    pass
+                try:
+                    sub.weight.scale = empty_scale_like_dtype
                 except AttributeError:
                     pass
 
@@ -625,6 +662,17 @@ class CPURoutedExpertsBackend:
         self._expert_int8_cache[expert_id] = sliced
         return sliced
 
+    def release_int8_prepare_cache(self) -> None:
+        self._expert_int8_cache.clear()
+        self._int8_arena = None
+        self._int8_weights_prepared = False
+        self._native_int8_w1_ptrs = None
+        self._native_int8_w2_ptrs = None
+        self._native_int8_w3_ptrs = None
+        self._native_int8_s1_ptrs = None
+        self._native_int8_s2_ptrs = None
+        self._native_int8_s3_ptrs = None
+
     def get_int8_arena(self):
         """Return the per-layer pinned arena tuple if every local expert has been materialized
         into it, otherwise None. The GPU prefill MoE backend uses this to skip its own pinned
@@ -644,13 +692,241 @@ class CPURoutedExpertsBackend:
             return None
         return self._int8_arena
 
-    def prepare_int8_weights(self, expert_ids: Sequence[int] | None = None) -> bool:
-        if not self._cpu_expert_int8_enabled:
-            return False
-        if not self._ensure_native_ready() or not self._native_int8_enabled:
+    # ------------------------------------------------------------------
+    # FP4 arena: parallel to int8 arena. Stores packed FP4 (e2m1fn_x2) weight
+    # bytes + ue8m0 block-scale bytes for routed experts. Used by the GPU
+    # active-expert decode path when the official FP4 ckpt is loaded — avoids
+    # the dequant->requant->int8 round-trip and halves H2D bytes per expert.
+    # ------------------------------------------------------------------
+
+    def _materialize_fp4_expert(self, expert_id: int):
+        """Copy expert's packed FP4 weights and e8m0 block scales (uint8 byte
+        views) into the per-layer pinned FP4 arena slot. Returns the slot tuple
+        or None on failure."""
+        cached = self._expert_fp4_cache.get(expert_id)
+        if cached is not None:
+            return cached
+        expert = self.experts[expert_id]
+        if expert is None:
+            return None
+        if expert.w1.weight.dtype != torch.float4_e2m1fn_x2:
+            return None
+        slot = self._reserve_arena_slot_fp4(expert, expert_id)
+        if slot is None:
+            return None
+        arena_w1q, arena_w1s, arena_w2q, arena_w2s, arena_w3q, arena_w3s = slot
+        try:
+            arena_w1q.copy_(expert.w1.weight.detach().view(torch.uint8))
+            arena_w1s.copy_(expert.w1.weight.scale.detach().view(torch.uint8))
+            arena_w2q.copy_(expert.w2.weight.detach().view(torch.uint8))
+            arena_w2s.copy_(expert.w2.weight.scale.detach().view(torch.uint8))
+            arena_w3q.copy_(expert.w3.weight.detach().view(torch.uint8))
+            arena_w3s.copy_(expert.w3.weight.scale.detach().view(torch.uint8))
+        except RuntimeError:
+            return None
+        expert._cpu_w1 = arena_w1q
+        expert._cpu_w2 = arena_w2q
+        expert._cpu_w3 = arena_w3q
+        expert._cpu_w1_scale = arena_w1s
+        expert._cpu_w2_scale = arena_w2s
+        expert._cpu_w3_scale = arena_w3s
+        expert._cpu_w2_tiled = None
+        expert._cpu_w2_scale_tiled = None
+        expert._cpu_materialized = True
+        self._release_expert_parameter_storage(expert)
+        cached = (arena_w1q, arena_w1s, arena_w2q, arena_w2s, arena_w3q, arena_w3s)
+        self._expert_fp4_cache[expert_id] = cached
+        return cached
+
+    def _reserve_arena_slot_fp4(self, expert, expert_id: int):
+        if not self._fp4_arena_enabled:
+            return None
+        if self._fp4_arena is None:
+            n = self.experts_end_idx - self.experts_start_idx
+            if n <= 0:
+                return None
+            try:
+                w1_shape = tuple(expert.w1.weight.shape)              # [O, K/2]
+                w2_shape = tuple(expert.w2.weight.shape)
+                w3_shape = tuple(expert.w3.weight.shape)
+                w1_scale_shape = tuple(expert.w1.weight.scale.shape)  # [O, K/32]
+                w2_scale_shape = tuple(expert.w2.weight.scale.shape)
+                w3_scale_shape = tuple(expert.w3.weight.scale.shape)
+            except AttributeError:
+                return None
+            try:
+                arena = (
+                    torch.empty((n, *w1_shape), device="cpu", dtype=torch.uint8, pin_memory=True),
+                    torch.empty((n, *w1_scale_shape), device="cpu", dtype=torch.uint8, pin_memory=True),
+                    torch.empty((n, *w2_shape), device="cpu", dtype=torch.uint8, pin_memory=True),
+                    torch.empty((n, *w2_scale_shape), device="cpu", dtype=torch.uint8, pin_memory=True),
+                    torch.empty((n, *w3_shape), device="cpu", dtype=torch.uint8, pin_memory=True),
+                    torch.empty((n, *w3_scale_shape), device="cpu", dtype=torch.uint8, pin_memory=True),
+                )
+            except RuntimeError:
+                self._fp4_arena_enabled = False
+                self._fp4_arena = None
+                return None
+            self._fp4_arena = arena
+        local_id = expert_id - self.experts_start_idx
+        if local_id < 0 or local_id >= self._fp4_arena[0].shape[0]:
+            return None
+        a_w1q, a_w1s, a_w2q, a_w2s, a_w3q, a_w3s = self._fp4_arena
+        return (
+            a_w1q[local_id], a_w1s[local_id],
+            a_w2q[local_id], a_w2s[local_id],
+            a_w3q[local_id], a_w3s[local_id],
+        )
+
+    def _gpu_convert_fp4_expert_to_int8(self, expert_id: int):
+        cached = self._expert_int8_cache.get(expert_id)
+        if cached is not None:
+            return cached
+        fp4_cached = self._expert_fp4_cache.get(expert_id)
+        if fp4_cached is None:
+            fp4_cached = self._materialize_fp4_expert(expert_id)
+        if fp4_cached is None:
+            return None
+        if not torch.cuda.is_available():
+            return None
+        if self._cuda_ext is None:
+            self._cuda_ext = load_cuda_kernel()
+        if self._cuda_ext is None or not hasattr(self._cuda_ext, "fp4_weight_to_int8_forward"):
+            return None
+        device = torch.device("cuda", torch.cuda.current_device())
+        w1q, w1s, w2q, w2s, w3q, w3s = fp4_cached
+        with torch.cuda.device(device):
+            w1q_i8, w1s_i8 = self._cuda_ext.fp4_weight_to_int8_forward(
+                w1q.unsqueeze(0).to(device, non_blocking=True),
+                w1s.unsqueeze(0).to(device, non_blocking=True),
+            )
+            w2q_i8, w2s_i8 = self._cuda_ext.fp4_weight_to_int8_forward(
+                w2q.unsqueeze(0).to(device, non_blocking=True),
+                w2s.unsqueeze(0).to(device, non_blocking=True),
+            )
+            w3q_i8, w3s_i8 = self._cuda_ext.fp4_weight_to_int8_forward(
+                w3q.unsqueeze(0).to(device, non_blocking=True),
+                w3s.unsqueeze(0).to(device, non_blocking=True),
+            )
+            torch.cuda.synchronize(device)
+        packed = (
+            w1q_i8.squeeze(0).cpu().contiguous(),
+            w1s_i8.squeeze(0).cpu().contiguous(),
+            w2q_i8.squeeze(0).cpu().contiguous(),
+            w2s_i8.squeeze(0).cpu().contiguous(),
+            w3q_i8.squeeze(0).cpu().contiguous(),
+            w3s_i8.squeeze(0).cpu().contiguous(),
+        )
+        return self._store_int8_cached(expert_id, packed)
+
+    def prepare_fp4_weights(self, expert_ids: Sequence[int] | None = None) -> bool:
+        """Materialize routed experts into the pinned FP4 arena. Returns True
+        when every local expert has an arena slot ready."""
+        if not self._fp4_arena_enabled:
             return False
         if expert_ids is None:
             expert_ids = range(self.experts_start_idx, self.experts_end_idx)
+        ok = True
+        for expert_id in expert_ids:
+            expert_id = int(expert_id)
+            if expert_id < self.experts_start_idx or expert_id >= self.experts_end_idx:
+                continue
+            ok = (self._materialize_fp4_expert(expert_id) is not None) and ok
+        self._fp4_weights_prepared = bool(self._expert_fp4_cache) and ok
+        return self._fp4_weights_prepared
+
+    def get_fp4_arena(self):
+        """Return the per-layer pinned FP4 arena tuple
+        (w1q, w1s, w2q, w2s, w3q, w3s) when every local expert has been
+        materialized into it. Same fast-path semantics as get_int8_arena()."""
+        if self._fp4_arena is None or not self._fp4_arena_enabled:
+            return None
+        n = self._fp4_arena[0].shape[0]
+        for expert_id in range(self.experts_start_idx, self.experts_end_idx):
+            cached = self._expert_fp4_cache.get(expert_id)
+            if cached is None:
+                return None
+            if cached[0].data_ptr() < self._fp4_arena[0].data_ptr():
+                return None
+        if n != (self.experts_end_idx - self.experts_start_idx):
+            return None
+        return self._fp4_arena
+
+    def _gpu_convert_fp4_arena_to_int8(self) -> bool:
+        t0 = time.perf_counter() if self._profile_enabled else 0.0
+        fp4_arena = self.get_fp4_arena()
+        if fp4_arena is None or not torch.cuda.is_available():
+            return False
+        if self._cuda_ext is None:
+            self._cuda_ext = load_cuda_kernel()
+        if self._cuda_ext is None or not hasattr(self._cuda_ext, "fp4_weight_to_int8_forward"):
+            return False
+        int8_arena = self._allocate_int8_arena_from_fp4_arena(fp4_arena)
+        if int8_arena is None:
+            return False
+        device = torch.device("cuda", torch.cuda.current_device())
+        with torch.cuda.device(device):
+            for src_q, src_s, dst_q, dst_s in (
+                (fp4_arena[0], fp4_arena[1], int8_arena[0], int8_arena[1]),
+                (fp4_arena[2], fp4_arena[3], int8_arena[2], int8_arena[3]),
+                (fp4_arena[4], fp4_arena[5], int8_arena[4], int8_arena[5]),
+            ):
+                src_q_gpu = src_q.to(device, non_blocking=True)
+                src_s_gpu = src_s.to(device, non_blocking=True)
+                q_gpu, s_gpu = self._cuda_ext.fp4_weight_to_int8_forward(src_q_gpu, src_s_gpu)
+                dst_q.copy_(q_gpu, non_blocking=False)
+                dst_s.copy_(s_gpu, non_blocking=False)
+                del src_q_gpu, src_s_gpu, q_gpu, s_gpu
+        self._int8_arena = int8_arena
+        self._int8_arena_enabled = True
+        self._expert_int8_cache.clear()
+        for expert_id in range(self.experts_start_idx, self.experts_end_idx):
+            local_id = expert_id - self.experts_start_idx
+            self._expert_int8_cache[expert_id] = (
+                int8_arena[0][local_id], int8_arena[1][local_id],
+                int8_arena[2][local_id], int8_arena[3][local_id],
+                int8_arena[4][local_id], int8_arena[5][local_id],
+            )
+        if self._profile_enabled:
+            print(
+                f"cpu_moe layer={self.layer_idx} fp4_gpu_prepare_int8 experts={self.experts_end_idx - self.experts_start_idx} time={time.perf_counter() - t0:.3f}s",
+                flush=True,
+            )
+        return True
+
+    def _allocate_int8_arena_from_fp4_arena(self, fp4_arena):
+        w1q, w1s, w2q, w2s, w3q, w3s = fp4_arena
+        shapes = (
+            (tuple(w1q.shape[:-1]) + (w1q.shape[-1] * 2,), torch.int8),
+            (tuple(w1s.shape[:2]), torch.float32),
+            (tuple(w2q.shape[:-1]) + (w2q.shape[-1] * 2,), torch.int8),
+            (tuple(w2s.shape[:2]), torch.float32),
+            (tuple(w3q.shape[:-1]) + (w3q.shape[-1] * 2,), torch.int8),
+            (tuple(w3s.shape[:2]), torch.float32),
+        )
+        try:
+            return tuple(torch.empty(shape, device="cpu", dtype=dtype, pin_memory=True) for shape, dtype in shapes)
+        except RuntimeError:
+            return tuple(torch.empty(shape, device="cpu", dtype=dtype) for shape, dtype in shapes)
+
+    def prepare_int8_weights(self, expert_ids: Sequence[int] | None = None) -> bool:
+        if self._inter_dim is None:
+            for expert in self.experts:
+                if expert is not None:
+                    self._inter_dim = expert.w1.out_features
+                    self._swiglu_limit = float(expert.swiglu_limit)
+                    break
+        full_prepare = expert_ids is None
+        if expert_ids is None:
+            expert_ids = range(self.experts_start_idx, self.experts_end_idx)
+        if full_prepare and self.get_int8_arena() is not None:
+            self._refresh_int8_ptrs()
+            self._int8_weights_prepared = True
+            return True
+        if full_prepare and self.get_fp4_arena() is not None and self._gpu_convert_fp4_arena_to_int8():
+            self._refresh_int8_ptrs()
+            self._int8_weights_prepared = True
+            return True
         ok = True
         prepared_any = False
         for expert_id in expert_ids:
@@ -660,7 +936,13 @@ class CPURoutedExpertsBackend:
             expert = self.experts[expert_id]
             if expert is None:
                 continue
-            ok = self._materialize_int8_expert(expert_id) is not None and ok
+            if expert.w1.weight.dtype == torch.float4_e2m1fn_x2:
+                if not self._fp4_weights_prepared:
+                    self.prepare_fp4_weights([expert_id])
+                cached = self._gpu_convert_fp4_expert_to_int8(expert_id)
+            else:
+                cached = self._materialize_int8_expert(expert_id)
+            ok = cached is not None and ok
             prepared_any = True
         if prepared_any:
             self._refresh_int8_ptrs()
@@ -791,6 +1073,8 @@ class CPURoutedExpertsBackend:
         s2_ptrs = torch.zeros(num_experts, device="cpu", dtype=torch.long)
         s3_ptrs = torch.zeros(num_experts, device="cpu", dtype=torch.long)
         native_int8_enabled = self._cpu_expert_int8_enabled and hasattr(self._native_mod, "routed_int8_moe_forward")
+        fp4_raw_enabled = False
+        fp4_legacy_enabled = False
         for expert_id in range(self.experts_start_idx, self.experts_end_idx):
             expert = self.experts[expert_id]
             if expert is None:
@@ -803,17 +1087,39 @@ class CPURoutedExpertsBackend:
             if expert.w1.weight.dtype != torch.float4_e2m1fn_x2:
                 self._native_enabled = False
                 self._native_int8_enabled = False
+                self._native_fp4_raw_enabled = False
                 return False
-            w1_ptrs[expert_id] = expert._cpu_w1.layout_tensor.data_ptr()
-            w2_ptrs[expert_id] = expert._cpu_w2_tiled.data_ptr() if expert._cpu_w2_tiled is not None else expert._cpu_w2.layout_tensor.data_ptr()
-            w3_ptrs[expert_id] = expert._cpu_w3.layout_tensor.data_ptr()
-            s1_ptrs[expert_id] = expert._cpu_w1_scale.data_ptr()
-            s2_ptrs[expert_id] = expert._cpu_w2_scale_tiled.data_ptr() if expert._cpu_w2_scale_tiled is not None else expert._cpu_w2_scale.data_ptr()
-            s3_ptrs[expert_id] = expert._cpu_w3_scale.data_ptr()
+            if isinstance(expert._cpu_w1, torch.Tensor):
+                if fp4_legacy_enabled or not hasattr(self._native_mod, "routed_fp4_moe_forward_raw"):
+                    self._native_enabled = False
+                    self._native_int8_enabled = False
+                    self._native_fp4_raw_enabled = False
+                    return False
+                fp4_raw_enabled = True
+                w1_ptrs[expert_id] = expert._cpu_w1.data_ptr()
+                w2_ptrs[expert_id] = expert._cpu_w2.data_ptr()
+                w3_ptrs[expert_id] = expert._cpu_w3.data_ptr()
+                s1_ptrs[expert_id] = expert._cpu_w1_scale.data_ptr()
+                s2_ptrs[expert_id] = expert._cpu_w2_scale.data_ptr()
+                s3_ptrs[expert_id] = expert._cpu_w3_scale.data_ptr()
+            else:
+                if fp4_raw_enabled:
+                    self._native_enabled = False
+                    self._native_int8_enabled = False
+                    self._native_fp4_raw_enabled = False
+                    return False
+                fp4_legacy_enabled = True
+                w1_ptrs[expert_id] = expert._cpu_w1.layout_tensor.data_ptr()
+                w2_ptrs[expert_id] = expert._cpu_w2_tiled.data_ptr() if expert._cpu_w2_tiled is not None else expert._cpu_w2.layout_tensor.data_ptr()
+                w3_ptrs[expert_id] = expert._cpu_w3.layout_tensor.data_ptr()
+                s1_ptrs[expert_id] = expert._cpu_w1_scale.data_ptr()
+                s2_ptrs[expert_id] = expert._cpu_w2_scale_tiled.data_ptr() if expert._cpu_w2_scale_tiled is not None else expert._cpu_w2_scale.data_ptr()
+                s3_ptrs[expert_id] = expert._cpu_w3_scale.data_ptr()
 
         if template_expert is None:
             self._native_enabled = False
             self._native_int8_enabled = False
+            self._native_fp4_raw_enabled = False
             return False
 
         self._inter_dim = template_expert.w1.out_features
@@ -826,6 +1132,7 @@ class CPURoutedExpertsBackend:
         self._native_s3_ptrs = s3_ptrs
         self._native_enabled = True
         self._native_int8_enabled = native_int8_enabled
+        self._native_fp4_raw_enabled = fp4_raw_enabled
         return True
 
     def _run_native_forward(
@@ -835,7 +1142,8 @@ class CPURoutedExpertsBackend:
         weights_cpu: torch.Tensor,
         output_cpu: torch.Tensor,
     ) -> None:
-        self._native_mod.routed_fp4_moe_forward(
+        forward_name = "routed_fp4_moe_forward_raw" if self._native_fp4_raw_enabled else "routed_fp4_moe_forward"
+        getattr(self._native_mod, forward_name)(
             input_cpu.data_ptr(),
             expert_ids_cpu.data_ptr(),
             weights_cpu.data_ptr(),

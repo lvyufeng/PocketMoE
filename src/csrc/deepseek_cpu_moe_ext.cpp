@@ -1288,6 +1288,249 @@ static PyObject* set_omp_num_threads(PyObject*, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+static inline float fp4_e8m0_scale(uint8_t scale_byte) {
+    return std::exp2(static_cast<float>(static_cast<int>(scale_byte) - 127));
+}
+
+static void fused_fp4_w13_hidden_range_raw(
+    const float* x_row,
+    const uint8_t* w1,
+    const uint8_t* w3,
+    const uint8_t* s1,
+    const uint8_t* s3,
+    long long hidden_dim,
+    long long in_blocks,
+    float swiglu_limit,
+    float route_w,
+    float* hidden,
+    long long o_start,
+    long long o_end)
+{
+    const long long row_stride = hidden_dim / 2;
+    const __m256i even_idx = _mm256_load_si256(reinterpret_cast<const __m256i*>(kEvenIdx8));
+    const __m256i odd_idx = _mm256_load_si256(reinterpret_cast<const __m256i*>(kOddIdx8));
+    const __m128i nibble_mask = _mm_set1_epi8(0x0F);
+
+    for (long long o = o_start; o < o_end; ++o) {
+        const uint8_t* w1_row = w1 + o * row_stride;
+        const uint8_t* w3_row = w3 + o * row_stride;
+        const uint8_t* s1_row = s1 + o * in_blocks;
+        const uint8_t* s3_row = s3 + o * in_blocks;
+        __m256 gate_acc = _mm256_setzero_ps();
+        __m256 up_acc = _mm256_setzero_ps();
+
+        for (long long b = 0; b < in_blocks; ++b) {
+            const long long byte_base = b * kFp4BytesPerBlock;
+            const long long feature_base = b * kFp4BlockSize;
+            const __m256 scale1 = _mm256_set1_ps(fp4_e8m0_scale(s1_row[b]));
+            const __m256 scale3 = _mm256_set1_ps(fp4_e8m0_scale(s3_row[b]));
+            const uint8_t* w1_block = w1_row + byte_base;
+            const uint8_t* w3_block = w3_row + byte_base;
+            const float* x_block = x_row + feature_base;
+
+            for (int chunk = 0; chunk < 2; ++chunk) {
+                const __m128i raw1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(w1_block + chunk * 8));
+                const __m128i raw3 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(w3_block + chunk * 8));
+                const __m128i lo1 = _mm_and_si128(raw1, nibble_mask);
+                const __m128i hi1 = _mm_and_si128(_mm_srli_epi16(raw1, 4), nibble_mask);
+                const __m128i lo3 = _mm_and_si128(raw3, nibble_mask);
+                const __m128i hi3 = _mm_and_si128(_mm_srli_epi16(raw3, 4), nibble_mask);
+
+                const __m256 w1_lo = _mm256_mul_ps(decode_fp4_nibbles8_to_ps(lo1), scale1);
+                const __m256 w1_hi = _mm256_mul_ps(decode_fp4_nibbles8_to_ps(hi1), scale1);
+                const __m256 w3_lo = _mm256_mul_ps(decode_fp4_nibbles8_to_ps(lo3), scale3);
+                const __m256 w3_hi = _mm256_mul_ps(decode_fp4_nibbles8_to_ps(hi3), scale3);
+
+                const float* x_chunk = x_block + chunk * 16;
+                const __m256 x_even = _mm256_i32gather_ps(x_chunk, even_idx, 4);
+                const __m256 x_odd = _mm256_i32gather_ps(x_chunk, odd_idx, 4);
+
+                gate_acc = _mm256_fmadd_ps(w1_lo, x_even, gate_acc);
+                gate_acc = _mm256_fmadd_ps(w1_hi, x_odd, gate_acc);
+                up_acc = _mm256_fmadd_ps(w3_lo, x_even, up_acc);
+                up_acc = _mm256_fmadd_ps(w3_hi, x_odd, up_acc);
+            }
+        }
+
+        float gate = hsum256_ps(gate_acc);
+        float up = hsum256_ps(up_acc);
+        if (swiglu_limit > 0.0f) {
+            up = std::max(-swiglu_limit, std::min(swiglu_limit, up));
+            gate = std::min(swiglu_limit, gate);
+        }
+        hidden[o] = route_w * silu_scalar(gate) * up;
+    }
+}
+
+static inline void fused_fp4_w13_hidden_raw(
+    const float* x_row,
+    const uint8_t* w1,
+    const uint8_t* w3,
+    const uint8_t* s1,
+    const uint8_t* s3,
+    long long hidden_dim,
+    long long inter_dim,
+    long long in_blocks,
+    float swiglu_limit,
+    float route_w,
+    float* hidden)
+{
+    fused_fp4_w13_hidden_range_raw(
+        x_row, w1, w3, s1, s3, hidden_dim, in_blocks, swiglu_limit, route_w, hidden, 0, inter_dim);
+}
+
+static void decode_fp4_w2_down_project_raw(
+    const float* hidden,
+    const uint8_t* w2,
+    const uint8_t* s2,
+    long long inter_dim,
+    long long hidden_dim,
+    long long out_blocks,
+    float* y_row,
+    long long o_start,
+    long long o_end)
+{
+    const long long row_stride = inter_dim / 2;
+    const __m256i even_idx = _mm256_load_si256(reinterpret_cast<const __m256i*>(kEvenIdx8));
+    const __m256i odd_idx = _mm256_load_si256(reinterpret_cast<const __m256i*>(kOddIdx8));
+    const __m128i nibble_mask = _mm_set1_epi8(0x0F);
+
+    for (long long o = o_start; o < o_end; ++o) {
+        const uint8_t* w2_row = w2 + o * row_stride;
+        const uint8_t* s2_row = s2 + o * out_blocks;
+        __m256 acc = _mm256_setzero_ps();
+        for (long long b = 0; b < out_blocks; ++b) {
+            const __m256 scale = _mm256_set1_ps(fp4_e8m0_scale(s2_row[b]));
+            const long long feature_base = b * kFp4BlockSize;
+            const uint8_t* w2_block = w2_row + b * kFp4BytesPerBlock;
+            const float* h_block = hidden + feature_base;
+            for (int chunk = 0; chunk < 2; ++chunk) {
+                const __m128i raw = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(w2_block + chunk * 8));
+                const __m128i lo = _mm_and_si128(raw, nibble_mask);
+                const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), nibble_mask);
+                const __m256 w_lo = _mm256_mul_ps(decode_fp4_nibbles8_to_ps(lo), scale);
+                const __m256 w_hi = _mm256_mul_ps(decode_fp4_nibbles8_to_ps(hi), scale);
+                const float* h_chunk = h_block + chunk * 16;
+                const __m256 h_even = _mm256_i32gather_ps(h_chunk, even_idx, 4);
+                const __m256 h_odd = _mm256_i32gather_ps(h_chunk, odd_idx, 4);
+                acc = _mm256_fmadd_ps(w_lo, h_even, acc);
+                acc = _mm256_fmadd_ps(w_hi, h_odd, acc);
+            }
+        }
+        y_row[o] += hsum256_ps(acc);
+    }
+}
+
+static PyObject* routed_fp4_moe_forward_raw(PyObject*, PyObject* args) {
+    unsigned long long input_ptr_ull, expert_ids_ptr_ull, weights_ptr_ull, output_ptr_ull;
+    unsigned long long w1_ptrs_ull, w2_ptrs_ull, w3_ptrs_ull, s1_ptrs_ull, s2_ptrs_ull, s3_ptrs_ull;
+    long long tokens, hidden_dim, topk, inter_dim, num_experts, experts_start_idx, experts_end_idx;
+    float swiglu_limit;
+    if (!PyArg_ParseTuple(
+            args,
+            "KKKKLLLLLLLKKKKKKf",
+            &input_ptr_ull,
+            &expert_ids_ptr_ull,
+            &weights_ptr_ull,
+            &output_ptr_ull,
+            &tokens,
+            &hidden_dim,
+            &topk,
+            &inter_dim,
+            &num_experts,
+            &experts_start_idx,
+            &experts_end_idx,
+            &w1_ptrs_ull,
+            &w2_ptrs_ull,
+            &w3_ptrs_ull,
+            &s1_ptrs_ull,
+            &s2_ptrs_ull,
+            &s3_ptrs_ull,
+            &swiglu_limit)) {
+        return nullptr;
+    }
+
+    auto* input = reinterpret_cast<float*>(input_ptr_ull);
+    auto* expert_ids = reinterpret_cast<int64_t*>(expert_ids_ptr_ull);
+    auto* weights = reinterpret_cast<float*>(weights_ptr_ull);
+    auto* output = reinterpret_cast<float*>(output_ptr_ull);
+    auto* w1_ptrs = reinterpret_cast<int64_t*>(w1_ptrs_ull);
+    auto* w2_ptrs = reinterpret_cast<int64_t*>(w2_ptrs_ull);
+    auto* w3_ptrs = reinterpret_cast<int64_t*>(w3_ptrs_ull);
+    auto* s1_ptrs = reinterpret_cast<int64_t*>(s1_ptrs_ull);
+    auto* s2_ptrs = reinterpret_cast<int64_t*>(s2_ptrs_ull);
+    auto* s3_ptrs = reinterpret_cast<int64_t*>(s3_ptrs_ull);
+
+    const long long in_blocks = hidden_dim / kFp4BlockSize;
+    const long long out_blocks = inter_dim / kFp4BlockSize;
+
+    Py_BEGIN_ALLOW_THREADS
+    apply_omp_runtime_config();
+    if (tokens > 1) {
+        #pragma omp parallel for schedule(static)
+        for (long long i = 0; i < tokens * hidden_dim; ++i) output[i] = 0.0f;
+
+        #pragma omp parallel
+        {
+            std::vector<float> hidden(inter_dim);
+            #pragma omp for schedule(static)
+            for (long long t = 0; t < tokens; ++t) {
+                const float* x_row = input + t * hidden_dim;
+                float* y_row = output + t * hidden_dim;
+                for (long long k = 0; k < topk; ++k) {
+                    const long long expert_id = expert_ids[t * topk + k];
+                    if (expert_id < experts_start_idx || expert_id >= experts_end_idx) continue;
+                    auto* w1 = reinterpret_cast<uint8_t*>(w1_ptrs[expert_id]);
+                    auto* w2 = reinterpret_cast<uint8_t*>(w2_ptrs[expert_id]);
+                    auto* w3 = reinterpret_cast<uint8_t*>(w3_ptrs[expert_id]);
+                    auto* s1 = reinterpret_cast<uint8_t*>(s1_ptrs[expert_id]);
+                    auto* s2 = reinterpret_cast<uint8_t*>(s2_ptrs[expert_id]);
+                    auto* s3 = reinterpret_cast<uint8_t*>(s3_ptrs[expert_id]);
+                    if (!w1 || !w2 || !w3 || !s1 || !s2 || !s3) continue;
+
+                    fused_fp4_w13_hidden_raw(
+                        x_row, w1, w3, s1, s3, hidden_dim, inter_dim, in_blocks,
+                        swiglu_limit, weights[t * topk + k], hidden.data());
+                    for (long long o_start = 0; o_start < hidden_dim; o_start += kW2TileRows) {
+                        long long o_end = o_start + kW2TileRows;
+                        if (o_end > hidden_dim) o_end = hidden_dim;
+                        decode_fp4_w2_down_project_raw(hidden.data(), w2, s2, inter_dim, hidden_dim, out_blocks, y_row, o_start, o_end);
+                    }
+                }
+            }
+        }
+    } else {
+        for (long long i = 0; i < hidden_dim; ++i) output[i] = 0.0f;
+
+        const float* x_row = input;
+        float* y_row = output;
+        std::vector<float> hidden(inter_dim);
+        for (long long k = 0; k < topk; ++k) {
+            const long long expert_id = expert_ids[k];
+            if (expert_id < experts_start_idx || expert_id >= experts_end_idx) continue;
+            auto* w1 = reinterpret_cast<uint8_t*>(w1_ptrs[expert_id]);
+            auto* w2 = reinterpret_cast<uint8_t*>(w2_ptrs[expert_id]);
+            auto* w3 = reinterpret_cast<uint8_t*>(w3_ptrs[expert_id]);
+            auto* s1 = reinterpret_cast<uint8_t*>(s1_ptrs[expert_id]);
+            auto* s2 = reinterpret_cast<uint8_t*>(s2_ptrs[expert_id]);
+            auto* s3 = reinterpret_cast<uint8_t*>(s3_ptrs[expert_id]);
+            if (!w1 || !w2 || !w3 || !s1 || !s2 || !s3) continue;
+
+            fused_fp4_w13_hidden_raw(
+                x_row, w1, w3, s1, s3, hidden_dim, inter_dim, in_blocks,
+                swiglu_limit, weights[k], hidden.data());
+            #pragma omp parallel for schedule(static)
+            for (long long o_start = 0; o_start < hidden_dim; o_start += kW2TileRows) {
+                long long o_end = o_start + kW2TileRows;
+                if (o_end > hidden_dim) o_end = hidden_dim;
+                decode_fp4_w2_down_project_raw(hidden.data(), w2, s2, inter_dim, hidden_dim, out_blocks, y_row, o_start, o_end);
+            }
+        }
+    }
+    Py_END_ALLOW_THREADS
+
+    Py_RETURN_NONE;
+}
 static PyObject* routed_fp4_moe_forward(PyObject*, PyObject* args) {
     unsigned long long input_ptr_ull, expert_ids_ptr_ull, weights_ptr_ull, output_ptr_ull;
     unsigned long long w1_ptrs_ull, w2_ptrs_ull, w3_ptrs_ull, s1_ptrs_ull, s2_ptrs_ull, s3_ptrs_ull;
@@ -2161,6 +2404,7 @@ static PyObject* cpu_moe_server_loop_int8_v2(PyObject*, PyObject* args) {
 
 static PyMethodDef Methods[] = {
     {"routed_fp4_moe_forward", routed_fp4_moe_forward, METH_VARARGS, nullptr},
+    {"routed_fp4_moe_forward_raw", routed_fp4_moe_forward_raw, METH_VARARGS, nullptr},
     {"routed_int8_moe_forward", routed_int8_moe_forward, METH_VARARGS, nullptr},
     {"routed_int8_moe_forward_topk_parallel", routed_int8_moe_forward_topk_parallel, METH_VARARGS, nullptr},
     {"routed_int8_moe_forward_topk_persistent", routed_int8_moe_forward_topk_persistent, METH_VARARGS, nullptr},

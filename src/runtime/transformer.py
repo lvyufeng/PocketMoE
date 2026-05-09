@@ -1412,6 +1412,7 @@ class Expert(nn.Module):
         self._shared_w2_fp16 = None
         self._shared_int8_ready = False
         self.shared_expert_chunk_tokens = max(0, int(os.getenv("DEEPSEEK_SHARED_EXPERT_CHUNK_TOKENS", "8192")))
+        self.shared_expert_profile_enabled = os.getenv("DEEPSEEK_SHARED_EXPERT_PROFILE", "0").lower() in {"1", "true", "yes"}
 
     def _predequantize_fp4_weights_on_gpu(self):
         if self._cpu_predequantized or self.w1.weight.dtype != torch.float4_e2m1fn_x2:
@@ -1523,6 +1524,10 @@ class Expert(nn.Module):
 
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         dtype = x.dtype
+        profile = self.shared_expert_profile_enabled and x.is_cuda and weights is None
+        if profile:
+            torch.cuda.synchronize(x.device)
+            t0 = time.perf_counter()
         chunk = self.shared_expert_chunk_tokens if self.shared_expert_int8_enabled or self.shared_expert_fp16_enabled else 0
         if chunk > 0 and x.dim() == 2 and x.size(0) > chunk:
             parts = []
@@ -1557,17 +1562,32 @@ class Expert(nn.Module):
         else:
             gate = self.w1(x).float()
             up = self.w3(x).float()
+        if profile:
+            torch.cuda.synchronize(x.device)
+            t_w13 = time.perf_counter()
         if self.swiglu_limit > 0:
             up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
             gate = torch.clamp(gate, max=self.swiglu_limit)
         x = F.silu(gate) * up
         if weights is not None:
             x = weights * x
+        if profile:
+            torch.cuda.synchronize(x.device)
+            t_act = time.perf_counter()
         if self.shared_expert_fp16_enabled and x.is_cuda:
-            return F.linear(x.to(torch.float16), self.shared_w2_fp16).to(dtype)
-        if self.shared_expert_int8_enabled:
-            return soft_bf16_weight_gemm_int8(x.to(dtype), self.shared_int8_w2, self.shared_int8_s2).to(dtype)
-        return self.w2(x.to(dtype))
+            out = F.linear(x.to(torch.float16), self.shared_w2_fp16).to(dtype)
+        elif self.shared_expert_int8_enabled:
+            out = soft_bf16_weight_gemm_int8(x.to(dtype), self.shared_int8_w2, self.shared_int8_s2).to(dtype)
+        else:
+            out = self.w2(x.to(dtype))
+        if profile:
+            torch.cuda.synchronize(out.device)
+            t_w2 = time.perf_counter()
+            print(
+                f"shared_expert_profile w13={t_w13 - t0:.6f}s act={t_act - t_w13:.6f}s w2={t_w2 - t_act:.6f}s total={t_w2 - t0:.6f}s",
+                flush=True,
+            )
+        return out
 
     def forward_cpu(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None, x_cpu: Optional[torch.Tensor] = None) -> torch.Tensor:
         self._materialize_cpu_weights()
@@ -1688,6 +1708,8 @@ class MoE(nn.Module):
         self.cpu_host_reduce_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_CPU_MOE_HOST_REDUCE")
         self.reduce_fp16_enabled = _env_enabled("DEEPSEEK_MOE_REDUCE_FP16")
         self._profile_enabled = os.getenv("DEEPSEEK_MOE_PROFILE", "0").lower() in {"1", "true", "yes"}
+        self._active_profile_enabled = os.getenv("DEEPSEEK_GPU_MOE_ACTIVE_PROFILE", "0").lower() in {"1", "true", "yes"}
+        self.gpu_active_overlap_reduce_enabled = _env_enabled("DEEPSEEK_GPU_MOE_ACTIVE_OVERLAP_REDUCE")
         self._rank_route_profile_enabled = _env_enabled("DEEPSEEK_RANK_ROUTE_PROFILE")
         self._allreduce_stream = torch.cuda.Stream() if self.async_allreduce_enabled and torch.cuda.is_available() else None
         self.gpu_prefill_moe_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_GPU_PREFILL_MOE")
@@ -1863,7 +1885,7 @@ class MoE(nn.Module):
             and device.type == "cuda"
             and token_count >= self.gpu_prefill_moe_min_tokens
         ):
-            self._ensure_gpu_prefill_backend().prefetch(device)
+            self._ensure_gpu_prefill_backend().prefetch(device, prefer_fp4=False)
 
     def _should_use_in_process_cpu_server(self, x: torch.Tensor) -> bool:
         if not self.cpu_moe_inproc_server_enabled or world_size <= 1 or x.shape[0] != 1:
@@ -2030,19 +2052,52 @@ class MoE(nn.Module):
             y[1:2] = y2
             used_gpu_prefill_moe = True
         elif self.routed_experts_device == "cpu" and self._should_use_gpu_decode_active_moe(x):
+            active_profile = self._active_profile_enabled and x.is_cuda
+            t_active0 = time.perf_counter() if active_profile else 0.0
             backend = self._ensure_gpu_prefill_backend()
             backend.prefetch_active_experts(x.device, indices)
             if hasattr(backend, "prefetch_active_experts_to_cache"):
                 backend.prefetch_active_experts_to_cache(x.device, indices)
+            t_active_prefetch = time.perf_counter() if active_profile else 0.0
             if prefetch_next is not None and hasattr(prefetch_next, "ffn"):
                 prefetch_next.ffn.prefetch_cross_layer_gate_prediction(x.device)
-            shared = self.shared_experts(x)
+            t_active_cross = time.perf_counter() if active_profile else 0.0
+            overlap_reduce = (
+                self.gpu_active_overlap_reduce_enabled
+                and self.async_allreduce_enabled
+                and world_size > 1
+                and self._allreduce_stream is not None
+            )
+            if overlap_reduce:
+                shared = None
+                t_active_shared = t_active_cross
+            else:
+                shared = self.shared_experts(x)
+                if active_profile:
+                    torch.cuda.synchronize(x.device)
+                t_active_shared = time.perf_counter() if active_profile else 0.0
             y = backend.forward(
                 x,
                 indices,
                 weights,
                 self.cpu_backend._swiglu_limit,
             )
+            if active_profile:
+                torch.cuda.synchronize(x.device)
+            t_active_routed = time.perf_counter() if active_profile else 0.0
+            if overlap_reduce:
+                reduce_dtype = torch.float16 if self.reduce_fp16_enabled else x.dtype
+                self._allreduce_stream.wait_stream(torch.cuda.current_stream(x.device))
+                with torch.cuda.stream(self._allreduce_stream):
+                    y_reduce = y.to(reduce_dtype)
+                    dist.all_reduce(y_reduce, async_op=False)
+                shared = self.shared_experts(x)
+                if active_profile:
+                    torch.cuda.synchronize(x.device)
+                    t_active_shared = time.perf_counter()
+                torch.cuda.current_stream(x.device).wait_stream(self._allreduce_stream)
+                y = y_reduce.to(torch.float32)
+                reduced_moe_ready = True
             used_gpu_prefill_moe = True
         elif self.routed_experts_device == "cpu" and self._should_use_in_process_cpu_server(x):
             profile = self._profile_enabled
@@ -2194,6 +2249,16 @@ class MoE(nn.Module):
         if not reduced_moe:
             y += shared
             y = y.type_as(x)
+        if 'active_profile' in locals() and active_profile:
+            torch.cuda.synchronize(x.device)
+            t_active_done = time.perf_counter()
+            print(
+                f"gpu_moe_active_profile layer={self.layer_id} rank={rank} "
+                f"prefetch={t_active_prefetch - t_active0:.6f}s cross={t_active_cross - t_active_prefetch:.6f}s "
+                f"shared={t_active_shared - t_active_cross:.6f}s routed={t_active_routed - t_active_shared:.6f}s "
+                f"finalize={t_active_done - t_active_routed:.6f}s total={t_active_done - t_active0:.6f}s",
+                flush=True,
+            )
         return y.view(shape)
 
 
@@ -2553,14 +2618,37 @@ class Transformer(nn.Module):
             self.hc_head_scale = nn.Parameter(torch.empty(1))
 
     def prepare_cpu_expert_int8(self) -> None:
+        timing_enabled = os.getenv("DEEPSEEK_LOAD_TIMING", "0").lower() in {"1", "true", "yes"}
         for layer in self.layers:
             backend = getattr(layer.ffn, "cpu_backend", None)
             if backend is not None:
+                t0 = time.perf_counter() if timing_enabled else 0.0
+                prepare_fp4 = getattr(backend, "prepare_fp4_weights", None)
+                if callable(prepare_fp4):
+                    prepare_fp4()
+                t1 = time.perf_counter() if timing_enabled else 0.0
                 backend.prepare_int8_weights()
+                if timing_enabled:
+                    print(
+                        f"load_timing rank={rank} layer={layer.layer_id} stage=cpu_expert_prepare "
+                        f"fp4={t1 - t0:.3f}s int8={time.perf_counter() - t1:.3f}s total={time.perf_counter() - t0:.3f}s",
+                        flush=True,
+                    )
         for layer in self.mtp:
             backend = getattr(layer.ffn, "cpu_backend", None)
             if backend is not None:
+                t0 = time.perf_counter() if timing_enabled else 0.0
+                prepare_fp4 = getattr(backend, "prepare_fp4_weights", None)
+                if callable(prepare_fp4):
+                    prepare_fp4()
+                t1 = time.perf_counter() if timing_enabled else 0.0
                 backend.prepare_int8_weights()
+                if timing_enabled:
+                    print(
+                        f"load_timing rank={rank} layer={layer.layer_id} stage=mtp_cpu_expert_prepare "
+                        f"fp4={t1 - t0:.3f}s int8={time.perf_counter() - t1:.3f}s total={time.perf_counter() - t0:.3f}s",
+                        flush=True,
+                    )
         if (
             _env_enabled("DEEPSEEK_CPU_MOE_INPROC_SERVER")
             and rank == 0
@@ -2591,6 +2679,16 @@ class Transformer(nn.Module):
             )
             os.environ["DEEPSEEK_CPU_MOE_SERVER_SHM"] = shm_name
             print(f"deepseek inproc cpu moe server started shm={shm_name}", flush=True)
+
+    def release_cpu_expert_int8_prepare_cache(self) -> None:
+        for layer in self.layers:
+            backend = getattr(layer.ffn, "cpu_backend", None)
+            if backend is not None and hasattr(backend, "release_int8_prepare_cache"):
+                backend.release_int8_prepare_cache()
+        for layer in self.mtp:
+            backend = getattr(layer.ffn, "cpu_backend", None)
+            if backend is not None and hasattr(backend, "release_int8_prepare_cache"):
+                backend.release_int8_prepare_cache()
 
     def release_gpu_prefill_moe_cache(self) -> None:
         for layer in self.layers:

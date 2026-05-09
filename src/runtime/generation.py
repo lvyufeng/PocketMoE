@@ -4,6 +4,7 @@ import json
 import sys
 import time
 from argparse import ArgumentParser
+from datetime import timedelta
 from typing import List
 
 import torch
@@ -116,6 +117,27 @@ def _module_owns_expert(module, expert_idx: int) -> bool:
     return getattr(module, "experts_start_idx", 0) <= expert_idx < getattr(module, "experts_end_idx", 0)
 
 
+def _checkpoint_key_is_needed_for_rank(
+    key: str,
+    state_keys: set[str],
+    name_to_module: dict[str, torch.nn.Module],
+) -> bool:
+    if key.endswith(".scale") and f"{key[:-6]}.weight" in state_keys:
+        return False
+    if key not in state_keys:
+        return False
+    module_name, _, _ = key.rpartition('.')
+    module = name_to_module.get(module_name)
+    if module is None:
+        return False
+    expert_idx = _expert_idx_from_name(key)
+    if expert_idx is None:
+        return True
+    parts = key.split('.')
+    owner_module = name_to_module.get('.'.join(parts[:parts.index("experts")]))
+    return owner_module is not None and _module_owns_expert(owner_module, expert_idx)
+
+
 def _is_replicated_c4_indexer_param(name: str, module) -> bool:
     return getattr(module, "replicated_c4_indexer", False) and (
         name.endswith("indexer.wq_b.weight")
@@ -180,6 +202,48 @@ def _shard_tensor_for_rank(name: str, tensor: torch.Tensor, module, world_size: 
     return tensor
 
 
+def _load_tensor_for_rank(name: str, reader, module, world_size: int, rank: int) -> torch.Tensor | None:
+    if not hasattr(reader, "get_slice"):
+        return _shard_tensor_for_rank(name, reader.get_tensor(name), module, world_size, rank)
+
+    tensor_slice = reader.get_slice(name)
+    shape = tensor_slice.get_shape()
+    if "experts." in name and "shared_experts" not in name:
+        return _shard_tensor_for_rank(name, reader.get_tensor(name), module, world_size, rank)
+    if _is_replicated_c4_indexer_param(name, module):
+        return reader.get_tensor(name)
+    if _is_column_parallel(module):
+        if len(shape) == 2:
+            shard_dim = 0
+        elif len(shape) == 1:
+            shard_dim = 0
+        else:
+            return reader.get_tensor(name)
+        assert shape[shard_dim] % world_size == 0, f"{name} not divisible on dim {shard_dim}"
+        shard = shape[shard_dim] // world_size
+        start = rank * shard
+        if len(shape) == 2:
+            return tensor_slice[start:start + shard, :].contiguous()
+        return tensor_slice[start:start + shard].contiguous()
+    if _is_row_parallel(module):
+        if len(shape) == 2:
+            shard_dim = 1
+        elif len(shape) == 1:
+            return reader.get_tensor(name)
+        else:
+            return reader.get_tensor(name)
+        assert shape[shard_dim] % world_size == 0, f"{name} not divisible on dim {shard_dim}"
+        shard = shape[shard_dim] // world_size
+        start = rank * shard
+        return tensor_slice[:, start:start + shard].contiguous()
+    if isinstance(module, Attention) and name.endswith("attn_sink"):
+        assert shape[0] % world_size == 0, f"{name} not divisible on dim 0"
+        shard = shape[0] // world_size
+        start = rank * shard
+        return tensor_slice[start:start + shard].contiguous()
+    return reader.get_tensor(name)
+
+
 def _dequant_int8_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (weight.to(torch.float32) * scale.to(torch.float32).unsqueeze(1)).contiguous()
 
@@ -218,6 +282,91 @@ def _copy_scale_tensor(key: str, state_dict: dict[str, torch.Tensor], module, sc
     if scale.shape != module_scale.shape:
         raise ValueError(f"Scale shape mismatch for {scale_key}: got {tuple(scale.shape)}, expected {tuple(module_scale.shape)}")
     module_scale.copy_(scale.to(device=module_scale.device, dtype=module_scale.dtype))
+
+
+def _maybe_bind_routed_int8_arena(
+    key: str,
+    state_dict: dict[str, torch.Tensor],
+    name_to_module: dict[str, torch.nn.Module],
+) -> None:
+    if "experts." not in key or "shared_experts" in key or not key.endswith(".weight"):
+        return
+    parts = key.split('.')
+    if len(parts) < 2 or parts[-2] not in {"w1", "w2", "w3"}:
+        return
+    module_name, _, _ = key.rpartition('.')
+    linear = name_to_module.get(module_name)
+    if linear is None or getattr(linear, "weight", None) is None or linear.weight.dtype != torch.int8:
+        return
+    owner_name = '.'.join(parts[:parts.index("experts")])
+    owner = name_to_module.get(owner_name)
+    backend = getattr(owner, "cpu_backend", None)
+    if backend is None or not hasattr(backend, "_reserve_arena_slot_int8"):
+        return
+    expert_idx = int(parts[parts.index("experts") + 1])
+    expert = name_to_module.get('.'.join(parts[:-2]))
+    if expert is None:
+        return
+    slot = backend._reserve_arena_slot_int8(expert, expert_idx)
+    if slot is None:
+        return
+    w1q, w1s, w2q, w2s, w3q, w3s = slot
+    expert.w1.set_int8_storage(w1q, w1s)
+    expert.w2.set_int8_storage(w2q, w2s)
+    expert.w3.set_int8_storage(w3q, w3s)
+    backend._expert_int8_cache[expert_idx] = (w1q, w1s, w2q, w2s, w3q, w3s)
+    state_dict[f"{owner_name}.experts.{expert_idx}.w1.weight"] = w1q
+    state_dict[f"{owner_name}.experts.{expert_idx}.w1.scale"] = w1s
+    state_dict[f"{owner_name}.experts.{expert_idx}.w2.weight"] = w2q
+    state_dict[f"{owner_name}.experts.{expert_idx}.w2.scale"] = w2s
+    state_dict[f"{owner_name}.experts.{expert_idx}.w3.weight"] = w3q
+    state_dict[f"{owner_name}.experts.{expert_idx}.w3.scale"] = w3s
+
+
+def _maybe_bind_routed_fp4_arena(
+    key: str,
+    state_dict: dict[str, torch.Tensor],
+    name_to_module: dict[str, torch.nn.Module],
+) -> None:
+    if "experts." not in key or "shared_experts" in key or not key.endswith(".weight"):
+        return
+    parts = key.split('.')
+    if len(parts) < 2 or parts[-2] not in {"w1", "w2", "w3"}:
+        return
+    module_name, _, _ = key.rpartition('.')
+    linear = name_to_module.get(module_name)
+    if linear is None or getattr(linear, "weight", None) is None or linear.weight.dtype != torch.float4_e2m1fn_x2:
+        return
+    owner_name = '.'.join(parts[:parts.index("experts")])
+    owner = name_to_module.get(owner_name)
+    backend = getattr(owner, "cpu_backend", None)
+    if backend is None or not hasattr(backend, "_reserve_arena_slot_fp4"):
+        return
+    expert_idx = int(parts[parts.index("experts") + 1])
+    expert = name_to_module.get('.'.join(parts[:-2]))
+    if expert is None:
+        return
+    slot = backend._reserve_arena_slot_fp4(expert, expert_idx)
+    if slot is None:
+        return
+    w1q, w1s, w2q, w2s, w3q, w3s = slot
+    expert._cpu_w1 = w1q
+    expert._cpu_w2 = w2q
+    expert._cpu_w3 = w3q
+    expert._cpu_w1_scale = w1s
+    expert._cpu_w2_scale = w2s
+    expert._cpu_w3_scale = w3s
+    expert._cpu_w2_tiled = None
+    expert._cpu_w2_scale_tiled = None
+    expert._cpu_materialized = True
+    backend._expert_fp4_cache[expert_idx] = (w1q, w1s, w2q, w2s, w3q, w3s)
+    state_dict[f"{owner_name}.experts.{expert_idx}.w1.weight"] = w1q.view(torch.float4_e2m1fn_x2)
+    state_dict[f"{owner_name}.experts.{expert_idx}.w1.scale"] = w1s.view(torch.float8_e8m0fnu)
+    state_dict[f"{owner_name}.experts.{expert_idx}.w2.weight"] = w2q.view(torch.float4_e2m1fn_x2)
+    state_dict[f"{owner_name}.experts.{expert_idx}.w2.scale"] = w2s.view(torch.float8_e8m0fnu)
+    state_dict[f"{owner_name}.experts.{expert_idx}.w3.weight"] = w3q.view(torch.float4_e2m1fn_x2)
+    state_dict[f"{owner_name}.experts.{expert_idx}.w3.scale"] = w3s.view(torch.float8_e8m0fnu)
+    backend._release_expert_parameter_storage(expert)
 
 
 def _copy_int8_weight_and_scale(
@@ -307,6 +456,7 @@ def _copy_quantized_weight_to_target(key: str, state_dict: dict[str, torch.Tenso
 
 def load_original_hf_model(model: Transformer, ckpt_path: str, world_size: int, rank: int) -> None:
     state_dict = model.state_dict()
+    state_keys = set(state_dict.keys())
     name_to_module = dict(model.named_modules())
     loaded = set()
     weight_map_path = os.path.join(ckpt_path, "model.safetensors.index.json")
@@ -317,55 +467,41 @@ def load_original_hf_model(model: Transformer, ckpt_path: str, world_size: int, 
     for key, file_name in weight_map.items():
         file_to_keys.setdefault(file_name, []).append(key)
 
-    total_files = len(file_to_keys)
-    for file_idx, (file_name, keys) in enumerate(file_to_keys.items(), 1):
+    filtered_file_to_keys = {}
+    for file_name, keys in file_to_keys.items():
+        needed_keys = [
+            key for key in keys
+            if _checkpoint_key_is_needed_for_rank(key, state_keys, name_to_module)
+        ]
+        if needed_keys:
+            filtered_file_to_keys[file_name] = needed_keys
+
+    total_files = len(filtered_file_to_keys)
+    for file_idx, (file_name, keys) in enumerate(filtered_file_to_keys.items(), 1):
         print(f"load shard {file_idx}/{total_files}: {file_name}", flush=True)
         file_path = os.path.join(ckpt_path, file_name)
         with safe_open(file_path, framework="pt", device="cpu") as f:
-            file_tensor_keys = set(f.keys())
-
-            def get_tensor_for_key(tensor_key: str) -> torch.Tensor | None:
-                if tensor_key in file_tensor_keys:
-                    return f.get_tensor(tensor_key)
-                tensor_file = weight_map.get(tensor_key)
-                if tensor_file is None:
-                    return None
-                with safe_open(os.path.join(ckpt_path, tensor_file), framework="pt", device="cpu") as other_f:
-                    return other_f.get_tensor(tensor_key)
-
             for key in keys:
                 if key in loaded:
-                    continue
-                if key.endswith(".scale") and f"{key[:-6]}.weight" in state_dict:
-                    continue
-                if key not in state_dict:
                     continue
                 module_name, _, _ = key.rpartition('.')
                 module = name_to_module.get(module_name)
                 if module is None:
                     continue
-                expert_idx = _expert_idx_from_name(key)
-                if expert_idx is not None:
-                    parts = key.split('.')
-                    owner_module = name_to_module.get('.'.join(parts[:parts.index("experts")]))
-                    if owner_module is None or not _module_owns_expert(owner_module, expert_idx):
-                        loaded.add(key)
-                        scale_key = f"{key[:-7]}.scale" if key.endswith(".weight") else None
-                        if scale_key is not None:
-                            loaded.add(scale_key)
-                        continue
 
+                _maybe_bind_routed_int8_arena(key, state_dict, name_to_module)
+                _maybe_bind_routed_fp4_arena(key, state_dict, name_to_module)
                 target = state_dict[key]
-                tensor = f.get_tensor(key)
+                tensor = _load_tensor_for_rank(key, f, module, world_size, rank)
                 scale_key = f"{key[:-7]}.scale"
-                scale_tensor = get_tensor_for_key(scale_key) if key.endswith(".weight") else None
+                scale_tensor = _load_tensor_for_rank(scale_key, f, module, world_size, rank) if key.endswith(".weight") and scale_key in weight_map else None
 
                 if key.endswith(".weight") and tensor.dtype == torch.int8 and target.dtype != torch.int8 and not (
                     scale_tensor is not None and scale_tensor.ndim == 2 and tensor.ndim == 2
                 ):
                     if hasattr(module, "set_preloaded_wo_a_int8") and key.endswith("wo_a.weight") and getattr(module, "wo_a_int8_enabled", False):
-                        weight = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
-                        scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
+                        weight = tensor
+                        scale = scale_tensor
                         if weight is None or scale is None:
                             continue
                         module.set_preloaded_wo_a_int8(weight, scale)
@@ -373,16 +509,16 @@ def load_original_hf_model(model: Transformer, ckpt_path: str, world_size: int, 
                         loaded.add(scale_key)
                         continue
                     if hasattr(module, "enable_online_int8") and getattr(module, "online_int8_enabled", False):
-                        weight = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
-                        scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
+                        weight = tensor
+                        scale = scale_tensor
                         if weight is None or scale is None:
                             continue
                         module.set_preloaded_int8(weight, scale)
                         loaded.add(key)
                         loaded.add(scale_key)
                         continue
-                    weight = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
-                    scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
+                    weight = tensor
+                    scale = scale_tensor
                     if weight is None or scale is None:
                         continue
                     _copy_quantized_weight_to_target(key, state_dict, module, target, weight, scale)
@@ -391,8 +527,8 @@ def load_original_hf_model(model: Transformer, ckpt_path: str, world_size: int, 
                     continue
 
                 if key.endswith(".weight") and _is_packed_fp4_source(tensor, scale_tensor, target):
-                    weight = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
-                    scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
+                    weight = tensor
+                    scale = scale_tensor
                     if weight is None or scale is None:
                         continue
                     quant_device = _cuda_quant_device()
@@ -406,8 +542,8 @@ def load_original_hf_model(model: Transformer, ckpt_path: str, world_size: int, 
                     continue
 
                 if key.endswith("wo_a.weight") and tensor.dtype == torch.float8_e4m3fn and target.dtype != torch.int8:
-                    weight = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
-                    scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
+                    weight = tensor
+                    scale = scale_tensor
                     if weight is None or scale is None:
                         continue
                     wo_a_bf16 = soft_fp8_blockfp8_weight_dequant(weight, scale)
@@ -429,8 +565,8 @@ def load_original_hf_model(model: Transformer, ckpt_path: str, world_size: int, 
                     continue
 
                 if key.endswith("wo_a.weight") and tensor.dtype == torch.int8 and target.dtype == torch.bfloat16:
-                    weight = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
-                    scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
+                    weight = tensor
+                    scale = scale_tensor
                     if weight is None or scale is None:
                         continue
                     wo_a_bf16 = _dequant_int8_weight(weight, scale)
@@ -444,8 +580,8 @@ def load_original_hf_model(model: Transformer, ckpt_path: str, world_size: int, 
                     continue
 
                 if key.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn and target.dtype == torch.int8:
-                    weight = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
-                    scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
+                    weight = tensor
+                    scale = scale_tensor
                     if weight is None or scale is None:
                         continue
                     w_bf16 = soft_fp8_blockfp8_weight_dequant(weight, scale).float()
@@ -456,19 +592,18 @@ def load_original_hf_model(model: Transformer, ckpt_path: str, world_size: int, 
                     continue
 
                 if target.dtype == torch.float4_e2m1fn_x2:
-                    weight = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
+                    weight = tensor
                     if weight is None:
                         continue
                     target.view(torch.uint8).copy_(weight.view(torch.uint8).to(device=target.device))
                     loaded.add(key)
                     if scale_tensor is not None:
-                        scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
+                        scale = scale_tensor
                         if scale is not None:
                             _copy_scale_tensor(key, state_dict, module, scale)
                             loaded.add(scale_key)
                     continue
 
-                tensor = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
                 if tensor is None:
                     continue
                 if tensor.shape != target.shape:
@@ -476,7 +611,7 @@ def load_original_hf_model(model: Transformer, ckpt_path: str, world_size: int, 
                 target.copy_(tensor.to(device=target.device, dtype=target.dtype))
                 loaded.add(key)
                 if scale_tensor is not None and scale_key not in loaded:
-                    scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
+                    scale = scale_tensor
                     if scale is not None:
                         _copy_scale_tensor(key, state_dict, module, scale)
                         loaded.add(scale_key)
@@ -662,6 +797,8 @@ def generate(
             prefill_tokens += generated_this_step
             if cur_pos + 1 < total_len and hasattr(model, "release_gpu_prefill_moe_cache"):
                 model.release_gpu_prefill_moe_cache()
+                if os.environ.get("DEEPSEEK_RELEASE_PREFILL_INT8_AFTER_PREFILL", "0").lower() in {"1", "true", "yes"} and hasattr(model, "release_cpu_expert_int8_prepare_cache"):
+                    model.release_cpu_expert_int8_prepare_cache()
             # Standard length-1 prefill step finishes here -- handle next_token
             # write below.
             if temperature > 0:
@@ -972,6 +1109,8 @@ def generate_stream(
             prefill_tokens += generated_this_step
             if cur_pos + 1 < total_len and hasattr(model, "release_gpu_prefill_moe_cache"):
                 model.release_gpu_prefill_moe_cache()
+                if os.environ.get("DEEPSEEK_RELEASE_PREFILL_INT8_AFTER_PREFILL", "0").lower() in {"1", "true", "yes"} and hasattr(model, "release_cpu_expert_int8_prepare_cache"):
+                    model.release_cpu_expert_int8_prepare_cache()
             if temperature > 0:
                 next_token = sample(logits, temperature)
             next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
@@ -1128,8 +1267,10 @@ def main(
     world_size = int(os.getenv("WORLD_SIZE", "1"))
     rank = int(os.getenv("RANK", "0"))
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    load_barrier_group = None
     if world_size > 1:
-        dist.init_process_group("nccl")
+        dist.init_process_group("nccl", timeout=timedelta(days=7))
+        load_barrier_group = dist.new_group(backend="gloo", timeout=timedelta(days=7))
     global print
     if rank != 0:
         print = lambda *_, **__: None
@@ -1190,11 +1331,23 @@ def main(
     print(f"init time: {time.perf_counter() - init_start:.3f}s", flush=True)
     print("load model")
     load_start = time.perf_counter()
+    load_timing_enabled = os.getenv("DEEPSEEK_LOAD_TIMING", "0").lower() in {"1", "true", "yes"}
     load_original_hf_model(model, ckpt_path, world_size, rank)
+    if load_timing_enabled:
+        print(f"load_timing rank={rank} stage=weights time={time.perf_counter() - load_start:.3f}s", flush=True)
     if routed_experts_device == "cpu":
+        prepare_start = time.perf_counter()
         model.prepare_cpu_expert_int8()
+        if load_timing_enabled:
+            print(f"load_timing rank={rank} stage=cpu_expert_prepare time={time.perf_counter() - prepare_start:.3f}s", flush=True)
         if shared_cpu_moe_arena is not None:
             shared_cpu_moe_arena.mark_ready()
+    if world_size > 1:
+        if load_timing_enabled:
+            print(f"load_timing rank={rank} stage=barrier_enter time={time.perf_counter() - load_start:.3f}s", flush=True)
+        dist.barrier(group=load_barrier_group)
+        if load_timing_enabled:
+            print(f"load_timing rank={rank} stage=barrier_exit time={time.perf_counter() - load_start:.3f}s", flush=True)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     print(f"load time: {time.perf_counter() - load_start:.3f}s", flush=True)

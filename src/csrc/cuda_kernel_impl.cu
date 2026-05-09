@@ -1795,6 +1795,1153 @@ torch::Tensor moe_single_token_int8_forward_cuda(
 }
 
 // ============================================================================
+// FP4 single-token MoE: routed expert weights stay packed FP4 (e2m1fn_x2)
+// + e8m0 per-32 block scales all the way to GPU. Activations are int8 like the
+// int8 path; weight nibbles unpack into int8 values multiplied by 2 (FP4 e2m1
+// levels are {0, +/-0.5, +/-1, +/-1.5, +/-2, +/-3, +/-4, +/-6}, all in [-12,12]
+// after *2). __dp4a accumulates over 32-K blocks; each block's int32 acc is
+// scaled by 2^(scale_byte - 128) (the -1 absorbs the LUT *2). The w1w3 kernel
+// emits fp32 (already weight-scaled), unlike the int8 v1 kernel which emits
+// int32 and scales in the SwiGLU stage.
+// ============================================================================
+
+__device__ __constant__ int8_t fp4_lut_x2[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12,
+    0, -1, -2, -3, -4, -6, -8, -12
+};
+
+__device__ __forceinline__ void fp4_init_byte_lut(uint16_t* lut_pair, int tid, int block_threads) {
+    // Each entry maps a byte (= two FP4 nibbles) to a uint16 holding the two
+    // dequantized int8 values (already *2 from the e2m1 LUT) in low/high byte.
+    // Lives in shared memory: byte LDS broadcasts and avoids the warp-level
+    // serialization that __constant__ would suffer on divergent nibble values.
+    for (int i = tid; i < 256; i += block_threads) {
+        const uint32_t b = static_cast<uint32_t>(i);
+        const int8_t lo = fp4_lut_x2[b & 0xF];
+        const int8_t hi = fp4_lut_x2[(b >> 4) & 0xF];
+        lut_pair[i] = static_cast<uint16_t>(
+            (static_cast<uint16_t>(static_cast<uint8_t>(lo)) << 0) |
+            (static_cast<uint16_t>(static_cast<uint8_t>(hi)) << 8));
+    }
+}
+
+__device__ __forceinline__ int fp4_unpack_4codes_via_lut(const uint16_t* lut_pair,
+                                                         uint32_t two_bytes) {
+    // two_bytes: low 16 bits hold weight byte0 (K0,K1) and byte1 (K2,K3).
+    // Returns int8x4 [K0, K1, K2, K3] suitable for __dp4a (signed int8 lanes).
+    const uint32_t pair0 = lut_pair[two_bytes & 0xFFu];
+    const uint32_t pair1 = lut_pair[(two_bytes >> 8) & 0xFFu];
+    return static_cast<int>(pair0 | (pair1 << 16));
+}
+
+__device__ __forceinline__ int fp4_unpack_4codes_prmt(uint32_t two_bytes) {
+    const uint32_t control_mags = two_bytes & 0x7777u;
+    const uint32_t pos = __byte_perm(0x03020100u, 0x0c080604u, control_mags);
+    const uint32_t neg = __byte_perm(0xfdfeff00u, 0xf4f8fafcu, control_mags);
+    const uint32_t control_sign = (two_bytes >> 3) & 0x1111u;
+    const uint32_t mask = __byte_perm(0x0000ff00u, 0x00000000u, control_sign);
+    return static_cast<int>((pos & ~mask) | (neg & mask));
+}
+
+__device__ __forceinline__ float fp4_block_scale(uint8_t scale_byte) {
+    const int exponent = max(0, static_cast<int>(scale_byte) - 1);
+    return __int_as_float(exponent << 23);
+}
+
+__device__ __forceinline__ float fp4_value_from_code_scale(uint8_t code, uint8_t scale_byte) {
+    return static_cast<float>(fp4_lut_x2[code & 0x0f]) * fp4_block_scale(scale_byte);
+}
+
+__global__ void fp4_weight_to_int8_row_kernel(
+    const uint8_t* __restrict__ wq,
+    const uint8_t* __restrict__ ws,
+    int8_t* __restrict__ out_q,
+    float* __restrict__ out_s,
+    int rows,
+    int k) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (row >= rows) return;
+    const int k_half = k / 2;
+    const int k_blocks = k / 32;
+    const uint8_t* row_q = wq + static_cast<int64_t>(row) * k_half;
+    const uint8_t* row_s = ws + static_cast<int64_t>(row) * k_blocks;
+    int8_t* dst_q = out_q + static_cast<int64_t>(row) * k;
+    __shared__ float sdata[kQuantThreads];
+    float local_max = 0.0f;
+    for (int idx = tid; idx < k; idx += blockDim.x) {
+        const uint8_t packed = row_q[idx >> 1];
+        const uint8_t code = (idx & 1) ? (packed >> 4) : (packed & 0x0f);
+        const float v = fp4_value_from_code_scale(code, row_s[idx >> 5]);
+        local_max = fmaxf(local_max, fabsf(v));
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] = fmaxf(sdata[tid], sdata[tid + stride]);
+        __syncthreads();
+    }
+    const float scale = fmaxf(sdata[0], 1.0e-6f) / 127.0f;
+    if (tid == 0) out_s[row] = scale;
+    const float inv_scale = 1.0f / scale;
+    for (int idx = tid; idx < k; idx += blockDim.x) {
+        const uint8_t packed = row_q[idx >> 1];
+        const uint8_t code = (idx & 1) ? (packed >> 4) : (packed & 0x0f);
+        const float v = fp4_value_from_code_scale(code, row_s[idx >> 5]);
+        int q = __float2int_rn(v * inv_scale);
+        q = max(-127, min(127, q));
+        dst_q[idx] = static_cast<int8_t>(q);
+    }
+}
+
+std::vector<torch::Tensor> fp4_weight_to_int8_forward_cuda(
+    const torch::Tensor& wq,
+    const torch::Tensor& ws) {
+    c10::cuda::CUDAGuard device_guard(wq.device());
+    const int rows = static_cast<int>(wq.size(0) * wq.size(1));
+    const int k = static_cast<int>(wq.size(2) * 2);
+    auto out_q = torch::empty({wq.size(0), wq.size(1), k}, wq.options().dtype(torch::kInt8));
+    auto out_s = torch::empty({wq.size(0), wq.size(1)}, wq.options().dtype(torch::kFloat32));
+    fp4_weight_to_int8_row_kernel<<<rows, kQuantThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        wq.data_ptr<uint8_t>(),
+        ws.data_ptr<uint8_t>(),
+        out_q.data_ptr<int8_t>(),
+        out_s.data_ptr<float>(),
+        rows,
+        k);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {out_q, out_s};
+}
+
+__global__ void moe_single_w1w3_fp4_kernel(
+    const int8_t* __restrict__ x_q,
+    const float* __restrict__ x_scale,
+    const int64_t* __restrict__ indices,
+    const uint8_t* __restrict__ w1q,
+    const uint8_t* __restrict__ w1s,
+    const uint8_t* __restrict__ w3q,
+    const uint8_t* __restrict__ w3s,
+    float* __restrict__ gate_f32,
+    float* __restrict__ up_f32,
+    int topk,
+    int experts_start_idx,
+    int n_local_experts,
+    int dim,
+    int inter_dim) {
+    const int route = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (route >= topk) return;
+    const int local = static_cast<int>(indices[route]) - experts_start_idx;
+    const int dim_packs = dim / 4;       // x_q packed as int8x4
+    const int blocks_k = dim / 32;       // one e8m0 byte per 32 K elems
+    extern __shared__ int x_shared[];
+    const int* x_i32 = reinterpret_cast<const int*>(x_q);
+    for (int idx = threadIdx.x; idx < dim_packs; idx += blockDim.x) {
+        x_shared[idx] = x_i32[idx];
+    }
+    __syncthreads();
+    if (col >= inter_dim) return;
+    if (local < 0 || local >= n_local_experts) {
+        gate_f32[route * inter_dim + col] = 0.0f;
+        up_f32[route * inter_dim + col] = 0.0f;
+        return;
+    }
+    const uint8_t* w1_row_bytes = w1q + (static_cast<int64_t>(local) * inter_dim + col) * (dim / 2);
+    const uint8_t* w3_row_bytes = w3q + (static_cast<int64_t>(local) * inter_dim + col) * (dim / 2);
+    const uint8_t* w1_scale_row = w1s + (static_cast<int64_t>(local) * inter_dim + col) * blocks_k;
+    const uint8_t* w3_scale_row = w3s + (static_cast<int64_t>(local) * inter_dim + col) * blocks_k;
+    const uint16_t* w1_pack_base = reinterpret_cast<const uint16_t*>(w1_row_bytes);
+    const uint16_t* w3_pack_base = reinterpret_cast<const uint16_t*>(w3_row_bytes);
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    // Each K-block of 32 elems: 16 weight bytes = 8 uint16 (each uint16 = 4
+    // codes). 8 activation int8x4 packs (32 int8). Two __dp4a per uint16.
+    for (int kb = 0; kb < blocks_k; ++kb) {
+        const uint16_t* w1_pack = w1_pack_base + kb * 8;
+        const uint16_t* w3_pack = w3_pack_base + kb * 8;
+        const int* x_pack = x_shared + kb * 8;
+        int gate_block = 0;
+        int up_block = 0;
+        #pragma unroll
+        for (int ip = 0; ip < 8; ++ip) {
+            const uint32_t w1_bits = static_cast<uint32_t>(w1_pack[ip]);
+            const uint32_t w3_bits = static_cast<uint32_t>(w3_pack[ip]);
+            const int w1_p = fp4_unpack_4codes_prmt(w1_bits);
+            const int w3_p = fp4_unpack_4codes_prmt(w3_bits);
+            const int x_p = x_pack[ip];
+            gate_block = __dp4a(x_p, w1_p, gate_block);
+            up_block = __dp4a(x_p, w3_p, up_block);
+        }
+        gate_acc += static_cast<float>(gate_block) * fp4_block_scale(w1_scale_row[kb]);
+        up_acc += static_cast<float>(up_block) * fp4_block_scale(w3_scale_row[kb]);
+    }
+    const float xs = x_scale[0];
+    gate_f32[route * inter_dim + col] = gate_acc * xs;
+    up_f32[route * inter_dim + col] = up_acc * xs;
+}
+
+__global__ void moe_single_swiglu_quant_fp4_kernel(
+    const float* __restrict__ gate_f32,
+    const float* __restrict__ up_f32,
+    const int64_t* __restrict__ indices,
+    const float* __restrict__ weights,
+    int8_t* __restrict__ hidden_q,
+    float* __restrict__ hidden_scale,
+    int topk,
+    int experts_start_idx,
+    int n_local_experts,
+    int inter_dim,
+    float swiglu_limit) {
+    const int route = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (route >= topk) return;
+    const int local = static_cast<int>(indices[route]) - experts_start_idx;
+    if (local < 0 || local >= n_local_experts) {
+        if (tid == 0) hidden_scale[route] = 0.0f;
+        return;
+    }
+    __shared__ float sdata[kQuantThreads];
+    float local_max = 0.0f;
+    const float route_weight = weights[route];
+    for (int col = tid; col < inter_dim; col += blockDim.x) {
+        float gate = gate_f32[route * inter_dim + col];
+        float up = up_f32[route * inter_dim + col];
+        if (swiglu_limit > 0.0f) {
+            up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
+            gate = fminf(gate, swiglu_limit);
+        }
+        const float silu = gate / (1.0f + expf(-gate));
+        const float v = silu * up * route_weight;
+        local_max = fmaxf(local_max, fabsf(v));
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] = fmaxf(sdata[tid], sdata[tid + stride]);
+        __syncthreads();
+    }
+    const float scale = fmaxf(sdata[0], 1.0e-6f) / 127.0f;
+    if (tid == 0) hidden_scale[route] = scale;
+    __syncthreads();
+    const float inv_scale = 1.0f / scale;
+    for (int col = tid; col < inter_dim; col += blockDim.x) {
+        float gate = gate_f32[route * inter_dim + col];
+        float up = up_f32[route * inter_dim + col];
+        if (swiglu_limit > 0.0f) {
+            up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
+            gate = fminf(gate, swiglu_limit);
+        }
+        const float silu = gate / (1.0f + expf(-gate));
+        const float v = silu * up * route_weight;
+        int q = __float2int_rn(v * inv_scale);
+        q = max(-127, min(127, q));
+        hidden_q[route * inter_dim + col] = static_cast<int8_t>(q);
+    }
+}
+
+__global__ void moe_single_w2_accum_fp4_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int64_t* __restrict__ indices,
+    const uint8_t* __restrict__ w2q,
+    const uint8_t* __restrict__ w2s,
+    float* __restrict__ y,
+    int topk,
+    int experts_start_idx,
+    int n_local_experts,
+    int dim,
+    int inter_dim) {
+    const int route = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (route >= topk) return;
+    const int local = static_cast<int>(indices[route]) - experts_start_idx;
+    if (local < 0 || local >= n_local_experts) return;
+    const int packs = inter_dim / 4;
+    const int blocks_k = inter_dim / 32;
+    extern __shared__ int h_shared[];
+    const int* h_i32 = reinterpret_cast<const int*>(hidden_q + route * inter_dim);
+    for (int idx = threadIdx.x; idx < packs; idx += blockDim.x) {
+        h_shared[idx] = h_i32[idx];
+    }
+    __syncthreads();
+    if (col >= dim) return;
+    const uint8_t* w2_row_bytes = w2q + (static_cast<int64_t>(local) * dim + col) * (inter_dim / 2);
+    const uint8_t* w2_scale_row = w2s + (static_cast<int64_t>(local) * dim + col) * blocks_k;
+    const uint16_t* w2_pack_base = reinterpret_cast<const uint16_t*>(w2_row_bytes);
+    float row_acc = 0.0f;
+    for (int kb = 0; kb < blocks_k; ++kb) {
+        const uint16_t* w2_pack = w2_pack_base + kb * 8;
+        const int* h_pack = h_shared + kb * 8;
+        int blk = 0;
+        #pragma unroll
+        for (int ip = 0; ip < 8; ++ip) {
+            const uint32_t w_bits = static_cast<uint32_t>(w2_pack[ip]);
+            const int w_p = fp4_unpack_4codes_prmt(w_bits);
+            blk = __dp4a(h_pack[ip], w_p, blk);
+        }
+        row_acc += static_cast<float>(blk) * fp4_block_scale(w2_scale_row[kb]);
+    }
+    atomicAdd(y + col, row_acc * hidden_scale[route]);
+}
+
+torch::Tensor moe_single_token_fp4_forward_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& indices,
+    const torch::Tensor& weights,
+    const torch::Tensor& w1q,
+    const torch::Tensor& w1s,
+    const torch::Tensor& w2q,
+    const torch::Tensor& w2s,
+    const torch::Tensor& w3q,
+    const torch::Tensor& w3s,
+    int64_t experts_start_idx,
+    double swiglu_limit) {
+    c10::cuda::CUDAGuard device_guard(x.device());
+    const int topk = static_cast<int>(indices.size(0));
+    const int dim = static_cast<int>(x.size(1));
+    const int n_local_experts = static_cast<int>(w1q.size(0));
+    const int inter_dim = static_cast<int>(w1q.size(1));
+    auto x_contig = x.contiguous();
+    auto indices_contig = indices.contiguous();
+    auto weights_contig = weights.contiguous();
+    auto y = torch::zeros({1, dim}, x.options().dtype(torch::kFloat32));
+    auto x_q = torch::empty({1, 1, dim}, x.options().dtype(torch::kInt8));
+    auto x_scale = torch::empty({1, 1}, x.options().dtype(torch::kFloat32));
+    auto gate_f32 = torch::empty({topk, inter_dim}, x.options().dtype(torch::kFloat32));
+    auto up_f32 = torch::empty({topk, inter_dim}, x.options().dtype(torch::kFloat32));
+    auto hidden_q = torch::empty({topk, inter_dim}, x.options().dtype(torch::kInt8));
+    auto hidden_scale = torch::empty({topk}, x.options().dtype(torch::kFloat32));
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x_contig.scalar_type(), "moe_single_quantize_x_fp4", [&] {
+        quantize_rows_kernel<scalar_t><<<1, kQuantThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            x_contig.data_ptr<scalar_t>(),
+            x_q.data_ptr<int8_t>(),
+            x_scale.data_ptr<float>(),
+            1,
+            1,
+            dim);
+    });
+
+    const dim3 w1w3_grid(ceil_div(inter_dim, kGemmThreads), topk);
+    const dim3 gemm_block(kGemmThreads);
+    const size_t x_shared_bytes = static_cast<size_t>(dim / 4) * sizeof(int);
+    moe_single_w1w3_fp4_kernel<<<w1w3_grid, gemm_block, x_shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        x_q.data_ptr<int8_t>(),
+        x_scale.data_ptr<float>(),
+        indices_contig.data_ptr<int64_t>(),
+        w1q.data_ptr<uint8_t>(),
+        w1s.data_ptr<uint8_t>(),
+        w3q.data_ptr<uint8_t>(),
+        w3s.data_ptr<uint8_t>(),
+        gate_f32.data_ptr<float>(),
+        up_f32.data_ptr<float>(),
+        topk,
+        static_cast<int>(experts_start_idx),
+        n_local_experts,
+        dim,
+        inter_dim);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    moe_single_swiglu_quant_fp4_kernel<<<topk, kQuantThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        gate_f32.data_ptr<float>(),
+        up_f32.data_ptr<float>(),
+        indices_contig.data_ptr<int64_t>(),
+        weights_contig.data_ptr<float>(),
+        hidden_q.data_ptr<int8_t>(),
+        hidden_scale.data_ptr<float>(),
+        topk,
+        static_cast<int>(experts_start_idx),
+        n_local_experts,
+        inter_dim,
+        static_cast<float>(swiglu_limit));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    const dim3 w2_grid(ceil_div(dim, kGemmThreads), topk);
+    const size_t h_shared_bytes = static_cast<size_t>(inter_dim / 4) * sizeof(int);
+    moe_single_w2_accum_fp4_kernel<<<w2_grid, gemm_block, h_shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        hidden_q.data_ptr<int8_t>(),
+        hidden_scale.data_ptr<float>(),
+        indices_contig.data_ptr<int64_t>(),
+        w2q.data_ptr<uint8_t>(),
+        w2s.data_ptr<uint8_t>(),
+        y.data_ptr<float>(),
+        topk,
+        static_cast<int>(experts_start_idx),
+        n_local_experts,
+        dim,
+        inter_dim);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
+
+constexpr int kFp4GroupedCols = 128;
+constexpr int kFp4GroupedRows = 4;
+
+__global__ void moe_fp4_grouped_w13_padded_kernel(
+    const int8_t* __restrict__ x_q_pad,
+    const float* __restrict__ x_scale_pad,
+    const int32_t* __restrict__ seg_starts,
+    const uint8_t* __restrict__ w1q,
+    const uint8_t* __restrict__ w1s,
+    const uint8_t* __restrict__ w3q,
+    const uint8_t* __restrict__ w3s,
+    float* __restrict__ gate_f32,
+    float* __restrict__ up_f32,
+    int rows_per_expert,
+    int dim,
+    int inter_dim) {
+    const int expert = blockIdx.z;
+    const int row_base = blockIdx.y * kFp4GroupedRows;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int dim_packs = dim / 4;
+    const int blocks_k = dim / 32;
+    const int count = seg_starts[expert + 1] - seg_starts[expert];
+    extern __shared__ int x_shared[];
+    for (int idx = threadIdx.x; idx < kFp4GroupedRows * dim_packs; idx += blockDim.x) {
+        const int r = idx / dim_packs;
+        const int pack = idx - r * dim_packs;
+        const int row = row_base + r;
+        int value = 0;
+        if (row < count && row < rows_per_expert) {
+            const int* x_row = reinterpret_cast<const int*>(x_q_pad + (static_cast<int64_t>(expert) * rows_per_expert + row) * dim);
+            value = x_row[pack];
+        }
+        x_shared[idx] = value;
+    }
+    __syncthreads();
+    if (col >= inter_dim) return;
+
+    const uint8_t* w1_row_bytes = w1q + (static_cast<int64_t>(expert) * inter_dim + col) * (dim / 2);
+    const uint8_t* w3_row_bytes = w3q + (static_cast<int64_t>(expert) * inter_dim + col) * (dim / 2);
+    const uint8_t* w1_scale_row = w1s + (static_cast<int64_t>(expert) * inter_dim + col) * blocks_k;
+    const uint8_t* w3_scale_row = w3s + (static_cast<int64_t>(expert) * inter_dim + col) * blocks_k;
+    const uint16_t* w1_pack_base = reinterpret_cast<const uint16_t*>(w1_row_bytes);
+    const uint16_t* w3_pack_base = reinterpret_cast<const uint16_t*>(w3_row_bytes);
+    float gate_acc[kFp4GroupedRows] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float up_acc[kFp4GroupedRows] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int kb = 0; kb < blocks_k; ++kb) {
+        const uint16_t* w1_pack = w1_pack_base + kb * 8;
+        const uint16_t* w3_pack = w3_pack_base + kb * 8;
+        int gate_block[kFp4GroupedRows] = {0, 0, 0, 0};
+        int up_block[kFp4GroupedRows] = {0, 0, 0, 0};
+        #pragma unroll
+        for (int ip = 0; ip < 8; ++ip) {
+            const int w1_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w1_pack[ip]));
+            const int w3_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w3_pack[ip]));
+            #pragma unroll
+            for (int r = 0; r < kFp4GroupedRows; ++r) {
+                const int x_p = x_shared[r * dim_packs + kb * 8 + ip];
+                gate_block[r] = __dp4a(x_p, w1_p, gate_block[r]);
+                up_block[r] = __dp4a(x_p, w3_p, up_block[r]);
+            }
+        }
+        const float s1 = fp4_block_scale(w1_scale_row[kb]);
+        const float s3 = fp4_block_scale(w3_scale_row[kb]);
+        #pragma unroll
+        for (int r = 0; r < kFp4GroupedRows; ++r) {
+            gate_acc[r] += static_cast<float>(gate_block[r]) * s1;
+            up_acc[r] += static_cast<float>(up_block[r]) * s3;
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < kFp4GroupedRows; ++r) {
+        const int row = row_base + r;
+        if (row < count && row < rows_per_expert) {
+            const int64_t base = (static_cast<int64_t>(expert) * rows_per_expert + row) * inter_dim + col;
+            const float xs = x_scale_pad[expert * rows_per_expert + row];
+            gate_f32[base] = gate_acc[r] * xs;
+            up_f32[base] = up_acc[r] * xs;
+        }
+    }
+}
+
+__global__ void moe_pair_swiglu_quantize_padded_fp32_kernel(
+    const float* __restrict__ gate_f32,
+    const float* __restrict__ up_f32,
+    const int32_t* __restrict__ seg_starts,
+    const float* __restrict__ route_weights,
+    int8_t* __restrict__ hidden_q,
+    float* __restrict__ hidden_scale,
+    int rows_per_expert,
+    int inter_dim,
+    float swiglu_limit) {
+    const int expert = blockIdx.x;
+    const int row = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int count = seg_starts[expert + 1] - seg_starts[expert];
+    const int padded_row = expert * rows_per_expert + row;
+    const int base = padded_row * inter_dim;
+    __shared__ float sdata[kQuantThreads];
+    if (row >= count) {
+        for (int col = tid; col < inter_dim; col += blockDim.x) {
+            hidden_q[base + col] = 0;
+        }
+        if (tid == 0) hidden_scale[padded_row] = 0.0f;
+        return;
+    }
+    const int route = seg_starts[expert] + row;
+    const float route_weight = route_weights[route];
+    float local_max = 0.0f;
+    for (int col = tid; col < inter_dim; col += blockDim.x) {
+        const int idx = base + col;
+        float gate = gate_f32[idx];
+        float up = up_f32[idx];
+        if (swiglu_limit > 0.0f) {
+            up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
+            gate = fminf(gate, swiglu_limit);
+        }
+        const float silu = gate / (1.0f + expf(-gate));
+        const float value = silu * up * route_weight;
+        local_max = fmaxf(local_max, fabsf(value));
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] = fmaxf(sdata[tid], sdata[tid + stride]);
+        __syncthreads();
+    }
+    const float scale = fmaxf(sdata[0], 1.0e-6f) / 127.0f;
+    if (tid == 0) hidden_scale[padded_row] = scale;
+    __syncthreads();
+    const float inv_scale = 1.0f / scale;
+    for (int col = tid; col < inter_dim; col += blockDim.x) {
+        const int idx = base + col;
+        float gate = gate_f32[idx];
+        float up = up_f32[idx];
+        if (swiglu_limit > 0.0f) {
+            up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
+            gate = fminf(gate, swiglu_limit);
+        }
+        const float silu = gate / (1.0f + expf(-gate));
+        const float value = silu * up * route_weight;
+        int q = __float2int_rn(value * inv_scale);
+        q = max(-127, min(127, q));
+        hidden_q[idx] = static_cast<int8_t>(q);
+    }
+}
+
+__global__ void moe_fp4_grouped_w2_scatter_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ seg_starts,
+    const uint8_t* __restrict__ w2q,
+    const uint8_t* __restrict__ w2s,
+    float* __restrict__ y,
+    int rows_per_expert,
+    int dim,
+    int inter_dim) {
+    const int expert = blockIdx.z;
+    const int row_base = blockIdx.y * kFp4GroupedRows;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int inter_packs = inter_dim / 4;
+    const int blocks_k = inter_dim / 32;
+    const int count = seg_starts[expert + 1] - seg_starts[expert];
+    extern __shared__ int h_shared[];
+    for (int idx = threadIdx.x; idx < kFp4GroupedRows * inter_packs; idx += blockDim.x) {
+        const int r = idx / inter_packs;
+        const int pack = idx - r * inter_packs;
+        const int row = row_base + r;
+        int value = 0;
+        if (row < count && row < rows_per_expert) {
+            const int* h_row = reinterpret_cast<const int*>(hidden_q + (static_cast<int64_t>(expert) * rows_per_expert + row) * inter_dim);
+            value = h_row[pack];
+        }
+        h_shared[idx] = value;
+    }
+    __syncthreads();
+    if (col >= dim) return;
+
+    const uint8_t* w2_row_bytes = w2q + (static_cast<int64_t>(expert) * dim + col) * (inter_dim / 2);
+    const uint8_t* w2_scale_row = w2s + (static_cast<int64_t>(expert) * dim + col) * blocks_k;
+    const uint16_t* w2_pack_base = reinterpret_cast<const uint16_t*>(w2_row_bytes);
+    float acc[kFp4GroupedRows] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int kb = 0; kb < blocks_k; ++kb) {
+        const uint16_t* w2_pack = w2_pack_base + kb * 8;
+        int block_acc[kFp4GroupedRows] = {0, 0, 0, 0};
+        #pragma unroll
+        for (int ip = 0; ip < 8; ++ip) {
+            const int w_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w2_pack[ip]));
+            #pragma unroll
+            for (int r = 0; r < kFp4GroupedRows; ++r) {
+                const int h_p = h_shared[r * inter_packs + kb * 8 + ip];
+                block_acc[r] = __dp4a(h_p, w_p, block_acc[r]);
+            }
+        }
+        const float s = fp4_block_scale(w2_scale_row[kb]);
+        #pragma unroll
+        for (int r = 0; r < kFp4GroupedRows; ++r) {
+            acc[r] += static_cast<float>(block_acc[r]) * s;
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < kFp4GroupedRows; ++r) {
+        const int row = row_base + r;
+        if (row < count && row < rows_per_expert) {
+            const int route = seg_starts[expert] + row;
+            const int64_t token = route_tokens[route];
+            atomicAdd(y + token * dim + col, acc[r] * hidden_scale[expert * rows_per_expert + row]);
+        }
+    }
+}
+
+__device__ __forceinline__ int8_t fp4_decode_code_x2(uint8_t code) {
+    return fp4_lut_x2[code & 0x0f];
+}
+
+__global__ void moe_fp4_grouped_w13_wmma_kernel(
+    const int8_t* __restrict__ x_q_pad,
+    const float* __restrict__ x_scale_pad,
+    const int32_t* __restrict__ seg_starts,
+    const uint8_t* __restrict__ w1q,
+    const uint8_t* __restrict__ w1s,
+    const uint8_t* __restrict__ w3q,
+    const uint8_t* __restrict__ w3s,
+    float* __restrict__ gate_f32,
+    float* __restrict__ up_f32,
+    int rows_per_expert,
+    int dim,
+    int inter_dim) {
+    using namespace nvcuda;
+    constexpr int TILE = 16;
+    const int expert = blockIdx.z;
+    const int row_base = blockIdx.y * TILE;
+    const int col_base = blockIdx.x * TILE;
+    const int tid = threadIdx.x;
+    const int blocks_k = dim / 32;
+    const int count = seg_starts[expert + 1] - seg_starts[expert];
+    extern __shared__ __align__(16) unsigned char smem[];
+    signed char* a_tile = reinterpret_cast<signed char*>(smem);
+    signed char* b_tile = a_tile + TILE * TILE;
+    int* c_tile = reinterpret_cast<int*>(b_tile + 2 * TILE * TILE);
+    float* gate_acc = reinterpret_cast<float*>(c_tile + TILE * TILE);
+    float* up_acc = gate_acc + TILE * TILE;
+
+    for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+        gate_acc[i] = 0.0f;
+        up_acc[i] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int kb = 0; kb < blocks_k; ++kb) {
+        wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, signed char, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, signed char, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, TILE, TILE, TILE, int> c1_frag;
+        wmma::fragment<wmma::accumulator, TILE, TILE, TILE, int> c3_frag;
+        wmma::fill_fragment(c1_frag, 0);
+        wmma::fill_fragment(c3_frag, 0);
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int k0 = kb * 32 + half * TILE;
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int r = i / TILE;
+                const int k = i - r * TILE;
+                const int row = row_base + r;
+                a_tile[i] = (row < count && row < rows_per_expert)
+                    ? x_q_pad[(static_cast<int64_t>(expert) * rows_per_expert + row) * dim + k0 + k]
+                    : 0;
+            }
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int k = i & (TILE - 1);
+                const int n = i >> 4;
+                const int col = col_base + n;
+                signed char v1 = 0;
+                signed char v3 = 0;
+                if (col < inter_dim) {
+                    const int kk = k0 + k;
+                    const uint8_t* w1_row = w1q + (static_cast<int64_t>(expert) * inter_dim + col) * (dim / 2);
+                    const uint8_t* w3_row = w3q + (static_cast<int64_t>(expert) * inter_dim + col) * (dim / 2);
+                    const uint8_t b1 = w1_row[kk >> 1];
+                    const uint8_t b3 = w3_row[kk >> 1];
+                    const uint8_t c1 = (kk & 1) ? (b1 >> 4) : (b1 & 0x0f);
+                    const uint8_t c3 = (kk & 1) ? (b3 >> 4) : (b3 & 0x0f);
+                    v1 = fp4_decode_code_x2(c1);
+                    v3 = fp4_decode_code_x2(c3);
+                }
+                b_tile[k + n * TILE] = v1;
+                b_tile[TILE * TILE + k + n * TILE] = v3;
+            }
+            __syncthreads();
+            wmma::load_matrix_sync(a_frag, a_tile, TILE);
+            wmma::load_matrix_sync(b_frag, b_tile, TILE);
+            wmma::mma_sync(c1_frag, a_frag, b_frag, c1_frag);
+            wmma::load_matrix_sync(b_frag, b_tile + TILE * TILE, TILE);
+            wmma::mma_sync(c3_frag, a_frag, b_frag, c3_frag);
+            __syncthreads();
+        }
+        wmma::store_matrix_sync(c_tile, c1_frag, TILE, wmma::mem_row_major);
+        __syncthreads();
+        for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+            const int n = i & (TILE - 1);
+            const int col = col_base + n;
+            if (col < inter_dim) {
+                const float s = fp4_block_scale(w1s[(static_cast<int64_t>(expert) * inter_dim + col) * blocks_k + kb]);
+                gate_acc[i] += static_cast<float>(c_tile[i]) * s;
+            }
+        }
+        __syncthreads();
+        wmma::store_matrix_sync(c_tile, c3_frag, TILE, wmma::mem_row_major);
+        __syncthreads();
+        for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+            const int n = i & (TILE - 1);
+            const int col = col_base + n;
+            if (col < inter_dim) {
+                const float s = fp4_block_scale(w3s[(static_cast<int64_t>(expert) * inter_dim + col) * blocks_k + kb]);
+                up_acc[i] += static_cast<float>(c_tile[i]) * s;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+        const int r = i / TILE;
+        const int n = i - r * TILE;
+        const int row = row_base + r;
+        const int col = col_base + n;
+        if (row < count && row < rows_per_expert && col < inter_dim) {
+            const int64_t out = (static_cast<int64_t>(expert) * rows_per_expert + row) * inter_dim + col;
+            const float xs = x_scale_pad[expert * rows_per_expert + row];
+            gate_f32[out] = gate_acc[i] * xs;
+            up_f32[out] = up_acc[i] * xs;
+        }
+    }
+}
+
+__global__ void moe_fp4_grouped_w2_wmma_scatter_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ seg_starts,
+    const uint8_t* __restrict__ w2q,
+    const uint8_t* __restrict__ w2s,
+    float* __restrict__ y,
+    int rows_per_expert,
+    int dim,
+    int inter_dim) {
+    using namespace nvcuda;
+    constexpr int TILE = 16;
+    const int expert = blockIdx.z;
+    const int row_base = blockIdx.y * TILE;
+    const int col_base = blockIdx.x * TILE;
+    const int tid = threadIdx.x;
+    const int blocks_k = inter_dim / 32;
+    const int count = seg_starts[expert + 1] - seg_starts[expert];
+    extern __shared__ __align__(16) unsigned char smem[];
+    signed char* a_tile = reinterpret_cast<signed char*>(smem);
+    signed char* b_tile = a_tile + TILE * TILE;
+    int* c_tile = reinterpret_cast<int*>(b_tile + TILE * TILE);
+    float* acc = reinterpret_cast<float*>(c_tile + TILE * TILE);
+
+    for (int i = tid; i < TILE * TILE; i += blockDim.x) acc[i] = 0.0f;
+    __syncthreads();
+
+    for (int kb = 0; kb < blocks_k; ++kb) {
+        wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, signed char, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, signed char, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, TILE, TILE, TILE, int> c_frag;
+        wmma::fill_fragment(c_frag, 0);
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int k0 = kb * 32 + half * TILE;
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int r = i / TILE;
+                const int k = i - r * TILE;
+                const int row = row_base + r;
+                a_tile[i] = (row < count && row < rows_per_expert)
+                    ? hidden_q[(static_cast<int64_t>(expert) * rows_per_expert + row) * inter_dim + k0 + k]
+                    : 0;
+            }
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int k = i & (TILE - 1);
+                const int n = i >> 4;
+                const int col = col_base + n;
+                signed char v = 0;
+                if (col < dim) {
+                    const int kk = k0 + k;
+                    const uint8_t* w2_row = w2q + (static_cast<int64_t>(expert) * dim + col) * (inter_dim / 2);
+                    const uint8_t b = w2_row[kk >> 1];
+                    const uint8_t c = (kk & 1) ? (b >> 4) : (b & 0x0f);
+                    v = fp4_decode_code_x2(c);
+                }
+                b_tile[k + n * TILE] = v;
+            }
+            __syncthreads();
+            wmma::load_matrix_sync(a_frag, a_tile, TILE);
+            wmma::load_matrix_sync(b_frag, b_tile, TILE);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            __syncthreads();
+        }
+        wmma::store_matrix_sync(c_tile, c_frag, TILE, wmma::mem_row_major);
+        __syncthreads();
+        for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+            const int n = i & (TILE - 1);
+            const int col = col_base + n;
+            if (col < dim) {
+                const float s = fp4_block_scale(w2s[(static_cast<int64_t>(expert) * dim + col) * blocks_k + kb]);
+                acc[i] += static_cast<float>(c_tile[i]) * s;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+        const int r = i / TILE;
+        const int n = i - r * TILE;
+        const int row = row_base + r;
+        const int col = col_base + n;
+        if (row < count && row < rows_per_expert && col < dim) {
+            const int route = seg_starts[expert] + row;
+            const int64_t token = route_tokens[route];
+            atomicAdd(y + token * dim + col, acc[i] * hidden_scale[expert * rows_per_expert + row]);
+        }
+    }
+}
+
+__global__ void moe_fp4_grouped_w13_wmma64_kernel(
+    const int8_t* __restrict__ x_q_pad,
+    const float* __restrict__ x_scale_pad,
+    const int32_t* __restrict__ seg_starts,
+    const uint8_t* __restrict__ w1q,
+    const uint8_t* __restrict__ w1s,
+    const uint8_t* __restrict__ w3q,
+    const uint8_t* __restrict__ w3s,
+    float* __restrict__ gate_f32,
+    float* __restrict__ up_f32,
+    int rows_per_expert,
+    int dim,
+    int inter_dim) {
+    using namespace nvcuda;
+    constexpr int TILE = 16;
+    constexpr int TN = 64;
+    constexpr int NF = TN / TILE;
+    const int expert = blockIdx.z;
+    const int row_base = blockIdx.y * TILE;
+    const int col_base = blockIdx.x * TN;
+    const int tid = threadIdx.x;
+    const int blocks_k = dim / 32;
+    const int count = seg_starts[expert + 1] - seg_starts[expert];
+    extern __shared__ __align__(16) unsigned char smem[];
+    signed char* a_tile = reinterpret_cast<signed char*>(smem);
+    signed char* b_tile = a_tile + TILE * TILE;
+    int* c_tile = reinterpret_cast<int*>(b_tile + 2 * NF * TILE * TILE);
+    float* gate_acc = reinterpret_cast<float*>(c_tile + TILE * TILE);
+    float* up_acc = gate_acc + TILE * TN;
+
+    for (int i = tid; i < TILE * TN; i += blockDim.x) {
+        gate_acc[i] = 0.0f;
+        up_acc[i] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int kb = 0; kb < blocks_k; ++kb) {
+        wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, signed char, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, signed char, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, TILE, TILE, TILE, int> c1_frag[NF];
+        wmma::fragment<wmma::accumulator, TILE, TILE, TILE, int> c3_frag[NF];
+        #pragma unroll
+        for (int f = 0; f < NF; ++f) {
+            wmma::fill_fragment(c1_frag[f], 0);
+            wmma::fill_fragment(c3_frag[f], 0);
+        }
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int k0 = kb * 32 + half * TILE;
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int r = i / TILE;
+                const int k = i - r * TILE;
+                const int row = row_base + r;
+                a_tile[i] = (row < count && row < rows_per_expert)
+                    ? x_q_pad[(static_cast<int64_t>(expert) * rows_per_expert + row) * dim + k0 + k]
+                    : 0;
+            }
+            for (int i = tid; i < NF * TILE * TILE; i += blockDim.x) {
+                const int f = i / (TILE * TILE);
+                const int j = i - f * TILE * TILE;
+                const int k = j & (TILE - 1);
+                const int n = j >> 4;
+                const int col = col_base + f * TILE + n;
+                signed char v1 = 0;
+                signed char v3 = 0;
+                if (col < inter_dim) {
+                    const int kk = k0 + k;
+                    const uint8_t* w1_row = w1q + (static_cast<int64_t>(expert) * inter_dim + col) * (dim / 2);
+                    const uint8_t* w3_row = w3q + (static_cast<int64_t>(expert) * inter_dim + col) * (dim / 2);
+                    const uint8_t b1 = w1_row[kk >> 1];
+                    const uint8_t b3 = w3_row[kk >> 1];
+                    v1 = fp4_decode_code_x2((kk & 1) ? (b1 >> 4) : (b1 & 0x0f));
+                    v3 = fp4_decode_code_x2((kk & 1) ? (b3 >> 4) : (b3 & 0x0f));
+                }
+                b_tile[(2 * f) * TILE * TILE + k + n * TILE] = v1;
+                b_tile[(2 * f + 1) * TILE * TILE + k + n * TILE] = v3;
+            }
+            __syncthreads();
+            wmma::load_matrix_sync(a_frag, a_tile, TILE);
+            #pragma unroll
+            for (int f = 0; f < NF; ++f) {
+                wmma::load_matrix_sync(b_frag, b_tile + (2 * f) * TILE * TILE, TILE);
+                wmma::mma_sync(c1_frag[f], a_frag, b_frag, c1_frag[f]);
+                wmma::load_matrix_sync(b_frag, b_tile + (2 * f + 1) * TILE * TILE, TILE);
+                wmma::mma_sync(c3_frag[f], a_frag, b_frag, c3_frag[f]);
+            }
+            __syncthreads();
+        }
+        #pragma unroll
+        for (int f = 0; f < NF; ++f) {
+            wmma::store_matrix_sync(c_tile, c1_frag[f], TILE, wmma::mem_row_major);
+            __syncthreads();
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int n = i & (TILE - 1);
+                const int col = col_base + f * TILE + n;
+                if (col < inter_dim) {
+                    const float s = fp4_block_scale(w1s[(static_cast<int64_t>(expert) * inter_dim + col) * blocks_k + kb]);
+                    const int r = i >> 4;
+                    gate_acc[r * TN + f * TILE + n] += static_cast<float>(c_tile[i]) * s;
+                }
+            }
+            __syncthreads();
+            wmma::store_matrix_sync(c_tile, c3_frag[f], TILE, wmma::mem_row_major);
+            __syncthreads();
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int n = i & (TILE - 1);
+                const int col = col_base + f * TILE + n;
+                if (col < inter_dim) {
+                    const float s = fp4_block_scale(w3s[(static_cast<int64_t>(expert) * inter_dim + col) * blocks_k + kb]);
+                    const int r = i >> 4;
+                    up_acc[r * TN + f * TILE + n] += static_cast<float>(c_tile[i]) * s;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int i = tid; i < TILE * TN; i += blockDim.x) {
+        const int r = i / TN;
+        const int n = i - r * TN;
+        const int row = row_base + r;
+        const int col = col_base + n;
+        if (row < count && row < rows_per_expert && col < inter_dim) {
+            const int64_t out = (static_cast<int64_t>(expert) * rows_per_expert + row) * inter_dim + col;
+            const float xs = x_scale_pad[expert * rows_per_expert + row];
+            gate_f32[out] = gate_acc[i] * xs;
+            up_f32[out] = up_acc[i] * xs;
+        }
+    }
+}
+
+__global__ void moe_fp4_grouped_w2_wmma64_scatter_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ seg_starts,
+    const uint8_t* __restrict__ w2q,
+    const uint8_t* __restrict__ w2s,
+    float* __restrict__ y,
+    int rows_per_expert,
+    int dim,
+    int inter_dim) {
+    using namespace nvcuda;
+    constexpr int TILE = 16;
+    constexpr int TN = 64;
+    constexpr int NF = TN / TILE;
+    const int expert = blockIdx.z;
+    const int row_base = blockIdx.y * TILE;
+    const int col_base = blockIdx.x * TN;
+    const int tid = threadIdx.x;
+    const int blocks_k = inter_dim / 32;
+    const int count = seg_starts[expert + 1] - seg_starts[expert];
+    extern __shared__ __align__(16) unsigned char smem[];
+    signed char* a_tile = reinterpret_cast<signed char*>(smem);
+    signed char* b_tile = a_tile + TILE * TILE;
+    int* c_tile = reinterpret_cast<int*>(b_tile + NF * TILE * TILE);
+    float* acc = reinterpret_cast<float*>(c_tile + TILE * TILE);
+
+    for (int i = tid; i < TILE * TN; i += blockDim.x) acc[i] = 0.0f;
+    __syncthreads();
+
+    for (int kb = 0; kb < blocks_k; ++kb) {
+        wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, signed char, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, signed char, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, TILE, TILE, TILE, int> c_frag[NF];
+        #pragma unroll
+        for (int f = 0; f < NF; ++f) wmma::fill_fragment(c_frag[f], 0);
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int k0 = kb * 32 + half * TILE;
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int r = i / TILE;
+                const int k = i - r * TILE;
+                const int row = row_base + r;
+                a_tile[i] = (row < count && row < rows_per_expert)
+                    ? hidden_q[(static_cast<int64_t>(expert) * rows_per_expert + row) * inter_dim + k0 + k]
+                    : 0;
+            }
+            for (int i = tid; i < NF * TILE * TILE; i += blockDim.x) {
+                const int f = i / (TILE * TILE);
+                const int j = i - f * TILE * TILE;
+                const int k = j & (TILE - 1);
+                const int n = j >> 4;
+                const int col = col_base + f * TILE + n;
+                signed char v = 0;
+                if (col < dim) {
+                    const int kk = k0 + k;
+                    const uint8_t* w2_row = w2q + (static_cast<int64_t>(expert) * dim + col) * (inter_dim / 2);
+                    const uint8_t b = w2_row[kk >> 1];
+                    v = fp4_decode_code_x2((kk & 1) ? (b >> 4) : (b & 0x0f));
+                }
+                b_tile[f * TILE * TILE + k + n * TILE] = v;
+            }
+            __syncthreads();
+            wmma::load_matrix_sync(a_frag, a_tile, TILE);
+            #pragma unroll
+            for (int f = 0; f < NF; ++f) {
+                wmma::load_matrix_sync(b_frag, b_tile + f * TILE * TILE, TILE);
+                wmma::mma_sync(c_frag[f], a_frag, b_frag, c_frag[f]);
+            }
+            __syncthreads();
+        }
+        #pragma unroll
+        for (int f = 0; f < NF; ++f) {
+            wmma::store_matrix_sync(c_tile, c_frag[f], TILE, wmma::mem_row_major);
+            __syncthreads();
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int n = i & (TILE - 1);
+                const int col = col_base + f * TILE + n;
+                if (col < dim) {
+                    const float s = fp4_block_scale(w2s[(static_cast<int64_t>(expert) * dim + col) * blocks_k + kb]);
+                    const int r = i >> 4;
+                    acc[r * TN + f * TILE + n] += static_cast<float>(c_tile[i]) * s;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int i = tid; i < TILE * TN; i += blockDim.x) {
+        const int r = i / TN;
+        const int n = i - r * TN;
+        const int row = row_base + r;
+        const int col = col_base + n;
+        if (row < count && row < rows_per_expert && col < dim) {
+            const int route = seg_starts[expert] + row;
+            const int64_t token = route_tokens[route];
+            atomicAdd(y + token * dim + col, acc[i] * hidden_scale[expert * rows_per_expert + row]);
+        }
+    }
+}
+
+torch::Tensor moe_prefill_fp4_grouped_gemm_forward_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& route_tokens,
+    const torch::Tensor& route_weights_sorted,
+    const torch::Tensor& seg_starts,
+    const torch::Tensor& w1q,
+    const torch::Tensor& w1s,
+    const torch::Tensor& w2q,
+    const torch::Tensor& w2s,
+    const torch::Tensor& w3q,
+    const torch::Tensor& w3s,
+    double swiglu_limit) {
+    c10::cuda::CUDAGuard device_guard(x.device());
+    const int routes = static_cast<int>(route_tokens.size(0));
+    const int dim = static_cast<int>(x.size(1));
+    const int n_experts = static_cast<int>(w1q.size(0));
+    const int inter_dim = static_cast<int>(w1q.size(1));
+    auto y = torch::zeros({x.size(0), x.size(1)}, x.options().dtype(torch::kFloat32));
+    if (routes == 0 || n_experts <= 0) {
+        return y;
+    }
+    auto seg_i32 = seg_starts.scalar_type() == torch::kInt32 ? seg_starts.contiguous() : seg_starts.to(torch::kInt32);
+    auto counts_i32 = seg_i32.slice(0, 1, n_experts + 1) - seg_i32.slice(0, 0, n_experts);
+    const int max_count = counts_i32.max().item<int>();
+    if (max_count <= 0) {
+        return y;
+    }
+
+    auto x_sorted = torch::empty({routes, dim}, x.options());
+    auto x_q = torch::empty({routes, 1, dim}, x.options().dtype(torch::kInt8));
+    auto x_scale = torch::empty({routes, 1}, x.options().dtype(torch::kFloat32));
+    auto x_pad = torch::empty({n_experts, max_count, dim}, x.options().dtype(torch::kInt8));
+    auto x_scale_pad = torch::empty({n_experts, max_count}, x.options().dtype(torch::kFloat32));
+    auto gate_f32 = torch::empty({n_experts, max_count, inter_dim}, x.options().dtype(torch::kFloat32));
+    auto up_f32 = torch::empty({n_experts, max_count, inter_dim}, x.options().dtype(torch::kFloat32));
+    auto hidden_pad = torch::empty({n_experts, max_count, inter_dim}, x.options().dtype(torch::kInt8));
+    auto hidden_scale_pad = torch::empty({n_experts, max_count}, x.options().dtype(torch::kFloat32));
+    const int threads = 256;
+    const int gather_blocks = static_cast<int>((static_cast<int64_t>(routes) * dim + threads - 1) / threads);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "moe_fp4_grouped_gather", [&] {
+        gather_routes_kernel<scalar_t><<<gather_blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            x.data_ptr<scalar_t>(),
+            route_tokens.data_ptr<int64_t>(),
+            x_sorted.data_ptr<scalar_t>(),
+            routes,
+            dim);
+    });
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "moe_fp4_grouped_quantize_x", [&] {
+        quantize_rows_kernel<scalar_t><<<routes, kQuantThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            x_sorted.data_ptr<scalar_t>(),
+            x_q.data_ptr<int8_t>(),
+            x_scale.data_ptr<float>(),
+            routes,
+            1,
+            dim);
+    });
+    const int pad_x_total = n_experts * max_count * dim;
+    moe_pad_q_rows_kernel<<<ceil_div(pad_x_total, threads), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x_q.data_ptr<int8_t>(),
+        x_scale.data_ptr<float>(),
+        seg_i32.data_ptr<int32_t>(),
+        x_pad.data_ptr<int8_t>(),
+        x_scale_pad.data_ptr<float>(),
+        n_experts,
+        max_count,
+        dim);
+
+    const dim3 fp4_block(128);
+    const dim3 w13_grid(ceil_div(inter_dim, 16), ceil_div(max_count, 16), n_experts);
+    const size_t x_shared_bytes = 4096;
+    moe_fp4_grouped_w13_wmma_kernel<<<w13_grid, fp4_block, x_shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        x_pad.data_ptr<int8_t>(),
+        x_scale_pad.data_ptr<float>(),
+        seg_i32.data_ptr<int32_t>(),
+        w1q.data_ptr<uint8_t>(),
+        w1s.data_ptr<uint8_t>(),
+        w3q.data_ptr<uint8_t>(),
+        w3s.data_ptr<uint8_t>(),
+        gate_f32.data_ptr<float>(),
+        up_f32.data_ptr<float>(),
+        max_count,
+        dim,
+        inter_dim);
+
+    moe_pair_swiglu_quantize_padded_fp32_kernel<<<dim3(n_experts, max_count), kQuantThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        gate_f32.data_ptr<float>(),
+        up_f32.data_ptr<float>(),
+        seg_i32.data_ptr<int32_t>(),
+        route_weights_sorted.data_ptr<float>(),
+        hidden_pad.data_ptr<int8_t>(),
+        hidden_scale_pad.data_ptr<float>(),
+        max_count,
+        inter_dim,
+        static_cast<float>(swiglu_limit));
+
+    const dim3 w2_grid(ceil_div(dim, 16), ceil_div(max_count, 16), n_experts);
+    const size_t h_shared_bytes = 4096;
+    moe_fp4_grouped_w2_wmma_scatter_kernel<<<w2_grid, fp4_block, h_shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        hidden_pad.data_ptr<int8_t>(),
+        hidden_scale_pad.data_ptr<float>(),
+        route_tokens.data_ptr<int64_t>(),
+        seg_i32.data_ptr<int32_t>(),
+        w2q.data_ptr<uint8_t>(),
+        w2s.data_ptr<uint8_t>(),
+        y.data_ptr<float>(),
+        max_count,
+        dim,
+        inter_dim);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
+
+// ============================================================================
 // v2 single-token MoE: compact buffers + route_to_slot indirection.
 // w*q / w*s are packed [k_active, ...] (one entry per *active* unique local
 // expert). route_to_slot[topk] maps each top-k route to a slot in those packed

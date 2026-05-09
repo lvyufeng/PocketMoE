@@ -114,6 +114,19 @@ torch::Tensor moe_single_token_int8_forward_cuda(
     int64_t experts_start_idx,
     double swiglu_limit);
 
+torch::Tensor moe_single_token_fp4_forward_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& indices,
+    const torch::Tensor& weights,
+    const torch::Tensor& w1q,
+    const torch::Tensor& w1s,
+    const torch::Tensor& w2q,
+    const torch::Tensor& w2s,
+    const torch::Tensor& w3q,
+    const torch::Tensor& w3s,
+    int64_t experts_start_idx,
+    double swiglu_limit);
+
 torch::Tensor moe_single_token_int8_forward_v2_cuda(
     const torch::Tensor& x,
     const torch::Tensor& route_to_slot,
@@ -149,6 +162,23 @@ torch::Tensor moe_prefill_int8_grouped_gemm_forward_cuda(
     const torch::Tensor& w3q,
     const torch::Tensor& w3s,
     double swiglu_limit);
+
+torch::Tensor moe_prefill_fp4_grouped_gemm_forward_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& route_tokens,
+    const torch::Tensor& route_weights_sorted,
+    const torch::Tensor& seg_starts,
+    const torch::Tensor& w1q,
+    const torch::Tensor& w1s,
+    const torch::Tensor& w2q,
+    const torch::Tensor& w2s,
+    const torch::Tensor& w3q,
+    const torch::Tensor& w3s,
+    double swiglu_limit);
+
+std::vector<torch::Tensor> fp4_weight_to_int8_forward_cuda(
+    const torch::Tensor& wq,
+    const torch::Tensor& ws);
 
 torch::Tensor moe_prefill_int8_grouped_gemm_bucketed_forward_cuda(
     const torch::Tensor& x,
@@ -655,6 +685,68 @@ torch::Tensor moe_single_token_int8_forward(
         swiglu_limit);
 }
 
+torch::Tensor moe_single_token_fp4_forward(
+    const torch::Tensor& x,
+    const torch::Tensor& indices,
+    const torch::Tensor& weights,
+    const torch::Tensor& w1q,
+    const torch::Tensor& w1s,
+    const torch::Tensor& w2q,
+    const torch::Tensor& w2s,
+    const torch::Tensor& w3q,
+    const torch::Tensor& w3s,
+    int64_t experts_start_idx,
+    double swiglu_limit) {
+    TORCH_CHECK(x.dim() == 2 && x.size(0) == 1, "x must have shape [1, D]");
+    TORCH_CHECK(indices.dim() == 1, "indices must have shape [K]");
+    TORCH_CHECK(weights.dim() == 1, "weights must have shape [K]");
+    TORCH_CHECK(indices.size(0) == weights.size(0), "indices/weights length mismatch");
+    TORCH_CHECK(w1q.dim() == 3 && w2q.dim() == 3 && w3q.dim() == 3, "fp4 weights must have shape [E, N, K/2]");
+    TORCH_CHECK(w1s.dim() == 3 && w2s.dim() == 3 && w3s.dim() == 3, "fp4 scales must have shape [E, N, K/32]");
+    TORCH_CHECK(w1q.size(0) == w2q.size(0) && w1q.size(0) == w3q.size(0), "expert count mismatch");
+    TORCH_CHECK(w1q.size(1) == w3q.size(1), "w1/w3 inter_dim mismatch");
+    const int64_t dim = x.size(1);
+    const int64_t inter_dim = w1q.size(1);
+    TORCH_CHECK(dim % 32 == 0, "dim must be divisible by 32 for fp4 path");
+    TORCH_CHECK(inter_dim % 32 == 0, "inter_dim must be divisible by 32 for fp4 path");
+    TORCH_CHECK(w1q.size(2) == dim / 2 && w3q.size(2) == dim / 2, "w1/w3 packed K must equal dim/2");
+    TORCH_CHECK(w1s.size(2) == dim / 32 && w3s.size(2) == dim / 32, "w1/w3 scale K must equal dim/32");
+    TORCH_CHECK(w2q.size(1) == dim, "w2 output dim must equal x.dim");
+    TORCH_CHECK(w2q.size(2) == inter_dim / 2, "w2 packed K must equal inter_dim/2");
+    TORCH_CHECK(w2s.size(2) == inter_dim / 32, "w2 scale K must equal inter_dim/32");
+    TORCH_CHECK(w1s.size(1) == w1q.size(1) && w3s.size(1) == w3q.size(1) && w2s.size(1) == w2q.size(1), "scale row count mismatch");
+    TORCH_CHECK(w1s.size(0) == w1q.size(0) && w3s.size(0) == w3q.size(0) && w2s.size(0) == w2q.size(0), "scale expert dim mismatch");
+    TORCH_CHECK(x.is_cuda() && indices.is_cuda() && weights.is_cuda(), "x/indices/weights must be CUDA tensors");
+    TORCH_CHECK(w1q.is_cuda() && w1s.is_cuda() && w2q.is_cuda() && w2s.is_cuda() && w3q.is_cuda() && w3s.is_cuda(), "weight tensors must be CUDA tensors");
+    TORCH_CHECK(x.is_contiguous() && indices.is_contiguous() && weights.is_contiguous(), "x/indices/weights must be contiguous");
+    TORCH_CHECK(w1q.is_contiguous() && w1s.is_contiguous() && w2q.is_contiguous() && w2s.is_contiguous() && w3q.is_contiguous() && w3s.is_contiguous(), "weight tensors must be contiguous");
+    TORCH_CHECK(
+        x.scalar_type() == torch::kFloat16 ||
+        x.scalar_type() == torch::kBFloat16 ||
+        x.scalar_type() == torch::kFloat32,
+        "x must be float16, bfloat16, or float32");
+    TORCH_CHECK(indices.scalar_type() == torch::kInt64, "indices must be int64");
+    TORCH_CHECK(weights.scalar_type() == torch::kFloat32, "weights must be float32");
+    check_tensor(w1q, "w1q", torch::kUInt8);
+    check_tensor(w2q, "w2q", torch::kUInt8);
+    check_tensor(w3q, "w3q", torch::kUInt8);
+    check_tensor(w1s, "w1s", torch::kUInt8);
+    check_tensor(w2s, "w2s", torch::kUInt8);
+    check_tensor(w3s, "w3s", torch::kUInt8);
+    return moe_single_token_fp4_forward_cuda(
+        x,
+        indices,
+        weights,
+        w1q,
+        w1s,
+        w2q,
+        w2s,
+        w3q,
+        w3s,
+        experts_start_idx,
+        swiglu_limit);
+}
+
 torch::Tensor moe_single_token_int8_forward_v2(
     const torch::Tensor& x,
     const torch::Tensor& route_to_slot,
@@ -820,6 +912,87 @@ torch::Tensor moe_prefill_int8_grouped_gemm_forward(
         w3s,
         swiglu_limit);
 }
+
+torch::Tensor moe_prefill_fp4_grouped_gemm_forward(
+    const torch::Tensor& x,
+    const torch::Tensor& route_tokens,
+    const torch::Tensor& route_weights_sorted,
+    const torch::Tensor& seg_starts,
+    const torch::Tensor& w1q,
+    const torch::Tensor& w1s,
+    const torch::Tensor& w2q,
+    const torch::Tensor& w2s,
+    const torch::Tensor& w3q,
+    const torch::Tensor& w3s,
+    double swiglu_limit) {
+    TORCH_CHECK(x.dim() == 2, "x must have shape [T, D]");
+    TORCH_CHECK(route_tokens.dim() == 1, "route_tokens must have shape [R]");
+    TORCH_CHECK(route_weights_sorted.dim() == 1, "route_weights_sorted must have shape [R]");
+    TORCH_CHECK(seg_starts.dim() == 1, "seg_starts must have shape [E + 1]");
+    TORCH_CHECK(w1q.dim() == 3 && w2q.dim() == 3 && w3q.dim() == 3, "fp4 weights must have shape [E, N, K/2]");
+    TORCH_CHECK(w1s.dim() == 3 && w2s.dim() == 3 && w3s.dim() == 3, "fp4 scales must have shape [E, N, K/32]");
+    TORCH_CHECK(route_tokens.size(0) == route_weights_sorted.size(0), "route count mismatch");
+    TORCH_CHECK(seg_starts.size(0) == w1q.size(0) + 1, "seg_starts/expert count mismatch");
+    TORCH_CHECK(w1q.size(0) == w2q.size(0) && w1q.size(0) == w3q.size(0), "expert count mismatch");
+    TORCH_CHECK(w1q.size(1) == w3q.size(1), "w1/w3 inter_dim mismatch");
+    const int64_t dim = x.size(1);
+    const int64_t inter_dim = w1q.size(1);
+    TORCH_CHECK(dim % 32 == 0, "dim must be divisible by 32 for fp4 path");
+    TORCH_CHECK(inter_dim % 32 == 0, "inter_dim must be divisible by 32 for fp4 path");
+    TORCH_CHECK(w1q.size(2) == dim / 2 && w3q.size(2) == dim / 2, "w1/w3 packed K must equal dim/2");
+    TORCH_CHECK(w1s.size(2) == dim / 32 && w3s.size(2) == dim / 32, "w1/w3 scale K must equal dim/32");
+    TORCH_CHECK(w2q.size(1) == dim, "w2 output dim must equal x.dim");
+    TORCH_CHECK(w2q.size(2) == inter_dim / 2, "w2 packed K must equal inter_dim/2");
+    TORCH_CHECK(w2s.size(2) == inter_dim / 32, "w2 scale K must equal inter_dim/32");
+    TORCH_CHECK(w1s.size(0) == w1q.size(0) && w3s.size(0) == w3q.size(0) && w2s.size(0) == w2q.size(0), "scale expert dim mismatch");
+    TORCH_CHECK(w1s.size(1) == w1q.size(1) && w3s.size(1) == w3q.size(1) && w2s.size(1) == w2q.size(1), "scale row count mismatch");
+    TORCH_CHECK(x.is_cuda() && route_tokens.is_cuda() && route_weights_sorted.is_cuda() && seg_starts.is_cuda(), "route tensors must be CUDA tensors");
+    TORCH_CHECK(w1q.is_cuda() && w1s.is_cuda() && w2q.is_cuda() && w2s.is_cuda() && w3q.is_cuda() && w3s.is_cuda(), "weight tensors must be CUDA tensors");
+    TORCH_CHECK(x.is_contiguous() && route_tokens.is_contiguous() && route_weights_sorted.is_contiguous() && seg_starts.is_contiguous(), "route tensors must be contiguous");
+    TORCH_CHECK(w1q.is_contiguous() && w1s.is_contiguous() && w2q.is_contiguous() && w2s.is_contiguous() && w3q.is_contiguous() && w3s.is_contiguous(), "weight tensors must be contiguous");
+    TORCH_CHECK(
+        x.scalar_type() == torch::kFloat16 ||
+        x.scalar_type() == torch::kBFloat16 ||
+        x.scalar_type() == torch::kFloat32,
+        "x must be float16, bfloat16, or float32");
+    TORCH_CHECK(route_tokens.scalar_type() == torch::kInt64, "route_tokens must be int64");
+    TORCH_CHECK(route_weights_sorted.scalar_type() == torch::kFloat32, "route_weights_sorted must be float32");
+    TORCH_CHECK(seg_starts.scalar_type() == torch::kInt32 || seg_starts.scalar_type() == torch::kInt64, "seg_starts must be int32 or int64");
+    check_tensor(w1q, "w1q", torch::kUInt8);
+    check_tensor(w2q, "w2q", torch::kUInt8);
+    check_tensor(w3q, "w3q", torch::kUInt8);
+    check_tensor(w1s, "w1s", torch::kUInt8);
+    check_tensor(w2s, "w2s", torch::kUInt8);
+    check_tensor(w3s, "w3s", torch::kUInt8);
+    return moe_prefill_fp4_grouped_gemm_forward_cuda(
+        x,
+        route_tokens,
+        route_weights_sorted,
+        seg_starts,
+        w1q,
+        w1s,
+        w2q,
+        w2s,
+        w3q,
+        w3s,
+        swiglu_limit);
+}
+
+std::vector<torch::Tensor> fp4_weight_to_int8_forward(
+    const torch::Tensor& wq,
+    const torch::Tensor& ws) {
+    TORCH_CHECK(wq.dim() == 3, "wq must have shape [E, N, K/2]");
+    TORCH_CHECK(ws.dim() == 3, "ws must have shape [E, N, K/32]");
+    TORCH_CHECK(wq.is_cuda() && ws.is_cuda(), "FP4 conversion tensors must be CUDA tensors");
+    TORCH_CHECK(wq.is_contiguous() && ws.is_contiguous(), "FP4 conversion tensors must be contiguous");
+    check_tensor(wq, "wq", torch::kUInt8);
+    check_tensor(ws, "ws", torch::kUInt8);
+    TORCH_CHECK(wq.size(0) == ws.size(0) && wq.size(1) == ws.size(1), "FP4 conversion expert/row shape mismatch");
+    TORCH_CHECK(wq.size(2) % 16 == 0, "packed FP4 K/2 must be divisible by 16");
+    TORCH_CHECK(ws.size(2) == wq.size(2) / 16, "FP4 scale K/32 shape mismatch");
+    return fp4_weight_to_int8_forward_cuda(wq, ws);
+}
+
 torch::Tensor moe_prefill_int8_grouped_gemm_bucketed_forward(
     const torch::Tensor& x,
     const torch::Tensor& route_tokens,
@@ -1042,8 +1215,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_group_routes", &moe_group_routes, "group MoE routes by local expert (CUDA)");
     m.def("moe_single_token_int8_forward", &moe_single_token_int8_forward, "single-token top-k MoE int8 forward (CUDA)");
     m.def("moe_single_token_int8_forward_v2", &moe_single_token_int8_forward_v2, "single-token top-k MoE int8 forward with compact buffer + slot map (CUDA)");
+    m.def("moe_single_token_fp4_forward", &moe_single_token_fp4_forward, "single-token top-k MoE FP4 (e2m1fn_x2 + e8m0 block) forward (CUDA)");
     m.def("moe_prefill_int8_grouped_forward", &moe_prefill_int8_grouped_forward, "prefill MoE grouped int8 forward (CUDA)");
     m.def("moe_prefill_int8_grouped_gemm_forward", &moe_prefill_int8_grouped_gemm_forward, "prefill MoE grouped-GEMM int8 forward (CUDA)");
+    m.def("moe_prefill_fp4_grouped_gemm_forward", &moe_prefill_fp4_grouped_gemm_forward, "prefill MoE grouped-GEMM FP4 forward (CUDA)");
+    m.def("fp4_weight_to_int8_forward", &fp4_weight_to_int8_forward, "convert FP4 block-scaled weights to int8 row-scaled weights (CUDA)");
     m.def("moe_prefill_int8_grouped_gemm_bucketed_forward", &moe_prefill_int8_grouped_gemm_bucketed_forward, "prefill MoE bucketed grouped-GEMM int8 forward (CUDA)");
     m.def("fused_q_rmsnorm_rope_inplace", &fused_q_rmsnorm_rope_inplace, "fused per-head rmsnorm + rope on q (CUDA, bf16, in-place)");
     m.def("fused_kv_rope_actquant_inplace", &fused_kv_rope_actquant_inplace,

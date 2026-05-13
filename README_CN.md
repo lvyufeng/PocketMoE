@@ -93,6 +93,11 @@ CKPT_PATH=$PWD/checkpoints/DeepSeek-V4-Flash-w8a8 bash scripts/run_openai_server
 | `MASTER_PORT` | 脚本各自默认 | torch distributed rendezvous 端口。 |
 | `NPROC_PER_NODE` | `4` | 本机 rank / GPU 数量。 |
 | `DSV4_TMP_DIR` | `.tmp` | benchmark 临时文件和生成 prompt 目录。 |
+| `CKPT_FORMAT` | `auto` | 传给 server 的 checkpoint 格式：`auto`、`safetensors` 或 `gguf`。 |
+| `TOKENIZER_PATH` | 未设置 | GGUF checkpoint 必填；其它格式可作为 tokenizer 覆盖项。 |
+| `PARTITION_POLICY` | `legacy` | runtime 放置策略：`legacy`、`baseline_4gpu` 或 `layer_pp_4gpu`。 |
+| `SERVING_PROFILE` | `safe1` | serving admission profile：`safe1`、`latency2` 或 `throughput4`。 |
+| `DEEPSEEK_GPU_MOE_CROSS_LAYER_PREFETCH` | `0` | decode MoE 跨层预取；当前 long-prompt 最优路径默认关闭。 |
 
 ## 如何运行
 

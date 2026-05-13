@@ -92,6 +92,11 @@ Useful runtime environment variables:
 | `MASTER_PORT` | script-specific | Torch distributed rendezvous port. |
 | `NPROC_PER_NODE` | `4` | Number of local ranks / GPUs. |
 | `DSV4_TMP_DIR` | `.tmp` | Temporary benchmark and generated prompt directory. |
+| `CKPT_FORMAT` | `auto` | Checkpoint format passed to the server: `auto`, `safetensors`, or `gguf`. |
+| `TOKENIZER_PATH` | unset | Required for GGUF checkpoints; optional tokenizer override for other formats. |
+| `PARTITION_POLICY` | `legacy` | Runtime placement policy: `legacy`, `baseline_4gpu`, or `layer_pp_4gpu`. |
+| `SERVING_PROFILE` | `safe1` | Serving admission profile: `safe1`, `latency2`, or `throughput4`. |
+| `DEEPSEEK_GPU_MOE_CROSS_LAYER_PREFETCH` | `0` | Cross-layer decode MoE prefetch; default is off for the current long-prompt best path. |
 
 ## How to run
 

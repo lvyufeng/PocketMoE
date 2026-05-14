@@ -5466,6 +5466,199 @@ constexpr int kQ8_0TileN = 8;
 constexpr int kGGUFQuantTileN = 8;
 constexpr int kGGUFQuantPrefillRows = 4;
 
+__device__ __forceinline__ int pack_i8x4(int a, int b, int c, int d) {
+    return (a & 0xff) | ((b & 0xff) << 8) | ((c & 0xff) << 16) | ((d & 0xff) << 24);
+}
+
+template <typename scalar_t>
+__global__ void gguf_q8_1_quantize_16_kernel(
+    const scalar_t* __restrict__ x,
+    int8_t* __restrict__ x_q,
+    float* __restrict__ x_scale,
+    int rows,
+    int row_elems) {
+    const int row = blockIdx.x;
+    const int group = blockIdx.y;
+    const int lane = threadIdx.x;
+    if (row >= rows || group * 16 >= row_elems || lane >= 16) return;
+    const int k = group * 16 + lane;
+    const float xv = k < row_elems ? static_cast<float>(x[static_cast<int64_t>(row) * row_elems + k]) : 0.0f;
+    float maxv = fabsf(xv);
+    #pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        maxv = fmaxf(maxv, __shfl_down_sync(0xffff, maxv, offset));
+    }
+    const float scale = __shfl_sync(0xffff, maxv > 0.0f ? maxv / 127.0f : 1.0e-8f, 0);
+    if (lane == 0) {
+        x_scale[row * ((row_elems + 15) / 16) + group] = scale;
+    }
+    int q = __float2int_rn(xv / scale);
+    q = max(-127, min(127, q));
+    x_q[static_cast<int64_t>(row) * row_elems + k] = static_cast<int8_t>(q);
+}
+
+__global__ void gguf_q2k_gemm_dp4a_prequant_kernel(
+    const int8_t* __restrict__ x_q,
+    const float* __restrict__ x_scale,
+    const uint8_t* __restrict__ blocks,
+    c10::BFloat16* __restrict__ out,
+    int rows,
+    int n,
+    int row_elems,
+    int blocks_per_row,
+    int x_groups) {
+    const int row = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int out_col = blockIdx.x * kGGUFQuantTileN + warp;
+    if (row >= rows || warp >= kGGUFQuantTileN || out_col >= n) return;
+
+    const uint8_t* weight_row = blocks + static_cast<int64_t>(out_col) * blocks_per_row * 84;
+    const int8_t* x_row = x_q + static_cast<int64_t>(row) * row_elems;
+    const float* xs_row = x_scale + static_cast<int64_t>(row) * x_groups;
+    float acc = 0.0f;
+
+    for (int block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const uint8_t* block = weight_row + static_cast<int64_t>(block_idx) * 84;
+        const uint8_t* scales = block;
+        const uint8_t* qs = block + 16;
+        const float d = gguf_block_scale_f16(block + 80);
+        const float dmin = gguf_block_scale_f16(block + 82);
+        const int k_base = block_idx * 256;
+        for (int group = 0; group < 16; ++group) {
+            float local = 0.0f;
+            if (lane < 4) {
+                const int half_block = group >> 3;
+                const int group_in_half = group & 7;
+                const int shift = (group_in_half >> 1) * 2;
+                const int byte_start = half_block * 32 + (group_in_half & 1) * 16;
+                const int idx = lane * 4;
+                const int q0 = static_cast<int>((qs[byte_start + idx + 0] >> shift) & 0x03);
+                const int q1 = static_cast<int>((qs[byte_start + idx + 1] >> shift) & 0x03);
+                const int q2 = static_cast<int>((qs[byte_start + idx + 2] >> shift) & 0x03);
+                const int q3 = static_cast<int>((qs[byte_start + idx + 3] >> shift) & 0x03);
+                const int w_pack = pack_i8x4(q0, q1, q2, q3);
+                const int x_idx = k_base + group * 16 + idx;
+                const int x_pack = pack_i8x4(
+                    static_cast<int>(x_row[x_idx + 0]),
+                    static_cast<int>(x_row[x_idx + 1]),
+                    static_cast<int>(x_row[x_idx + 2]),
+                    static_cast<int>(x_row[x_idx + 3]));
+                const int dot_q = __dp4a(w_pack, x_pack, 0);
+                const int sum_x = __dp4a(0x01010101, x_pack, 0);
+                const float qscale = d * static_cast<float>(scales[group] & 0x0f);
+                const float base = dmin * static_cast<float>(scales[group] >> 4);
+                local = xs_row[block_idx * 16 + group] * (qscale * static_cast<float>(dot_q) - base * static_cast<float>(sum_x));
+            }
+            #pragma unroll
+            for (int offset = 2; offset > 0; offset >>= 1) {
+                local += __shfl_down_sync(0x0f, local, offset);
+            }
+            if (lane == 0) acc += local;
+        }
+    }
+    if (lane == 0) {
+        out[static_cast<int64_t>(row) * n + out_col] = c10::BFloat16(acc);
+    }
+}
+
+template <typename scalar_t>
+__global__ void gguf_q2k_gemm_dp4a_kernel(
+    const scalar_t* __restrict__ x,
+    const uint8_t* __restrict__ blocks,
+    c10::BFloat16* __restrict__ out,
+    int rows,
+    int n,
+    int row_elems,
+    int blocks_per_row) {
+    const int row = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int out_col = blockIdx.x * kGGUFQuantTileN + warp;
+    if (row >= rows || warp >= kGGUFQuantTileN) return;
+
+    __shared__ int8_t x_q8[256];
+    __shared__ float x_scale[16];
+    const scalar_t* x_row = x + static_cast<int64_t>(row) * row_elems;
+    const uint8_t* weight_row = blocks + static_cast<int64_t>(out_col) * blocks_per_row * 84;
+    float acc = 0.0f;
+
+    for (int block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const int k_base = block_idx * 256;
+        if (warp == 0) {
+            for (int group = 0; group < 16; ++group) {
+                const int k = group * 16 + lane;
+                float xv = 0.0f;
+                if (lane < 16 && k_base + k < row_elems) {
+                    xv = static_cast<float>(x_row[k_base + k]);
+                }
+                float maxv = fabsf(xv);
+                #pragma unroll
+                for (int offset = 8; offset > 0; offset >>= 1) {
+                    maxv = fmaxf(maxv, __shfl_down_sync(0xffff, maxv, offset));
+                }
+                float scale = 0.0f;
+                float inv_scale = 0.0f;
+                if (lane == 0) {
+                    scale = maxv > 0.0f ? maxv / 127.0f : 0.0f;
+                    x_scale[group] = scale;
+                }
+                scale = __shfl_sync(0xffff, scale, 0);
+                inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+                if (lane < 16) {
+                    int q = __float2int_rn(xv * inv_scale);
+                    q = max(-127, min(127, q));
+                    x_q8[k] = static_cast<int8_t>(q);
+                }
+            }
+        }
+        __syncthreads();
+
+        if (out_col < n) {
+            const uint8_t* block = weight_row + static_cast<int64_t>(block_idx) * 84;
+            const uint8_t* scales = block;
+            const uint8_t* qs = block + 16;
+            const float d = gguf_block_scale_f16(block + 80);
+            const float dmin = gguf_block_scale_f16(block + 82);
+            for (int group = 0; group < 16; ++group) {
+                float local = 0.0f;
+                if (lane < 4) {
+                    const int half_block = group >> 3;
+                    const int group_in_half = group & 7;
+                    const int shift = (group_in_half >> 1) * 2;
+                    const int byte_start = half_block * 32 + (group_in_half & 1) * 16;
+                    const int idx = lane * 4;
+                    const int q0 = static_cast<int>((qs[byte_start + idx + 0] >> shift) & 0x03);
+                    const int q1 = static_cast<int>((qs[byte_start + idx + 1] >> shift) & 0x03);
+                    const int q2 = static_cast<int>((qs[byte_start + idx + 2] >> shift) & 0x03);
+                    const int q3 = static_cast<int>((qs[byte_start + idx + 3] >> shift) & 0x03);
+                    const int w_pack = pack_i8x4(q0, q1, q2, q3);
+                    const int x_pack = pack_i8x4(
+                        static_cast<int>(x_q8[group * 16 + idx + 0]),
+                        static_cast<int>(x_q8[group * 16 + idx + 1]),
+                        static_cast<int>(x_q8[group * 16 + idx + 2]),
+                        static_cast<int>(x_q8[group * 16 + idx + 3]));
+                    const int dot_q = __dp4a(w_pack, x_pack, 0);
+                    const int sum_x = __dp4a(0x01010101, x_pack, 0);
+                    const float qscale = d * static_cast<float>(scales[group] & 0x0f);
+                    const float base = dmin * static_cast<float>(scales[group] >> 4);
+                    local = x_scale[group] * (qscale * static_cast<float>(dot_q) - base * static_cast<float>(sum_x));
+                }
+                #pragma unroll
+                for (int offset = 2; offset > 0; offset >>= 1) {
+                    local += __shfl_down_sync(0x0f, local, offset);
+                }
+                if (lane == 0) acc += local;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0 && out_col < n) {
+        out[static_cast<int64_t>(row) * n + out_col] = c10::BFloat16(acc);
+    }
+}
+
 __device__ __forceinline__ float gguf_quant_block_dot_256(
     const float* __restrict__ x_shared,
     const uint8_t* __restrict__ block,
@@ -5876,6 +6069,153 @@ __global__ void gguf_moe_w13_kernel(
     }
 }
 
+template <typename scalar_t>
+__global__ void gguf_q8_1_quantize_x_32_kernel(
+    const scalar_t* __restrict__ x,
+    int8_t* __restrict__ x_q,
+    float* __restrict__ x_scale,
+    int rows,
+    int row_elems) {
+    const int row = blockIdx.x;
+    const int group = blockIdx.y;
+    const int lane = threadIdx.x;
+    if (row >= rows || group * 32 >= row_elems || lane >= 32) return;
+    const int k = group * 32 + lane;
+    const float xv = k < row_elems ? static_cast<float>(x[static_cast<int64_t>(row) * row_elems + k]) : 0.0f;
+    float maxv = fabsf(xv);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        maxv = fmaxf(maxv, __shfl_down_sync(0xffffffff, maxv, offset));
+    }
+    const float scale = __shfl_sync(0xffffffff, maxv > 0.0f ? maxv / 127.0f : 1.0e-8f, 0);
+    if (lane == 0) {
+        x_scale[row * ((row_elems + 31) / 32) + group] = scale;
+    }
+    int q = __float2int_rn(xv / scale);
+    q = max(-127, min(127, q));
+    if (k < row_elems) {
+        x_q[static_cast<int64_t>(row) * row_elems + k] = static_cast<int8_t>(q);
+    }
+}
+
+__global__ void gguf_moe_w13_iq2_xxs_dp4a_kernel(
+    const int8_t* __restrict__ x_q,
+    const float* __restrict__ x_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ route_experts,
+    const uint8_t* __restrict__ w1_blocks,
+    const uint8_t* __restrict__ w3_blocks,
+    const int8_t* __restrict__ signed_grid,
+    float* __restrict__ gate,
+    float* __restrict__ up,
+    int routes,
+    int dim,
+    int inter_dim,
+    int blocks_per_row,
+    int x_groups) {
+    const int route = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int out_col = blockIdx.x * kGGUFQuantTileN + warp;
+    if (route >= routes || warp >= kGGUFQuantTileN) return;
+
+    const int64_t token = route_tokens[route];
+    const int expert = route_experts[route];
+    const int8_t* x_q_row = x_q + token * dim;
+    const float* x_scale_row = x_scale + token * x_groups;
+    const uint8_t* w1_row = w1_blocks + (static_cast<int64_t>(expert) * inter_dim + out_col) * blocks_per_row * 66;
+    const uint8_t* w3_row = w3_blocks + (static_cast<int64_t>(expert) * inter_dim + out_col) * blocks_per_row * 66;
+
+    __shared__ int x_shared_q[64];
+    __shared__ float x_shared_scale[8];
+
+    float acc1 = 0.0f;
+    float acc3 = 0.0f;
+
+    for (int block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const int k_base = block_idx * 256;
+        const int tid = threadIdx.x;
+        if (tid < 64) {
+            const int byte_off = tid * 4;
+            int v = 0;
+            if (k_base + byte_off + 4 <= dim) {
+                v = *reinterpret_cast<const int*>(x_q_row + k_base + byte_off);
+            }
+            x_shared_q[tid] = v;
+        }
+        if (tid < 8) {
+            const int sg_idx = block_idx * 8 + tid;
+            x_shared_scale[tid] = sg_idx < x_groups ? x_scale_row[sg_idx] : 0.0f;
+        }
+        __syncthreads();
+
+        if (out_col < inter_dim) {
+            const int sub = lane >> 2;
+            const int part = lane & 3;
+            const uint8_t* w1_block = w1_row + static_cast<int64_t>(block_idx) * 66;
+            const uint8_t* w3_block = w3_row + static_cast<int64_t>(block_idx) * 66;
+            const uint8_t* chunk1 = w1_block + 2 + sub * 8;
+            const uint8_t* chunk3 = w3_block + 2 + sub * 8;
+
+            const float d1 = gguf_block_scale_f16(w1_block);
+            const float d3 = gguf_block_scale_f16(w3_block);
+
+            const uint32_t aux1 = static_cast<uint32_t>(chunk1[4]) |
+                (static_cast<uint32_t>(chunk1[5]) << 8) |
+                (static_cast<uint32_t>(chunk1[6]) << 16) |
+                (static_cast<uint32_t>(chunk1[7]) << 24);
+            const uint32_t aux3 = static_cast<uint32_t>(chunk3[4]) |
+                (static_cast<uint32_t>(chunk3[5]) << 8) |
+                (static_cast<uint32_t>(chunk3[6]) << 16) |
+                (static_cast<uint32_t>(chunk3[7]) << 24);
+
+            const int grid_id1 = chunk1[part];
+            const int grid_id3 = chunk3[part];
+            const int sign_idx1 = static_cast<int>((aux1 >> (7 * part)) & 127);
+            const int sign_idx3 = static_cast<int>((aux3 >> (7 * part)) & 127);
+
+            const float s1 = 0.125f * d1 * static_cast<float>(2 * (aux1 >> 28) + 1);
+            const float s3 = 0.125f * d3 * static_cast<float>(2 * (aux3 >> 28) + 1);
+
+            const int8_t* vals1 = signed_grid + (grid_id1 * 128 + sign_idx1) * 8;
+            const int8_t* vals3 = signed_grid + (grid_id3 * 128 + sign_idx3) * 8;
+            const int v1_p0 = *reinterpret_cast<const int*>(vals1);
+            const int v1_p1 = *reinterpret_cast<const int*>(vals1 + 4);
+            const int v3_p0 = *reinterpret_cast<const int*>(vals3);
+            const int v3_p1 = *reinterpret_cast<const int*>(vals3 + 4);
+
+            const int xq_base = sub * 8 + part * 2;
+            const int x_p0 = x_shared_q[xq_base];
+            const int x_p1 = x_shared_q[xq_base + 1];
+
+            int sumi1 = __dp4a(v1_p0, x_p0, 0);
+            sumi1 = __dp4a(v1_p1, x_p1, sumi1);
+            int sumi3 = __dp4a(v3_p0, x_p0, 0);
+            sumi3 = __dp4a(v3_p1, x_p1, sumi3);
+
+            const float xs = x_shared_scale[sub];
+            float local1 = s1 * xs * static_cast<float>(sumi1);
+            float local3 = s3 * xs * static_cast<float>(sumi3);
+
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                local1 += __shfl_down_sync(0xffffffff, local1, offset);
+                local3 += __shfl_down_sync(0xffffffff, local3, offset);
+            }
+            if (lane == 0) {
+                acc1 += local1;
+                acc3 += local3;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0 && out_col < inter_dim) {
+        gate[static_cast<int64_t>(route) * inter_dim + out_col] = acc1;
+        up[static_cast<int64_t>(route) * inter_dim + out_col] = acc3;
+    }
+}
+
 __global__ void gguf_moe_w2_scatter_kernel(
     const float* __restrict__ hidden,
     const int64_t* __restrict__ route_tokens,
@@ -5915,6 +6255,324 @@ __global__ void gguf_moe_w2_scatter_kernel(
     }
     if (lane == 0 && out_col < dim) {
         atomicAdd(y + token * dim + out_col, acc);
+    }
+}
+
+__global__ void gguf_route_swiglu_quantize_hidden_16_kernel(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    const float* __restrict__ route_weights,
+    int8_t* __restrict__ hidden_q,
+    float* __restrict__ hidden_scale,
+    int routes,
+    int inter_dim,
+    float swiglu_limit) {
+    const int route = blockIdx.x;
+    const int group = blockIdx.y;
+    const int lane = threadIdx.x;
+    if (route >= routes || group * 16 >= inter_dim || lane >= 16) return;
+    const int k = group * 16 + lane;
+    float g = k < inter_dim ? gate[static_cast<int64_t>(route) * inter_dim + k] : 0.0f;
+    float u = k < inter_dim ? up[static_cast<int64_t>(route) * inter_dim + k] : 0.0f;
+    if (swiglu_limit > 0.0f) {
+        u = fminf(fmaxf(u, -swiglu_limit), swiglu_limit);
+        g = fminf(g, swiglu_limit);
+    }
+    const float v = (g / (1.0f + expf(-g))) * u * route_weights[route];
+    float maxv = fabsf(v);
+    #pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        maxv = fmaxf(maxv, __shfl_down_sync(0xffff, maxv, offset));
+    }
+    const float scale = __shfl_sync(0xffff, maxv > 0.0f ? maxv / 127.0f : 1.0e-8f, 0);
+    if (lane == 0) {
+        hidden_scale[route * ((inter_dim + 15) / 16) + group] = scale;
+    }
+    int q = __float2int_rn(v / scale);
+    q = max(-127, min(127, q));
+    if (k < inter_dim) {
+        hidden_q[static_cast<int64_t>(route) * inter_dim + k] = static_cast<int8_t>(q);
+    }
+}
+__global__ void gguf_q8_1_quantize_hidden_16_kernel(
+    const float* __restrict__ hidden,
+    int8_t* __restrict__ hidden_q,
+    float* __restrict__ hidden_scale,
+    int routes,
+    int inter_dim) {
+    const int route = blockIdx.x;
+    const int group = blockIdx.y;
+    const int lane = threadIdx.x;
+    if (route >= routes || group * 16 >= inter_dim || lane >= 16) return;
+    const int k = group * 16 + lane;
+    const float xv = k < inter_dim ? hidden[static_cast<int64_t>(route) * inter_dim + k] : 0.0f;
+    float maxv = fabsf(xv);
+    #pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        maxv = fmaxf(maxv, __shfl_down_sync(0xffff, maxv, offset));
+    }
+    const float scale = __shfl_sync(0xffff, maxv > 0.0f ? maxv / 127.0f : 1.0e-8f, 0);
+    if (lane == 0) {
+        hidden_scale[route * ((inter_dim + 15) / 16) + group] = scale;
+    }
+    int q = __float2int_rn(xv / scale);
+    q = max(-127, min(127, q));
+    hidden_q[static_cast<int64_t>(route) * inter_dim + k] = static_cast<int8_t>(q);
+}
+
+__global__ void gguf_moe_w2_scatter_q2k_dp4a_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ route_experts,
+    const uint8_t* __restrict__ w2_blocks,
+    float* __restrict__ y,
+    int routes,
+    int dim,
+    int inter_dim,
+    int w2_blocks_per_row,
+    int hidden_groups) {
+    const int route = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int out_col = blockIdx.x * kGGUFQuantTileN + warp;
+    if (route >= routes || warp >= kGGUFQuantTileN || out_col >= dim) return;
+
+    const int64_t token = route_tokens[route];
+    const int expert = route_experts[route];
+    const int8_t* hidden_row = hidden_q + static_cast<int64_t>(route) * inter_dim;
+    const float* hs_row = hidden_scale + static_cast<int64_t>(route) * hidden_groups;
+    const uint8_t* w2_row = w2_blocks + (static_cast<int64_t>(expert) * dim + out_col) * w2_blocks_per_row * 84;
+    float acc = 0.0f;
+
+    for (int block_idx = 0; block_idx < w2_blocks_per_row; ++block_idx) {
+        const uint8_t* block = w2_row + static_cast<int64_t>(block_idx) * 84;
+        const uint8_t* scales = block;
+        const uint8_t* qs = block + 16;
+        const float d = gguf_block_scale_f16(block + 80);
+        const float dmin = gguf_block_scale_f16(block + 82);
+        const int k_base = block_idx * 256;
+        for (int group = 0; group < 16; ++group) {
+            float local = 0.0f;
+            if (lane < 4) {
+                const int half_block = group >> 3;
+                const int group_in_half = group & 7;
+                const int shift = (group_in_half >> 1) * 2;
+                const int byte_start = half_block * 32 + (group_in_half & 1) * 16;
+                const int idx = lane * 4;
+                const int q0 = static_cast<int>((qs[byte_start + idx + 0] >> shift) & 0x03);
+                const int q1 = static_cast<int>((qs[byte_start + idx + 1] >> shift) & 0x03);
+                const int q2 = static_cast<int>((qs[byte_start + idx + 2] >> shift) & 0x03);
+                const int q3 = static_cast<int>((qs[byte_start + idx + 3] >> shift) & 0x03);
+                const int w_pack = pack_i8x4(q0, q1, q2, q3);
+                const int h_idx = k_base + group * 16 + idx;
+                const int h_pack = pack_i8x4(
+                    static_cast<int>(hidden_row[h_idx + 0]),
+                    static_cast<int>(hidden_row[h_idx + 1]),
+                    static_cast<int>(hidden_row[h_idx + 2]),
+                    static_cast<int>(hidden_row[h_idx + 3]));
+                const int dot_q = __dp4a(w_pack, h_pack, 0);
+                const int sum_h = __dp4a(0x01010101, h_pack, 0);
+                const float qscale = d * static_cast<float>(scales[group] & 0x0f);
+                const float base = dmin * static_cast<float>(scales[group] >> 4);
+                local = hs_row[block_idx * 16 + group] * (qscale * static_cast<float>(dot_q) - base * static_cast<float>(sum_h));
+            }
+            #pragma unroll
+            for (int offset = 2; offset > 0; offset >>= 1) {
+                local += __shfl_down_sync(0x0f, local, offset);
+            }
+            if (lane == 0) acc += local;
+        }
+    }
+
+    if (lane == 0) {
+        atomicAdd(y + token * dim + out_col, acc);
+    }
+}
+
+__global__ void gguf_moe_single_w13_iq2_xxs_dp4a_kernel(
+    const int8_t* __restrict__ x_q,
+    const float* __restrict__ x_scale,
+    const int64_t* __restrict__ route_slots,
+    const uint8_t* __restrict__ w1_blocks,
+    const uint8_t* __restrict__ w3_blocks,
+    const int8_t* __restrict__ signed_grid,
+    float* __restrict__ gate,
+    float* __restrict__ up,
+    int routes,
+    int n_experts,
+    int dim,
+    int inter_dim,
+    int blocks_per_row,
+    int x_groups) {
+    const int route = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int out_col = blockIdx.x * kGGUFQuantTileN + warp;
+    if (route >= routes || warp >= kGGUFQuantTileN) return;
+    const int expert = static_cast<int>(route_slots[route]);
+    if (expert < 0 || expert >= n_experts) return;
+
+    const uint8_t* w1_row = w1_blocks + (static_cast<int64_t>(expert) * inter_dim + out_col) * blocks_per_row * 66;
+    const uint8_t* w3_row = w3_blocks + (static_cast<int64_t>(expert) * inter_dim + out_col) * blocks_per_row * 66;
+
+    __shared__ int x_shared_q[64];
+    __shared__ float x_shared_scale[8];
+
+    float acc1 = 0.0f;
+    float acc3 = 0.0f;
+
+    for (int block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const int k_base = block_idx * 256;
+        const int tid = threadIdx.x;
+        if (tid < 64) {
+            const int byte_off = tid * 4;
+            int v = 0;
+            if (k_base + byte_off + 4 <= dim) {
+                v = *reinterpret_cast<const int*>(x_q + k_base + byte_off);
+            }
+            x_shared_q[tid] = v;
+        }
+        if (tid < 8) {
+            const int sg_idx = block_idx * 8 + tid;
+            x_shared_scale[tid] = sg_idx < x_groups ? x_scale[sg_idx] : 0.0f;
+        }
+        __syncthreads();
+
+        if (out_col < inter_dim) {
+            const int sub = lane >> 2;
+            const int part = lane & 3;
+            const uint8_t* w1_block = w1_row + static_cast<int64_t>(block_idx) * 66;
+            const uint8_t* w3_block = w3_row + static_cast<int64_t>(block_idx) * 66;
+            const uint8_t* chunk1 = w1_block + 2 + sub * 8;
+            const uint8_t* chunk3 = w3_block + 2 + sub * 8;
+
+            const float d1 = gguf_block_scale_f16(w1_block);
+            const float d3 = gguf_block_scale_f16(w3_block);
+
+            const uint32_t aux1 = static_cast<uint32_t>(chunk1[4]) |
+                (static_cast<uint32_t>(chunk1[5]) << 8) |
+                (static_cast<uint32_t>(chunk1[6]) << 16) |
+                (static_cast<uint32_t>(chunk1[7]) << 24);
+            const uint32_t aux3 = static_cast<uint32_t>(chunk3[4]) |
+                (static_cast<uint32_t>(chunk3[5]) << 8) |
+                (static_cast<uint32_t>(chunk3[6]) << 16) |
+                (static_cast<uint32_t>(chunk3[7]) << 24);
+
+            const int grid_id1 = chunk1[part];
+            const int grid_id3 = chunk3[part];
+            const int sign_idx1 = static_cast<int>((aux1 >> (7 * part)) & 127);
+            const int sign_idx3 = static_cast<int>((aux3 >> (7 * part)) & 127);
+
+            const float s1 = 0.125f * d1 * static_cast<float>(2 * (aux1 >> 28) + 1);
+            const float s3 = 0.125f * d3 * static_cast<float>(2 * (aux3 >> 28) + 1);
+
+            const int8_t* vals1 = signed_grid + (grid_id1 * 128 + sign_idx1) * 8;
+            const int8_t* vals3 = signed_grid + (grid_id3 * 128 + sign_idx3) * 8;
+            const int v1_p0 = *reinterpret_cast<const int*>(vals1);
+            const int v1_p1 = *reinterpret_cast<const int*>(vals1 + 4);
+            const int v3_p0 = *reinterpret_cast<const int*>(vals3);
+            const int v3_p1 = *reinterpret_cast<const int*>(vals3 + 4);
+
+            const int xq_base = sub * 8 + part * 2;
+            const int x_p0 = x_shared_q[xq_base];
+            const int x_p1 = x_shared_q[xq_base + 1];
+
+            int sumi1 = __dp4a(v1_p0, x_p0, 0);
+            sumi1 = __dp4a(v1_p1, x_p1, sumi1);
+            int sumi3 = __dp4a(v3_p0, x_p0, 0);
+            sumi3 = __dp4a(v3_p1, x_p1, sumi3);
+
+            const float xs = x_shared_scale[sub];
+            float local1 = s1 * xs * static_cast<float>(sumi1);
+            float local3 = s3 * xs * static_cast<float>(sumi3);
+
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                local1 += __shfl_down_sync(0xffffffff, local1, offset);
+                local3 += __shfl_down_sync(0xffffffff, local3, offset);
+            }
+            if (lane == 0) {
+                acc1 += local1;
+                acc3 += local3;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0 && out_col < inter_dim) {
+        gate[static_cast<int64_t>(route) * inter_dim + out_col] = acc1;
+        up[static_cast<int64_t>(route) * inter_dim + out_col] = acc3;
+    }
+}
+
+__global__ void gguf_moe_single_w2_q2k_dp4a_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int64_t* __restrict__ route_slots,
+    const uint8_t* __restrict__ w2_blocks,
+    float* __restrict__ y,
+    int routes,
+    int n_experts,
+    int dim,
+    int inter_dim,
+    int w2_blocks_per_row,
+    int hidden_groups) {
+    const int route = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int out_col = blockIdx.x * kGGUFQuantTileN + warp;
+    if (route >= routes || warp >= kGGUFQuantTileN || out_col >= dim) return;
+    const int expert = static_cast<int>(route_slots[route]);
+    if (expert < 0 || expert >= n_experts) return;
+
+    const int8_t* hidden_row = hidden_q + static_cast<int64_t>(route) * inter_dim;
+    const float* hs_row = hidden_scale + static_cast<int64_t>(route) * hidden_groups;
+    const uint8_t* w2_row = w2_blocks + (static_cast<int64_t>(expert) * dim + out_col) * w2_blocks_per_row * 84;
+    float acc = 0.0f;
+
+    for (int block_idx = 0; block_idx < w2_blocks_per_row; ++block_idx) {
+        const uint8_t* block = w2_row + static_cast<int64_t>(block_idx) * 84;
+        const uint8_t* scales = block;
+        const uint8_t* qs = block + 16;
+        const float d = gguf_block_scale_f16(block + 80);
+        const float dmin = gguf_block_scale_f16(block + 82);
+        const int k_base = block_idx * 256;
+        for (int group = 0; group < 16; ++group) {
+            float local = 0.0f;
+            if (lane < 4) {
+                const int half_block = group >> 3;
+                const int group_in_half = group & 7;
+                const int shift = (group_in_half >> 1) * 2;
+                const int byte_start = half_block * 32 + (group_in_half & 1) * 16;
+                const int idx = lane * 4;
+                const int q0 = static_cast<int>((qs[byte_start + idx + 0] >> shift) & 0x03);
+                const int q1 = static_cast<int>((qs[byte_start + idx + 1] >> shift) & 0x03);
+                const int q2 = static_cast<int>((qs[byte_start + idx + 2] >> shift) & 0x03);
+                const int q3 = static_cast<int>((qs[byte_start + idx + 3] >> shift) & 0x03);
+                const int w_pack = pack_i8x4(q0, q1, q2, q3);
+                const int h_idx = k_base + group * 16 + idx;
+                const int h_pack = pack_i8x4(
+                    static_cast<int>(hidden_row[h_idx + 0]),
+                    static_cast<int>(hidden_row[h_idx + 1]),
+                    static_cast<int>(hidden_row[h_idx + 2]),
+                    static_cast<int>(hidden_row[h_idx + 3]));
+                const int dot_q = __dp4a(w_pack, h_pack, 0);
+                const int sum_h = __dp4a(0x01010101, h_pack, 0);
+                const float qscale = d * static_cast<float>(scales[group] & 0x0f);
+                const float base = dmin * static_cast<float>(scales[group] >> 4);
+                local = hs_row[block_idx * 16 + group] * (qscale * static_cast<float>(dot_q) - base * static_cast<float>(sum_h));
+            }
+            #pragma unroll
+            for (int offset = 2; offset > 0; offset >>= 1) {
+                local += __shfl_down_sync(0x0f, local, offset);
+            }
+            if (lane == 0) acc += local;
+        }
+    }
+
+    if (lane == 0) {
+        atomicAdd(y + out_col, acc);
     }
 }
 
@@ -5962,6 +6620,50 @@ __global__ void q8_0_gemm_kernel(
 
 
 }  // namespace
+
+torch::Tensor gguf_q2k_gemm_dp4a_forward_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& blocks,
+    int64_t row_elems) {
+    c10::cuda::CUDAGuard device_guard(x.device());
+    auto x_contig = x.contiguous();
+    auto blocks_contig = blocks.contiguous();
+    const int k = static_cast<int>(row_elems);
+    const int n = static_cast<int>(blocks_contig.size(0));
+    const int blocks_per_row = static_cast<int>(blocks_contig.size(1));
+    const int rows = static_cast<int>(x_contig.numel() / k);
+    auto out = torch::empty({rows, n}, x.options().dtype(torch::kBFloat16));
+    auto x_q = torch::empty({rows, k}, x.options().dtype(torch::kInt8));
+    const int x_groups = (k + 15) / 16;
+    auto x_scale = torch::empty({rows, x_groups}, x.options().dtype(torch::kFloat32));
+    const dim3 quant_grid(rows, x_groups);
+    const dim3 quant_block(16);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x_contig.scalar_type(), "gguf_q2k_q8_1_quantize", [&] {
+        gguf_q8_1_quantize_16_kernel<scalar_t><<<quant_grid, quant_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            x_contig.data_ptr<scalar_t>(),
+            x_q.data_ptr<int8_t>(),
+            x_scale.data_ptr<float>(),
+            rows,
+            k);
+    });
+    const dim3 grid(ceil_div(n, kGGUFQuantTileN), rows);
+    const dim3 block(256);
+    gguf_q2k_gemm_dp4a_prequant_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x_q.data_ptr<int8_t>(),
+        x_scale.data_ptr<float>(),
+        blocks_contig.data_ptr<uint8_t>(),
+        out.data_ptr<c10::BFloat16>(),
+        rows,
+        n,
+        k,
+        blocks_per_row,
+        x_groups);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    auto out_shape = x.sizes().vec();
+    out_shape.back() = n;
+    return out.view(out_shape);
+}
+
 
 torch::Tensor q8_0_gemm_forward_cuda(
     const torch::Tensor& x,
@@ -6164,64 +6866,283 @@ torch::Tensor gguf_moe_prefill_grouped_forward_cuda(
     if (routes == 0 || n_experts <= 0) {
         return y;
     }
-    auto seg_cpu = seg_i32.to(torch::kCPU, false);
-    const int32_t* seg_cpu_ptr = seg_cpu.data_ptr<int32_t>();
-    const int threads = 256;
-    for (int expert = 0; expert < n_experts; ++expert) {
-        const int start = static_cast<int>(seg_cpu_ptr[expert]);
-        const int end = static_cast<int>(seg_cpu_ptr[expert + 1]);
-        const int count = end - start;
-        if (count <= 0) continue;
-        auto route_tokens_e = route_tokens_contig.narrow(0, start, count).contiguous();
-        auto route_weights_e = route_weights_contig.narrow(0, start, count).contiguous();
-        auto x_e = torch::empty({count, dim}, x.options());
-        const int gather_blocks = static_cast<int>((static_cast<int64_t>(count) * dim + threads - 1) / threads);
-        AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x_contig.scalar_type(), "gguf_moe_grouped_gather", [&] {
-            gather_routes_kernel<scalar_t><<<gather_blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+
+    const int w1_blocks_per_row = static_cast<int>(w1_contig.size(2));
+    const int w1_block_bytes = static_cast<int>(w1_contig.size(3));
+    const int w3_blocks_per_row = static_cast<int>(w3_contig.size(2));
+    const int w3_block_bytes = static_cast<int>(w3_contig.size(3));
+    const int w2_blocks_per_row = static_cast<int>(w2_contig.size(2));
+    const int w2_block_bytes = static_cast<int>(w2_contig.size(3));
+    auto route_experts = torch::empty({routes}, seg_i32.options());
+    gguf_route_experts_from_segments_kernel<<<n_experts, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        seg_i32.data_ptr<int32_t>(),
+        route_experts.data_ptr<int32_t>(),
+        n_experts);
+
+    const int8_t* grid_ptr = nullptr;
+    torch::Tensor grid_contig;
+    if (w1_type_id == 0 || w3_type_id == 0 || w2_type_id == 0) {
+        grid_contig = signed_grid.contiguous();
+        grid_ptr = grid_contig.data_ptr<int8_t>();
+    }
+
+    auto gate = torch::empty({routes, inter_dim}, x.options().dtype(torch::kFloat32));
+    auto up = torch::empty({routes, inter_dim}, x.options().dtype(torch::kFloat32));
+    const dim3 w13_grid(ceil_div(inter_dim, kGGUFQuantTileN), routes);
+    const dim3 block(256);
+    const bool use_iq2_xxs_w13_dp4a =
+        w1_type_id == 0 && w3_type_id == 0 &&
+        w1_block_bytes == 66 && w3_block_bytes == 66 &&
+        w1_blocks_per_row == w3_blocks_per_row &&
+        env_enabled_explicit("DEEPSEEK_GGUF_IQ2_XXS_W13_DP4A");
+    if (use_iq2_xxs_w13_dp4a) {
+        const int x_groups = ceil_div(dim, 32);
+        auto x_q = torch::empty({tokens, dim}, x.options().dtype(torch::kInt8));
+        auto x_scale = torch::empty({tokens, x_groups}, x.options().dtype(torch::kFloat32));
+        const dim3 quant_grid(tokens, x_groups);
+        AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x_contig.scalar_type(), "gguf_q8_1_quantize_x_32", [&] {
+            gguf_q8_1_quantize_x_32_kernel<scalar_t><<<quant_grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
                 x_contig.data_ptr<scalar_t>(),
-                route_tokens_e.data_ptr<int64_t>(),
-                x_e.data_ptr<scalar_t>(),
-                count,
+                x_q.data_ptr<int8_t>(),
+                x_scale.data_ptr<float>(),
+                tokens,
                 dim);
         });
-        auto gate = gguf_quant_gemm_forward_cuda(
-            x_e,
-            w1_contig[expert],
-            w1_row_elems,
-            w1_type_id,
-            signed_grid).contiguous();
-        auto up = gguf_quant_gemm_forward_cuda(
-            x_e,
-            w3_contig[expert],
-            w3_row_elems,
-            w3_type_id,
-            signed_grid).contiguous();
-        auto hidden = torch::empty({count, inter_dim}, x.options().dtype(torch::kFloat32));
-        const int hidden_blocks = static_cast<int>((static_cast<int64_t>(count) * inter_dim + threads - 1) / threads);
-        AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, gate.scalar_type(), "gguf_moe_grouped_swiglu", [&] {
-            route_swiglu_cast_kernel<scalar_t><<<hidden_blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-                gate.data_ptr<scalar_t>(),
-                up.data_ptr<scalar_t>(),
-                route_weights_e.data_ptr<float>(),
-                hidden.data_ptr<float>(),
-                count,
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        gguf_moe_w13_iq2_xxs_dp4a_kernel<<<w13_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            x_q.data_ptr<int8_t>(),
+            x_scale.data_ptr<float>(),
+            route_tokens_contig.data_ptr<int64_t>(),
+            route_experts.data_ptr<int32_t>(),
+            w1_contig.data_ptr<uint8_t>(),
+            w3_contig.data_ptr<uint8_t>(),
+            grid_ptr,
+            gate.data_ptr<float>(),
+            up.data_ptr<float>(),
+            routes,
+            dim,
+            inter_dim,
+            w1_blocks_per_row,
+            x_groups);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    } else {
+        AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x_contig.scalar_type(), "gguf_moe_w13", [&] {
+            gguf_moe_w13_kernel<scalar_t><<<w13_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                x_contig.data_ptr<scalar_t>(),
+                route_tokens_contig.data_ptr<int64_t>(),
+                route_experts.data_ptr<int32_t>(),
+                w1_contig.data_ptr<uint8_t>(),
+                w3_contig.data_ptr<uint8_t>(),
+                grid_ptr,
+                gate.data_ptr<float>(),
+                up.data_ptr<float>(),
+                routes,
+                dim,
+                inter_dim,
+                w1_blocks_per_row,
+                w1_block_bytes,
+                static_cast<int>(w1_type_id),
+                w3_blocks_per_row,
+                w3_block_bytes,
+                static_cast<int>(w3_type_id));
+        });
+    }
+
+    const dim3 w2_grid(ceil_div(dim, kGGUFQuantTileN), routes);
+    const bool use_q2k_w2_dp4a =
+        w2_type_id == 1 &&
+        w2_block_bytes == 84 &&
+        env_enabled_explicit("DEEPSEEK_GGUF_Q2K_W2_DP4A");
+    if (use_q2k_w2_dp4a) {
+        const int hidden_groups = ceil_div(inter_dim, 16);
+        auto hidden_q = torch::empty({routes, inter_dim}, x.options().dtype(torch::kInt8));
+        auto hidden_scale = torch::empty({routes, hidden_groups}, x.options().dtype(torch::kFloat32));
+        const dim3 quant_grid(routes, hidden_groups);
+        if (env_enabled_explicit("DEEPSEEK_GGUF_Q2K_FUSED_SWIGLU_QUANT")) {
+            gguf_route_swiglu_quantize_hidden_16_kernel<<<quant_grid, 16, 0, at::cuda::getCurrentCUDAStream()>>>(
+                gate.data_ptr<float>(),
+                up.data_ptr<float>(),
+                route_weights_contig.data_ptr<float>(),
+                hidden_q.data_ptr<int8_t>(),
+                hidden_scale.data_ptr<float>(),
+                routes,
                 inter_dim,
                 static_cast<float>(swiglu_limit));
-        });
-        auto out = gguf_quant_gemm_forward_cuda(
-            hidden,
-            w2_contig[expert],
-            w2_row_elems,
-            w2_type_id,
-            signed_grid).to(torch::kFloat32).contiguous().view({count, dim});
-        const int scatter_blocks = static_cast<int>((static_cast<int64_t>(count) * dim + threads - 1) / threads);
-        scatter_routes_kernel<float><<<scatter_blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-            out.data_ptr<float>(),
-            route_tokens_e.data_ptr<int64_t>(),
+        } else {
+            auto hidden = torch::empty({routes, inter_dim}, x.options().dtype(torch::kFloat32));
+            const int hidden_threads = 256;
+            const int hidden_blocks = static_cast<int>((static_cast<int64_t>(routes) * inter_dim + hidden_threads - 1) / hidden_threads);
+            route_swiglu_cast_kernel<float><<<hidden_blocks, hidden_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                gate.data_ptr<float>(),
+                up.data_ptr<float>(),
+                route_weights_contig.data_ptr<float>(),
+                hidden.data_ptr<float>(),
+                routes,
+                inter_dim,
+                static_cast<float>(swiglu_limit));
+            gguf_q8_1_quantize_hidden_16_kernel<<<quant_grid, 16, 0, at::cuda::getCurrentCUDAStream()>>>(
+                hidden.data_ptr<float>(),
+                hidden_q.data_ptr<int8_t>(),
+                hidden_scale.data_ptr<float>(),
+                routes,
+                inter_dim);
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        gguf_moe_w2_scatter_q2k_dp4a_kernel<<<w2_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            hidden_q.data_ptr<int8_t>(),
+            hidden_scale.data_ptr<float>(),
+            route_tokens_contig.data_ptr<int64_t>(),
+            route_experts.data_ptr<int32_t>(),
+            w2_contig.data_ptr<uint8_t>(),
             y.data_ptr<float>(),
-            count,
-            dim);
+            routes,
+            dim,
+            inter_dim,
+            w2_blocks_per_row,
+            hidden_groups);
+    } else {
+        auto hidden = torch::empty({routes, inter_dim}, x.options().dtype(torch::kFloat32));
+        const int hidden_threads = 256;
+        const int hidden_blocks = static_cast<int>((static_cast<int64_t>(routes) * inter_dim + hidden_threads - 1) / hidden_threads);
+        route_swiglu_cast_kernel<float><<<hidden_blocks, hidden_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            gate.data_ptr<float>(),
+            up.data_ptr<float>(),
+            route_weights_contig.data_ptr<float>(),
+            hidden.data_ptr<float>(),
+            routes,
+            inter_dim,
+            static_cast<float>(swiglu_limit));
+        gguf_moe_w2_scatter_kernel<<<w2_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            hidden.data_ptr<float>(),
+            route_tokens_contig.data_ptr<int64_t>(),
+            route_experts.data_ptr<int32_t>(),
+            w2_contig.data_ptr<uint8_t>(),
+            grid_ptr,
+            y.data_ptr<float>(),
+            routes,
+            dim,
+            inter_dim,
+            w2_blocks_per_row,
+            w2_block_bytes,
+            static_cast<int>(w2_type_id));
     }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
+
+torch::Tensor gguf_moe_single_token_iq2_q2k_forward_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& route_slots,
+    const torch::Tensor& route_weights,
+    const torch::Tensor& w1_blocks,
+    const torch::Tensor& w3_blocks,
+    const torch::Tensor& w2_blocks,
+    const torch::Tensor& signed_grid,
+    double swiglu_limit) {
+    c10::cuda::CUDAGuard device_guard(x.device());
+    auto x_contig = x.contiguous();
+    auto route_slots_contig = route_slots.contiguous();
+    auto route_weights_contig = route_weights.contiguous();
+    auto w1_contig = w1_blocks.contiguous();
+    auto w3_contig = w3_blocks.contiguous();
+    auto w2_contig = w2_blocks.contiguous();
+    auto grid_contig = signed_grid.contiguous();
+
+    const int routes = static_cast<int>(route_slots_contig.size(0));
+    const int n_experts = static_cast<int>(w1_contig.size(0));
+    const int dim = static_cast<int>(x_contig.size(1));
+    const int inter_dim = static_cast<int>(w1_contig.size(1));
+    auto y = torch::zeros({1, dim}, x.options().dtype(torch::kFloat32));
+    if (routes == 0 || n_experts <= 0) {
+        return y;
+    }
+
+    const int w1_blocks_per_row = static_cast<int>(w1_contig.size(2));
+    const int w2_blocks_per_row = static_cast<int>(w2_contig.size(2));
+    const int x_groups = ceil_div(dim, 32);
+    const int hidden_groups = ceil_div(inter_dim, 16);
+
+    auto x_q = torch::empty({1, dim}, x.options().dtype(torch::kInt8));
+    auto x_scale = torch::empty({1, x_groups}, x.options().dtype(torch::kFloat32));
+    const dim3 quant_x_grid(1, x_groups);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x_contig.scalar_type(), "gguf_single_q8_1_quantize_x_32", [&] {
+        gguf_q8_1_quantize_x_32_kernel<scalar_t><<<quant_x_grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
+            x_contig.data_ptr<scalar_t>(),
+            x_q.data_ptr<int8_t>(),
+            x_scale.data_ptr<float>(),
+            1,
+            dim);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    auto gate = torch::empty({routes, inter_dim}, x.options().dtype(torch::kFloat32));
+    auto up = torch::empty({routes, inter_dim}, x.options().dtype(torch::kFloat32));
+    const dim3 w13_grid(ceil_div(inter_dim, kGGUFQuantTileN), routes);
+    const dim3 block(256);
+    gguf_moe_single_w13_iq2_xxs_dp4a_kernel<<<w13_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x_q.data_ptr<int8_t>(),
+        x_scale.data_ptr<float>(),
+        route_slots_contig.data_ptr<int64_t>(),
+        w1_contig.data_ptr<uint8_t>(),
+        w3_contig.data_ptr<uint8_t>(),
+        grid_contig.data_ptr<int8_t>(),
+        gate.data_ptr<float>(),
+        up.data_ptr<float>(),
+        routes,
+        n_experts,
+        dim,
+        inter_dim,
+        w1_blocks_per_row,
+        x_groups);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    auto hidden_q = torch::empty({routes, inter_dim}, x.options().dtype(torch::kInt8));
+    auto hidden_scale = torch::empty({routes, hidden_groups}, x.options().dtype(torch::kFloat32));
+    const dim3 quant_h_grid(routes, hidden_groups);
+    if (env_enabled_explicit("DEEPSEEK_GGUF_Q2K_FUSED_SWIGLU_QUANT")) {
+        gguf_route_swiglu_quantize_hidden_16_kernel<<<quant_h_grid, 16, 0, at::cuda::getCurrentCUDAStream()>>>(
+            gate.data_ptr<float>(),
+            up.data_ptr<float>(),
+            route_weights_contig.data_ptr<float>(),
+            hidden_q.data_ptr<int8_t>(),
+            hidden_scale.data_ptr<float>(),
+            routes,
+            inter_dim,
+            static_cast<float>(swiglu_limit));
+    } else {
+        auto hidden = torch::empty({routes, inter_dim}, x.options().dtype(torch::kFloat32));
+        const int hidden_threads = 256;
+        const int hidden_blocks = static_cast<int>((static_cast<int64_t>(routes) * inter_dim + hidden_threads - 1) / hidden_threads);
+        route_swiglu_cast_kernel<float><<<hidden_blocks, hidden_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            gate.data_ptr<float>(),
+            up.data_ptr<float>(),
+            route_weights_contig.data_ptr<float>(),
+            hidden.data_ptr<float>(),
+            routes,
+            inter_dim,
+            static_cast<float>(swiglu_limit));
+        gguf_q8_1_quantize_hidden_16_kernel<<<quant_h_grid, 16, 0, at::cuda::getCurrentCUDAStream()>>>(
+            hidden.data_ptr<float>(),
+            hidden_q.data_ptr<int8_t>(),
+            hidden_scale.data_ptr<float>(),
+            routes,
+            inter_dim);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    const dim3 w2_grid(ceil_div(dim, kGGUFQuantTileN), routes);
+    gguf_moe_single_w2_q2k_dp4a_kernel<<<w2_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        hidden_q.data_ptr<int8_t>(),
+        hidden_scale.data_ptr<float>(),
+        route_slots_contig.data_ptr<int64_t>(),
+        w2_contig.data_ptr<uint8_t>(),
+        y.data_ptr<float>(),
+        routes,
+        n_experts,
+        dim,
+        inter_dim,
+        w2_blocks_per_row,
+        hidden_groups);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }

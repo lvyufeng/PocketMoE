@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+
 torch::Tensor int8_gemm_forward_cuda(
     const torch::Tensor& x,
     const torch::Tensor& weight_q,
@@ -247,6 +248,11 @@ torch::Tensor q8_0_gemm_forward_cuda(
     const torch::Tensor& blocks,
     int64_t row_elems);
 
+torch::Tensor gguf_q2k_gemm_dp4a_forward_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& blocks,
+    int64_t row_elems);
+
 torch::Tensor gguf_quant_gemm_forward_cuda(
     const torch::Tensor& x,
     const torch::Tensor& blocks,
@@ -285,6 +291,16 @@ torch::Tensor gguf_moe_prefill_grouped_forward_cuda(
     int64_t w3_type_id,
     int64_t w2_row_elems,
     int64_t w2_type_id,
+    const torch::Tensor& signed_grid,
+    double swiglu_limit);
+
+torch::Tensor gguf_moe_single_token_iq2_q2k_forward_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& route_slots,
+    const torch::Tensor& route_weights,
+    const torch::Tensor& w1_blocks,
+    const torch::Tensor& w3_blocks,
+    const torch::Tensor& w2_blocks,
     const torch::Tensor& signed_grid,
     double swiglu_limit);
 
@@ -447,6 +463,27 @@ torch::Tensor q8_0_gemm_forward(
     return q8_0_gemm_forward_cuda(x, blocks, row_elems);
 }
 
+torch::Tensor gguf_q2k_gemm_dp4a_forward(
+    const torch::Tensor& x,
+    const torch::Tensor& blocks,
+    int64_t row_elems) {
+    TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "x must have shape [M, K] or [B, S, K]");
+    TORCH_CHECK(blocks.dim() == 3, "blocks must have shape [N, K_blocks, 84]");
+    TORCH_CHECK(blocks.size(2) == 84, "q2_k block size must be 84 bytes");
+    TORCH_CHECK(row_elems > 0, "row_elems must be positive");
+    TORCH_CHECK(x.size(-1) == row_elems, "inner dimension mismatch");
+    TORCH_CHECK(blocks.size(1) * 256 >= row_elems, "blocks do not cover row_elems");
+    TORCH_CHECK(x.is_cuda() && blocks.is_cuda(), "all tensors must be CUDA tensors");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    check_tensor(blocks, "blocks", torch::kUInt8);
+    TORCH_CHECK(
+        x.scalar_type() == torch::kFloat16 ||
+        x.scalar_type() == torch::kBFloat16 ||
+        x.scalar_type() == torch::kFloat32,
+        "x must be float16, bfloat16, or float32");
+    return gguf_q2k_gemm_dp4a_forward_cuda(x, blocks, row_elems);
+}
+
 torch::Tensor gguf_quant_gemm_forward(
     const torch::Tensor& x,
     const torch::Tensor& blocks,
@@ -601,7 +638,7 @@ torch::Tensor gguf_moe_prefill_grouped_forward(
     check_tensor(w1_blocks, "w1_blocks", torch::kUInt8);
     check_tensor(w3_blocks, "w3_blocks", torch::kUInt8);
     check_tensor(w2_blocks, "w2_blocks", torch::kUInt8);
-    if (w1_type_id == 0 || w3_type_id == 0) {
+    if (w1_type_id == 0 || w3_type_id == 0 || w2_type_id == 0) {
         TORCH_CHECK(signed_grid.is_cuda(), "signed_grid must be CUDA when iq2_xxs blocks are used");
         TORCH_CHECK(signed_grid.scalar_type() == torch::kInt8, "signed_grid must be int8");
         TORCH_CHECK(signed_grid.is_contiguous(), "signed_grid must be contiguous");
@@ -621,6 +658,57 @@ torch::Tensor gguf_moe_prefill_grouped_forward(
         w3_type_id,
         w2_row_elems,
         w2_type_id,
+        signed_grid,
+        swiglu_limit);
+}
+
+torch::Tensor gguf_moe_single_token_iq2_q2k_forward(
+    const torch::Tensor& x,
+    const torch::Tensor& route_slots,
+    const torch::Tensor& route_weights,
+    const torch::Tensor& w1_blocks,
+    const torch::Tensor& w3_blocks,
+    const torch::Tensor& w2_blocks,
+    const torch::Tensor& signed_grid,
+    double swiglu_limit) {
+    TORCH_CHECK(x.dim() == 2 && x.size(0) == 1, "x must have shape [1, D]");
+    TORCH_CHECK(route_slots.dim() == 1, "route_slots must have shape [K]");
+    TORCH_CHECK(route_weights.dim() == 1, "route_weights must have shape [K]");
+    TORCH_CHECK(route_slots.size(0) == route_weights.size(0), "route_slots/route_weights length mismatch");
+    TORCH_CHECK(w1_blocks.dim() == 4 && w3_blocks.dim() == 4 && w2_blocks.dim() == 4, "GGUF blocks must have shape [E, N, K_blocks, block_bytes]");
+    TORCH_CHECK(w1_blocks.size(0) == w3_blocks.size(0) && w1_blocks.size(0) == w2_blocks.size(0), "expert count mismatch");
+    TORCH_CHECK(w1_blocks.size(1) == w3_blocks.size(1), "w1/w3 inter_dim mismatch");
+    TORCH_CHECK(w1_blocks.size(2) == w3_blocks.size(2), "w1/w3 block count mismatch");
+    TORCH_CHECK(w1_blocks.size(3) == 66 && w3_blocks.size(3) == 66, "w1/w3 must be IQ2_XXS blocks");
+    TORCH_CHECK(w2_blocks.size(3) == 84, "w2 must be Q2_K blocks");
+    TORCH_CHECK(w1_blocks.size(2) * 256 >= x.size(1), "w1/w3 blocks do not cover x dim");
+    TORCH_CHECK(w2_blocks.size(1) == x.size(1), "w2 output dimension mismatch");
+    TORCH_CHECK(w2_blocks.size(2) * 256 >= w1_blocks.size(1), "w2 blocks do not cover inter dim");
+    TORCH_CHECK(x.is_cuda() && route_slots.is_cuda() && route_weights.is_cuda(), "x/route tensors must be CUDA tensors");
+    TORCH_CHECK(w1_blocks.is_cuda() && w3_blocks.is_cuda() && w2_blocks.is_cuda(), "GGUF blocks must be CUDA tensors");
+    TORCH_CHECK(signed_grid.is_cuda(), "signed_grid must be CUDA for IQ2_XXS");
+    TORCH_CHECK(x.is_contiguous() && route_slots.is_contiguous() && route_weights.is_contiguous(), "x/route tensors must be contiguous");
+    TORCH_CHECK(w1_blocks.is_contiguous() && w3_blocks.is_contiguous() && w2_blocks.is_contiguous(), "GGUF blocks must be contiguous");
+    TORCH_CHECK(signed_grid.is_contiguous(), "signed_grid must be contiguous");
+    TORCH_CHECK(
+        x.scalar_type() == torch::kFloat16 ||
+        x.scalar_type() == torch::kBFloat16 ||
+        x.scalar_type() == torch::kFloat32,
+        "x must be float16, bfloat16, or float32");
+    TORCH_CHECK(route_slots.scalar_type() == torch::kInt64, "route_slots must be int64");
+    TORCH_CHECK(route_weights.scalar_type() == torch::kFloat32, "route_weights must be float32");
+    check_tensor(w1_blocks, "w1_blocks", torch::kUInt8);
+    check_tensor(w3_blocks, "w3_blocks", torch::kUInt8);
+    check_tensor(w2_blocks, "w2_blocks", torch::kUInt8);
+    check_tensor(signed_grid, "signed_grid", torch::kInt8);
+    TORCH_CHECK(signed_grid.numel() == 256 * 128 * 8, "signed_grid must contain 256*128*8 entries");
+    return gguf_moe_single_token_iq2_q2k_forward_cuda(
+        x,
+        route_slots,
+        route_weights,
+        w1_blocks,
+        w3_blocks,
+        w2_blocks,
         signed_grid,
         swiglu_limit);
 }
@@ -1000,6 +1088,91 @@ std::vector<torch::Tensor> moe_group_routes(
     TORCH_CHECK(indices.scalar_type() == torch::kInt64 || indices.scalar_type() == torch::kInt32, "indices must be int64 or int32");
     TORCH_CHECK(n_local_experts > 0, "n_local_experts must be positive");
     return moe_group_routes_cuda(indices, weights, experts_start_idx, n_local_experts);
+}
+
+std::vector<torch::Tensor> gguf_single_token_route_slots(
+    const torch::Tensor& indices,
+    const torch::Tensor& weights,
+    int64_t experts_start_idx,
+    int64_t n_local_experts) {
+    TORCH_CHECK(indices.dim() == 2 && indices.size(0) == 1, "indices must have shape [1, K]");
+    TORCH_CHECK(weights.dim() == 2 && weights.size(0) == 1, "weights must have shape [1, K]");
+    TORCH_CHECK(indices.size(1) == weights.size(1), "indices/weights shape mismatch");
+    TORCH_CHECK(indices.is_cuda() && weights.is_cuda(), "indices and weights must be CUDA tensors");
+    TORCH_CHECK(indices.is_contiguous() && weights.is_contiguous(), "indices and weights must be contiguous");
+    TORCH_CHECK(weights.scalar_type() == torch::kFloat32, "weights must be float32");
+    TORCH_CHECK(indices.scalar_type() == torch::kInt64 || indices.scalar_type() == torch::kInt32, "indices must be int64 or int32");
+    TORCH_CHECK(n_local_experts > 0, "n_local_experts must be positive");
+
+    const int64_t topk = indices.size(1);
+    const int64_t experts = n_local_experts;
+    auto idx_cpu = indices.to(torch::kCPU);
+    std::vector<std::vector<int64_t>> routes_by_local(static_cast<size_t>(experts));
+    if (indices.scalar_type() == torch::kInt64) {
+        const auto* idx = idx_cpu.data_ptr<int64_t>();
+        for (int64_t route_pos = 0; route_pos < topk; ++route_pos) {
+            const int64_t local = idx[route_pos] - experts_start_idx;
+            if (0 <= local && local < experts) {
+                routes_by_local[static_cast<size_t>(local)].push_back(route_pos);
+            }
+        }
+    } else {
+        const auto* idx = idx_cpu.data_ptr<int32_t>();
+        for (int64_t route_pos = 0; route_pos < topk; ++route_pos) {
+            const int64_t local = static_cast<int64_t>(idx[route_pos]) - experts_start_idx;
+            if (0 <= local && local < experts) {
+                routes_by_local[static_cast<size_t>(local)].push_back(route_pos);
+            }
+        }
+    }
+
+    int64_t active = 0;
+    int64_t routes = 0;
+    for (const auto& positions : routes_by_local) {
+        if (!positions.empty()) {
+            ++active;
+            routes += static_cast<int64_t>(positions.size());
+        }
+    }
+
+    auto cpu_long_opts = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+    auto cpu_i32_opts = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+    auto local_ids_cpu = torch::empty({active}, cpu_long_opts);
+    auto route_slots_cpu = torch::empty({routes}, cpu_long_opts);
+    auto route_positions_cpu = torch::empty({routes}, cpu_long_opts);
+    auto compact_starts_cpu = torch::empty({active + 1}, cpu_i32_opts);
+
+    auto* local_ids_ptr = local_ids_cpu.data_ptr<int64_t>();
+    auto* route_slots_ptr = route_slots_cpu.data_ptr<int64_t>();
+    auto* route_positions_ptr = route_positions_cpu.data_ptr<int64_t>();
+    auto* compact_ptr = compact_starts_cpu.data_ptr<int32_t>();
+    int64_t active_pos = 0;
+    int64_t route_out = 0;
+    compact_ptr[0] = 0;
+    for (int64_t local = 0; local < experts; ++local) {
+        const auto& positions = routes_by_local[static_cast<size_t>(local)];
+        if (positions.empty()) {
+            continue;
+        }
+        local_ids_ptr[active_pos] = local;
+        for (int64_t route_pos : positions) {
+            route_slots_ptr[route_out] = active_pos;
+            route_positions_ptr[route_out] = route_pos;
+            ++route_out;
+        }
+        ++active_pos;
+        compact_ptr[active_pos] = static_cast<int32_t>(route_out);
+    }
+
+    auto route_slots = torch::empty({routes}, indices.options().dtype(torch::kInt64));
+    auto route_positions = torch::empty({routes}, indices.options().dtype(torch::kInt64));
+    auto route_tokens = torch::zeros({routes}, indices.options().dtype(torch::kInt64));
+    auto compact_starts = torch::empty({active + 1}, indices.options().dtype(torch::kInt32));
+    route_slots.copy_(route_slots_cpu);
+    route_positions.copy_(route_positions_cpu);
+    compact_starts.copy_(compact_starts_cpu);
+    auto route_weights = weights.view({-1}).index_select(0, route_positions);
+    return {local_ids_cpu, route_tokens, route_weights, route_slots, compact_starts};
 }
 
 torch::Tensor moe_single_token_int8_forward(
@@ -1576,10 +1749,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("custom_allreduce_inplace", &custom_allreduce_inplace, "custom allreduce in-place over CUDA IPC buffers");
     m.def("moe_finalize_reduce_forward", &moe_finalize_reduce_forward, "finalize reduced MoE output with shared expert add and dtype cast (CUDA)");
     m.def("q8_0_gemm_forward", &q8_0_gemm_forward, "raw GGUF q8_0 GEMM forward (CUDA)");
+    m.def("gguf_q2k_gemm_dp4a_forward", &gguf_q2k_gemm_dp4a_forward, "raw GGUF q2_k GEMM forward using Q8 activation + DP4A (CUDA)");
     m.def("gguf_quant_gemm_forward", &gguf_quant_gemm_forward, "raw GGUF iq2_xxs/q2_k GEMM forward (CUDA)");
     m.def("gguf_quant_gemm_prefill_forward", &gguf_quant_gemm_prefill_forward, "prefill-only raw GGUF iq2_xxs/q2_k GEMM forward (CUDA)");
     m.def("gguf_quant_gemm_pair_forward", &gguf_quant_gemm_pair_forward, "paired raw GGUF iq2_xxs/q2_k GEMM forward (CUDA)");
     m.def("gguf_moe_prefill_grouped_forward", &gguf_moe_prefill_grouped_forward, "raw GGUF routed grouped MoE prefill forward (CUDA)");
+    m.def("gguf_moe_single_token_iq2_q2k_forward", &gguf_moe_single_token_iq2_q2k_forward, "single-token GGUF IQ2_XXS/Q2_K routed MoE forward (CUDA)");
     m.def("int8_gemm_forward", &int8_gemm_forward, "generic int8 GEMM forward (CUDA)");
     m.def("int8_gemm_pair_forward", &int8_gemm_pair_forward, "paired int8 GEMM forward with shared activation quantization (CUDA)");
     m.def("wo_a_int8_forward", &wo_a_int8_forward, "wo_a grouped int8 forward (CUDA)");
@@ -1595,6 +1770,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("hc_split_pre_forward", &hc_split_pre_forward, "HC split/sinkhorn/pre-sum forward (CUDA)");
     m.def("hc_post_forward", &hc_post_forward, "HC post forward (CUDA)");
     m.def("moe_group_routes", &moe_group_routes, "group MoE routes by local expert (CUDA)");
+    m.def("gguf_single_token_route_slots", &gguf_single_token_route_slots, "single-token GGUF route compaction for slot-cache decode");
     m.def("moe_single_token_int8_forward", &moe_single_token_int8_forward, "single-token top-k MoE int8 forward (CUDA)");
     m.def("moe_single_token_int8_forward_v2", &moe_single_token_int8_forward_v2, "single-token top-k MoE int8 forward with compact buffer + slot map (CUDA)");
     m.def("moe_single_token_fp4_forward", &moe_single_token_fp4_forward, "single-token top-k MoE FP4 (e2m1fn_x2 + e8m0 block) forward (CUDA)");

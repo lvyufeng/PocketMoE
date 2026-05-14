@@ -264,6 +264,8 @@ class GGUFTensorDataReader:
     def read_routed_layer_blocks(
         self,
         name: str | GGUFTensorInfo,
+        expert_start: int = 0,
+        expert_count: int | None = None,
     ) -> tuple[torch.Tensor, str, int]:
         tensor = self._tensor(name)
         if len(tensor.dimensions) != 3:
@@ -277,9 +279,15 @@ class GGUFTensorDataReader:
             raise ValueError(f"{tensor.name} in_dim={in_dim} is not divisible by {block_elems}")
         blocks_per_row = in_dim // block_elems
         row_bytes = blocks_per_row * block_bytes
-        nbytes = n_experts * out_dim * row_bytes
-        view = memoryview(self._mmap)[tensor.absolute_offset:tensor.absolute_offset + nbytes]
-        blocks = torch.frombuffer(view, dtype=torch.uint8, count=nbytes).view(n_experts, out_dim, blocks_per_row, block_bytes)
+        expert_start = int(expert_start)
+        expert_count = n_experts - expert_start if expert_count is None else int(expert_count)
+        if expert_start < 0 or expert_count < 0 or expert_start + expert_count > n_experts:
+            raise ValueError(f"expert range [{expert_start}, {expert_start + expert_count}) is outside {tensor.name} experts={n_experts}")
+        expert_bytes = out_dim * row_bytes
+        nbytes = expert_count * expert_bytes
+        offset = tensor.absolute_offset + expert_start * expert_bytes
+        view = memoryview(self._mmap)[offset:offset + nbytes]
+        blocks = torch.frombuffer(view, dtype=torch.uint8, count=nbytes).view(expert_count, out_dim, blocks_per_row, block_bytes)
         return blocks, tensor.type_name, in_dim
 
     def read_routed_expert_blocks(

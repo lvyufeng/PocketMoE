@@ -45,6 +45,79 @@ def _get_gguf_gpu_prefill_copy_stream(device: torch.device) -> torch.cuda.Stream
     return stream
 
 
+class _GGUFGpuExpertLRU:
+    def __init__(self):
+        cap_env = os.getenv("DEEPSEEK_GGUF_GPU_DECODE_CACHE_BYTES")
+        if cap_env:
+            self.capacity_bytes = int(cap_env)
+        else:
+            self.capacity_bytes = int(8.0 * 1024 ** 3)
+        self.used_bytes = 0
+        self.entries: "OrderedDict[tuple, tuple[torch.Tensor, str, int]]" = OrderedDict()
+        self.profile = os.getenv("DEEPSEEK_GGUF_GPU_DECODE_CACHE_PROFILE", "0").lower() in {"1", "true", "yes"}
+        self.profile_every = max(1, int(os.getenv("DEEPSEEK_GGUF_GPU_DECODE_CACHE_PROFILE_EVERY", "256")))
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self._last_profile_total = 0
+
+    @staticmethod
+    def _nbytes(gpu_blocks: torch.Tensor) -> int:
+        return int(gpu_blocks.numel() * gpu_blocks.element_size())
+
+    def _maybe_profile(self) -> None:
+        total_lookups = self.hits + self.misses
+        if self.profile and total_lookups >= self._last_profile_total + self.profile_every:
+            self._last_profile_total = total_lookups
+            print(
+                f"gguf_gpu_expert_lru entries={len(self.entries)} used={self.used_bytes / 1024 ** 2:.1f}MiB "
+                f"hits={self.hits} misses={self.misses} evictions={self.evictions}",
+                flush=True,
+            )
+
+    def lookup(self, key):
+        entry = self.entries.pop(key, None)
+        if entry is None:
+            self.misses += 1
+            self._maybe_profile()
+            return None
+        self.entries[key] = entry
+        self.hits += 1
+        self._maybe_profile()
+        return entry
+
+    def insert(self, key, value: "tuple[torch.Tensor, str, int]"):
+        gpu_blocks, _type_name, _in_dim = value
+        existing = self.entries.pop(key, None)
+        if existing is not None:
+            self.used_bytes -= self._nbytes(existing[0])
+        nbytes = self._nbytes(gpu_blocks)
+        if nbytes > self.capacity_bytes:
+            return False
+        while self.entries and self.used_bytes + nbytes > self.capacity_bytes:
+            _old_key, old_entry = self.entries.popitem(last=False)
+            self.used_bytes -= self._nbytes(old_entry[0])
+            self.evictions += 1
+        self.entries[key] = value
+        self.used_bytes += nbytes
+        return True
+
+    def contains(self, key) -> bool:
+        return key in self.entries
+
+    def remove(self, key) -> None:
+        existing = self.entries.pop(key, None)
+        if existing is not None:
+            self.used_bytes -= self._nbytes(existing[0])
+
+    def clear(self) -> None:
+        self.entries.clear()
+        self.used_bytes = 0
+
+
+_GGUF_GPU_EXPERT_LRU = _GGUFGpuExpertLRU()
+
+
 def _get_cpu_moe_server_shm_name() -> str:
     global _cpu_moe_server_ipc_name
     if _cpu_moe_server_ipc_name is not None:
@@ -1753,10 +1826,11 @@ class Expert(nn.Module):
                 except Exception:
                     pass
 
-    def _gguf_cuda_key(self, name: str, device: torch.device) -> tuple[str, int, int]:
+    def _gguf_cuda_key(self, name: str, device: torch.device) -> tuple[str, str, int, int]:
         dev_index = int(device.index if device.index is not None else torch.cuda.current_device())
         expert_id = int(self._gguf_raw_backing.expert_id) if self._gguf_raw_backing is not None else -1
-        return name, expert_id, dev_index
+        gguf_path = self._gguf_raw_backing.gguf_path if self._gguf_raw_backing is not None else ""
+        return gguf_path, name, expert_id, dev_index
 
     def _gguf_type_id(self, type_name: str) -> int:
         return 0 if type_name == "iq2_xxs" else 1
@@ -1790,16 +1864,17 @@ class Expert(nn.Module):
         except Exception:
             return None
 
-    def prefetch_cuda_gguf(self, reader, device: torch.device) -> None:
-        if not self._gguf_cuda_prefetch_enabled or not self._gguf_cuda_fused_expert_enabled or self._gguf_raw_backing is None:
-            return
+    def prefetch_cuda_gguf(self, reader, device: torch.device, force: bool = False) -> bool:
+        if ((not force and not self._gguf_cuda_prefetch_enabled) or not self._gguf_cuda_fused_expert_enabled or self._gguf_raw_backing is None):
+            return False
         if device.type != "cuda":
-            return
+            return False
         copy_stream = _get_gguf_gpu_prefill_copy_stream(device)
-        current_stream = torch.cuda.current_stream(device)
+        prepared = False
         for name in (self._gguf_raw_backing.w1_name, self._gguf_raw_backing.w3_name, self._gguf_raw_backing.w2_name):
             key = self._gguf_cuda_key(name, device)
-            if key in self._gguf_cuda_cache or key in self._gguf_cuda_prefetch_pending:
+            if _GGUF_GPU_EXPERT_LRU.contains(key) or key in self._gguf_cuda_prefetch_pending:
+                prepared = True
                 continue
             packed = self._gguf_cuda_read_blocks(reader, name)
             if packed is None:
@@ -1813,14 +1888,19 @@ class Expert(nn.Module):
                 gpu_blocks.record_stream(copy_stream)
                 event = torch.cuda.Event()
                 event.record(copy_stream)
-            self._gguf_cuda_cache[key] = (gpu_blocks, type_name, in_dim)
+            if not _GGUF_GPU_EXPERT_LRU.insert(key, (gpu_blocks, type_name, in_dim)):
+                self._gguf_cuda_cache[key] = (gpu_blocks, type_name, in_dim)
             self._gguf_cuda_prefetch_host[key] = host_blocks
             self._gguf_cuda_prefetch_events[key] = event
             self._gguf_cuda_prefetch_pending.add(key)
+            prepared = True
+        return prepared
 
     def _gguf_cuda_get_blocks(self, reader, name: str, device: torch.device) -> tuple[torch.Tensor, str, int] | None:
         key = self._gguf_cuda_key(name, device)
-        cached = self._gguf_cuda_cache.get(key)
+        cached = _GGUF_GPU_EXPERT_LRU.lookup(key)
+        if cached is None:
+            cached = self._gguf_cuda_cache.get(key)
         if cached is not None:
             event = self._gguf_cuda_prefetch_events.pop(key, None)
             if event is not None:
@@ -1833,12 +1913,28 @@ class Expert(nn.Module):
             return None
         blocks, type_name, in_dim = packed
         gpu_blocks = blocks.to(device=device, non_blocking=True).contiguous()
-        self._gguf_cuda_cache[key] = (gpu_blocks, type_name, in_dim)
-        return gpu_blocks, type_name, in_dim
+        value = (gpu_blocks, type_name, in_dim)
+        if not _GGUF_GPU_EXPERT_LRU.insert(key, value):
+            self._gguf_cuda_cache[key] = value
+        return value
 
     def clear_cuda_gguf_cache(self) -> None:
         for event in self._gguf_cuda_prefetch_events.values():
             event.synchronize()
+        if self._gguf_raw_backing is not None:
+            for name in (
+                self._gguf_raw_backing.w1_name,
+                self._gguf_raw_backing.w3_name,
+                self._gguf_raw_backing.w2_name,
+            ):
+                for dev_index in range(torch.cuda.device_count() if torch.cuda.is_available() else 0):
+                    key = (
+                        self._gguf_raw_backing.gguf_path,
+                        name,
+                        int(self._gguf_raw_backing.expert_id),
+                        dev_index,
+                    )
+                    _GGUF_GPU_EXPERT_LRU.remove(key)
         self._gguf_cuda_cache.clear()
         self._gguf_cuda_prefetch_events.clear()
         self._gguf_cuda_prefetch_host.clear()
@@ -2207,7 +2303,15 @@ class Expert(nn.Module):
         if profile:
             torch.cuda.synchronize(x.device)
             t0 = time.perf_counter()
-        chunk = self.shared_expert_chunk_tokens if self.shared_expert_int8_enabled or self.shared_expert_fp16_enabled or self.shared_expert_phase_fp16_enabled else 0
+        use_raw_q8_0 = (
+            self.w1._raw_q8_0_active()
+            or self.w2._raw_q8_0_active()
+            or self.w3._raw_q8_0_active()
+        )
+        chunk = self.shared_expert_chunk_tokens if (
+            not use_raw_q8_0
+            and (self.shared_expert_int8_enabled or self.shared_expert_fp16_enabled or self.shared_expert_phase_fp16_enabled)
+        ) else 0
         if chunk > 0 and x.dim() == 2 and x.size(0) > chunk:
             parts = []
             for start in range(0, x.size(0), chunk):
@@ -2215,9 +2319,11 @@ class Expert(nn.Module):
                 weight_part = weights[start:end] if weights is not None else None
                 parts.append(self.forward(x[start:end].contiguous(), weight_part))
             return torch.cat(parts, dim=0).to(dtype)
-        use_shared_fp16 = self.shared_expert_fp16_enabled or (
-            self.shared_expert_phase_fp16_enabled
-            and os.getenv("DEEPSEEK_PD_ACTIVE_PHASE", "") == "prefill"
+        use_shared_fp16 = not use_raw_q8_0 and (
+            self.shared_expert_fp16_enabled or (
+                self.shared_expert_phase_fp16_enabled
+                and os.getenv("DEEPSEEK_PD_ACTIVE_PHASE", "") == "prefill"
+            )
         )
         if use_shared_fp16 and x.is_cuda:
             self._ensure_shared_fp16()
@@ -2331,6 +2437,44 @@ class Expert(nn.Module):
             if self._gguf_cuda_profile_enabled and self._gguf_cuda_profile_count < self._gguf_cuda_profile_limit:
                 self._gguf_cuda_profile_count += 1
                 print(f"gguf_gpu_staged_fallback rank={rank} layer={self._profile_layer_idx} expert={self._gguf_raw_backing.expert_id if self._gguf_raw_backing is not None else -1} error={exc}", flush=True)
+            return None
+
+
+    def forward_cuda_gguf_dense_staged(
+        self,
+        x: torch.Tensor,
+        weights: Optional[torch.Tensor],
+        w1_host_packed: tuple[torch.Tensor, str, int],
+        w3_host_packed: tuple[torch.Tensor, str, int],
+        w2_host_packed: tuple[torch.Tensor, str, int],
+        expert_local_idx: int,
+    ) -> torch.Tensor | None:
+        if not x.is_cuda:
+            return None
+        try:
+            w1_host, _w1_type, w1_in_dim = w1_host_packed
+            w3_host, _w3_type, w3_in_dim = w3_host_packed
+            w2_host, _w2_type, w2_in_dim = w2_host_packed
+            if w1_in_dim != self.w1.in_features or w3_in_dim != self.w3.in_features or w2_in_dim != self.w2.in_features:
+                return None
+            device = x.device
+            w1 = w1_host[expert_local_idx].to(dtype=torch.float32).to(device=device, non_blocking=False).to(torch.bfloat16)
+            w3 = w3_host[expert_local_idx].to(dtype=torch.float32).to(device=device, non_blocking=False).to(torch.bfloat16)
+            w2 = w2_host[expert_local_idx].to(dtype=torch.float32).to(device=device, non_blocking=False).to(torch.bfloat16)
+            x_contig = x.contiguous().to(torch.bfloat16)
+            gate = F.linear(x_contig, w1, None).float()
+            up = F.linear(x_contig, w3, None).float()
+            if self.swiglu_limit > 0:
+                up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+                gate = torch.clamp(gate, max=self.swiglu_limit)
+            hidden = torch.nn.functional.silu(gate) * up
+            if weights is not None:
+                hidden = hidden * weights.to(device=device, dtype=torch.float32)
+            return F.linear(hidden.to(torch.bfloat16), w2, None).float()
+        except Exception as exc:
+            if self._gguf_cuda_profile_enabled and self._gguf_cuda_profile_count < self._gguf_cuda_profile_limit:
+                self._gguf_cuda_profile_count += 1
+                print(f"gguf_gpu_dense_staged_fallback rank={rank} layer={self._profile_layer_idx} expert={self._gguf_raw_backing.expert_id if self._gguf_raw_backing is not None else -1} error={exc}", flush=True)
             return None
 
     def forward_cuda_gguf(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor | None:
@@ -2478,9 +2622,20 @@ class MoE(nn.Module):
         self.gpu_active_overlap_reduce_enabled = _env_enabled("DEEPSEEK_GPU_MOE_ACTIVE_OVERLAP_REDUCE")
         self._rank_route_profile_enabled = _env_enabled("DEEPSEEK_RANK_ROUTE_PROFILE")
         self._allreduce_stream = torch.cuda.Stream() if self.async_allreduce_enabled and torch.cuda.is_available() else None
+        self._gguf_decode_shared_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self.gpu_prefill_moe_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_GPU_PREFILL_MOE")
         self.gpu_gguf_prefill_moe_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_GGUF_GPU_PREFILL_MOE")
         self.gpu_gguf_prefill_active_expert_enabled = self.gpu_gguf_prefill_moe_enabled and _env_enabled("DEEPSEEK_GGUF_GPU_PREFILL_ACTIVE_EXPERT")
+        self.gpu_gguf_prefill_active_keep_cache = _env_enabled("DEEPSEEK_GGUF_GPU_PREFILL_ACTIVE_KEEP_CACHE")
+        self.gpu_gguf_decode_active_expert_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_GGUF_GPU_DECODE_ACTIVE_EXPERT")
+        self.gpu_gguf_decode_grouped_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_GGUF_GPU_DECODE_GROUPED")
+        self.gpu_gguf_decode_single_token_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_GGUF_GPU_DECODE_SINGLE_TOKEN")
+        self.gpu_gguf_decode_slot_cache_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_GGUF_GPU_DECODE_SLOT_CACHE")
+        self.gpu_gguf_decode_slot_cache_size = max(0, int(os.getenv("DEEPSEEK_GGUF_GPU_DECODE_SLOT_CACHE_SIZE", "4")))
+        self.gpu_gguf_decode_grouped_profile = _env_enabled("DEEPSEEK_GGUF_GPU_DECODE_GROUPED_PROFILE")
+        self.gpu_gguf_decode_keep_cache = _env_enabled_default_on("DEEPSEEK_GGUF_GPU_DECODE_KEEP_CACHE")
+        self.gpu_gguf_decode_active_prefetch_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_GGUF_GPU_DECODE_ACTIVE_PREFETCH")
+        self.gpu_gguf_decode_overlap_shared_route = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_GGUF_GPU_DECODE_OVERLAP_SHARED_ROUTE")
         self.gpu_decode_active_moe_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_GPU_MOE_DECODE_ACTIVE")
         self.gpu_spec_token2_moe_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_GPU_MOE_SPEC_TOKEN2")
         self.gpu_prefill_moe_min_tokens = int(os.getenv("DEEPSEEK_GPU_PREFILL_MOE_MIN_TOKENS", "64"))
@@ -2488,10 +2643,16 @@ class MoE(nn.Module):
         self.moe_reduce_cast_chunk_tokens = max(0, int(os.getenv("DEEPSEEK_MOE_REDUCE_CAST_CHUNK_TOKENS", "8192")))
         self.gpu_prefill_backend = None
         self._gguf_layer_stage = None
+        self._gguf_layer_stage_host_cache = None
         self._gguf_layer_stage_event: torch.cuda.Event | None = None
         self._gguf_layer_stage_pending = False
         self._gguf_layer_stage_device: torch.device | None = None
-        self._gguf_layer_stage_profile = _env_enabled("DEEPSEEK_GGUF_GPU_STAGE_PROFILE")
+        self._gguf_decode_slot_cache_device: torch.device | None = None
+        self._gguf_decode_slot_cache: "OrderedDict[int, int]" = OrderedDict()
+        self._gguf_decode_slot_w1_blocks: torch.Tensor | None = None
+        self._gguf_decode_slot_w3_blocks: torch.Tensor | None = None
+        self._gguf_decode_slot_w2_blocks: torch.Tensor | None = None
+        self._gguf_decode_slot_meta: tuple[str, int, str, int, str, int] | None = None
         self._cross_layer_pred_source_layer_id = -1
         self._cross_layer_pred_topk = None
         self._cross_layer_pred_percentile = None
@@ -2539,17 +2700,38 @@ class MoE(nn.Module):
         from src.gguf.tensor_reader import get_cached_gguf_tensor_reader
 
         t0 = time.perf_counter() if self._gguf_layer_stage_profile else 0.0
-        reader = get_cached_gguf_tensor_reader(first_expert._gguf_raw_backing.gguf_path)
-        backing = first_expert._gguf_raw_backing
-        w1_cpu, w1_type, w1_in_dim = reader.read_routed_layer_blocks(backing.w1_name)
-        w3_cpu, w3_type, w3_in_dim = reader.read_routed_layer_blocks(backing.w3_name)
-        w2_cpu, w2_type, w2_in_dim = reader.read_routed_layer_blocks(backing.w2_name)
-        w1_host = torch.empty_like(w1_cpu, device="cpu", pin_memory=True)
-        w3_host = torch.empty_like(w3_cpu, device="cpu", pin_memory=True)
-        w2_host = torch.empty_like(w2_cpu, device="cpu", pin_memory=True)
-        w1_host.copy_(w1_cpu)
-        w3_host.copy_(w3_cpu)
-        w2_host.copy_(w2_cpu)
+        host_cache = self._gguf_layer_stage_host_cache
+        if host_cache is None:
+            reader = get_cached_gguf_tensor_reader(first_expert._gguf_raw_backing.gguf_path)
+            backing = first_expert._gguf_raw_backing
+            w1_cpu, w1_type, w1_in_dim = reader.read_routed_layer_blocks(
+                backing.w1_name,
+                self.experts_start_idx,
+                self.experts_end_idx - self.experts_start_idx,
+            )
+            w3_cpu, w3_type, w3_in_dim = reader.read_routed_layer_blocks(
+                backing.w3_name,
+                self.experts_start_idx,
+                self.experts_end_idx - self.experts_start_idx,
+            )
+            w2_cpu, w2_type, w2_in_dim = reader.read_routed_layer_blocks(
+                backing.w2_name,
+                self.experts_start_idx,
+                self.experts_end_idx - self.experts_start_idx,
+            )
+            w1_host = torch.empty_like(w1_cpu, device="cpu", pin_memory=True)
+            w3_host = torch.empty_like(w3_cpu, device="cpu", pin_memory=True)
+            w2_host = torch.empty_like(w2_cpu, device="cpu", pin_memory=True)
+            w1_host.copy_(w1_cpu)
+            w3_host.copy_(w3_cpu)
+            w2_host.copy_(w2_cpu)
+            host_cache = (
+                (w1_host, w1_type, w1_in_dim),
+                (w3_host, w3_type, w3_in_dim),
+                (w2_host, w2_type, w2_in_dim),
+            )
+            self._gguf_layer_stage_host_cache = host_cache
+        (w1_host, w1_type, w1_in_dim), (w3_host, w3_type, w3_in_dim), (w2_host, w2_type, w2_in_dim) = host_cache
         copy_stream = _get_gguf_gpu_prefill_copy_stream(device) if async_copy else torch.cuda.current_stream(device)
         current_stream = torch.cuda.current_stream(device)
         if async_copy:
@@ -2579,7 +2761,7 @@ class MoE(nn.Module):
         if self._gguf_layer_stage_profile:
             print(
                 f"gguf_gpu_layer_stage layer={self.layer_id} rank={rank} async={int(async_copy)} "
-                f"bytes={(w1_cpu.numel() + w3_cpu.numel() + w2_cpu.numel()) / 1024 ** 2:.1f}MiB total={time.perf_counter() - t0:.4f}s",
+                f"bytes={(w1_host.numel() + w3_host.numel() + w2_host.numel()) / 1024 ** 2:.1f}MiB total={time.perf_counter() - t0:.4f}s",
                 flush=True,
             )
 
@@ -2609,9 +2791,52 @@ class MoE(nn.Module):
         if self._gguf_layer_stage_pending and self._gguf_layer_stage_event is not None:
             self._gguf_layer_stage_event.synchronize()
         self._gguf_layer_stage = None
+        self._gguf_layer_stage_host_cache = None
         self._gguf_layer_stage_event = None
         self._gguf_layer_stage_pending = False
         self._gguf_layer_stage_device = None
+
+    def _prefetch_gguf_decode_expert_ids(self, device: torch.device, expert_ids: list[int]) -> int:
+        if not expert_ids or not self._has_gguf_raw_experts() or device.type != "cuda":
+            return 0
+        try:
+            from src.gguf.tensor_reader import get_cached_gguf_tensor_reader
+
+            first_expert = next((expert for expert in self.experts if expert is not None and expert._gguf_raw_backing is not None), None)
+            if first_expert is None:
+                return 0
+            reader = get_cached_gguf_tensor_reader(first_expert._gguf_raw_backing.gguf_path)
+            prepared = 0
+            for expert_id in sorted(set(int(eid) for eid in expert_ids)):
+                if expert_id < self.experts_start_idx or expert_id >= self.experts_end_idx:
+                    continue
+                expert = self.experts[expert_id]
+                if expert is None or expert._gguf_raw_backing is None:
+                    continue
+                if expert.prefetch_cuda_gguf(reader, device, force=True):
+                    prepared += 1
+            return prepared
+        except Exception as exc:
+            if _env_enabled("DEEPSEEK_GGUF_GPU_PROFILE"):
+                print(f"gguf_decode_active_prefetch_fallback rank={rank} layer={self.layer_id} error={exc}", flush=True)
+            return 0
+
+    def _prefetch_gguf_decode_local_experts(self, device: torch.device, local_ids: list[int]) -> None:
+        if not local_ids or not self._has_gguf_raw_experts() or device.type != "cuda":
+            return
+        prepared = self._prefetch_gguf_decode_expert_ids(
+            device,
+            [int(local_id) + int(self.experts_start_idx) for local_id in local_ids],
+        )
+        if _env_enabled("DEEPSEEK_GGUF_GPU_PROFILE") and prepared:
+            for local_id in local_ids:
+                expert_id = int(local_id) + int(self.experts_start_idx)
+                if self.experts_start_idx <= expert_id < self.experts_end_idx:
+                    print(
+                        f"gguf_decode_cross_layer_prefetch rank={rank} layer={self.layer_id} local={int(local_id)} expert={expert_id}",
+                        flush=True,
+                    )
+
     def prefetch_cross_layer_gate_prediction(self, device: torch.device) -> None:
         if self._cross_layer_pred_prefetch_done or not _cross_layer_gate_prefetch_enabled():
             return
@@ -2620,7 +2845,6 @@ class MoE(nn.Module):
             return
         if (
             self._pd_active_phase() != "decode"
-            or not self.gpu_decode_active_moe_enabled
             or self.cpu_backend is None
             or self.experts_end_idx <= self.experts_start_idx
             or device.type != "cuda"
@@ -2640,10 +2864,21 @@ class MoE(nn.Module):
             if not picked:
                 self._cross_layer_pred_prefetch_done = True
                 return
+            if self._has_gguf_raw_experts() and self.gpu_gguf_decode_grouped_enabled:
+                self._prefetch_gguf_decode_local_experts(device, picked)
+                self._cross_layer_pred_prefetch_done = True
+                return
+            if not self.gpu_decode_active_moe_enabled:
+                return
             local_tensor = torch.tensor(picked, dtype=torch.long, device="cpu")
             backend = self._ensure_gpu_prefill_backend()
             backend._stage_local_experts(device, local_tensor, async_copy=True)
             self._cross_layer_pred_prefetch_done = True
+            return
+        if self._has_gguf_raw_experts():
+            self._cross_layer_pred_prefetch_done = True
+            return
+        if not self.gpu_decode_active_moe_enabled:
             return
         pred = pred_topk[:, :K].contiguous()
         if limit > 0:
@@ -2733,6 +2968,378 @@ class MoE(nn.Module):
             and x.is_cuda
             and x.shape[0] >= self.gpu_prefill_moe_min_tokens
         )
+
+    def _should_use_gpu_gguf_decode_active_expert(self, x: torch.Tensor) -> bool:
+        return (
+            self._has_gguf_raw_experts()
+            and self._pd_active_phase() == "decode"
+            and self.gpu_gguf_decode_active_expert_enabled
+            and self.cpu_backend is not None
+            and self.experts_end_idx > self.experts_start_idx
+            and x.is_cuda
+        )
+
+    def _should_use_gpu_gguf_decode_grouped(self, x: torch.Tensor) -> bool:
+        return (
+            self._has_gguf_raw_experts()
+            and self._pd_active_phase() == "decode"
+            and self.gpu_gguf_decode_grouped_enabled
+            and self.cpu_backend is not None
+            and self.experts_end_idx > self.experts_start_idx
+            and x.is_cuda
+        )
+
+    def _gguf_decode_slot_cache_get(
+        self,
+        reader,
+        local_ids_cpu: list[int],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int, str, int, str, int] | None:
+        if not self.gpu_gguf_decode_slot_cache_enabled or self.gpu_gguf_decode_slot_cache_size <= 0:
+            return None
+        if len(local_ids_cpu) > self.gpu_gguf_decode_slot_cache_size:
+            return None
+
+        def read_values(local_id: int):
+            expert_id = int(local_id) + int(self.experts_start_idx)
+            expert = self.experts[expert_id]
+            if expert is None or expert._gguf_raw_backing is None:
+                return None
+            w1 = expert._gguf_cuda_read_blocks(reader, expert._gguf_raw_backing.w1_name)
+            w3 = expert._gguf_cuda_read_blocks(reader, expert._gguf_raw_backing.w3_name)
+            w2 = expert._gguf_cuda_read_blocks(reader, expert._gguf_raw_backing.w2_name)
+            if w1 is None or w3 is None or w2 is None:
+                return None
+            return w1, w3, w2
+
+        first_values = None
+        meta = self._gguf_decode_slot_meta
+        if (
+            self._gguf_decode_slot_cache_device != device
+            or meta is None
+            or self._gguf_decode_slot_w1_blocks is None
+            or self._gguf_decode_slot_w3_blocks is None
+            or self._gguf_decode_slot_w2_blocks is None
+            or self._gguf_decode_slot_w1_blocks.size(0) != self.gpu_gguf_decode_slot_cache_size
+        ):
+            first_values = read_values(local_ids_cpu[0])
+            if first_values is None:
+                return None
+            w1_first, w3_first, w2_first = first_values
+            w1_type, w1_in_dim = w1_first[1], int(w1_first[2])
+            w3_type, w3_in_dim = w3_first[1], int(w3_first[2])
+            w2_type, w2_in_dim = w2_first[1], int(w2_first[2])
+            if w1_type != "iq2_xxs" or w3_type != "iq2_xxs" or w2_type != "q2_k":
+                return None
+            meta = (w1_type, w1_in_dim, w3_type, w3_in_dim, w2_type, w2_in_dim)
+            capacity = int(self.gpu_gguf_decode_slot_cache_size)
+            self._gguf_decode_slot_cache_device = device
+            self._gguf_decode_slot_cache.clear()
+            self._gguf_decode_slot_meta = meta
+            self._gguf_decode_slot_w1_blocks = torch.empty(
+                (capacity,) + tuple(w1_first[0].shape), device=device, dtype=w1_first[0].dtype
+            )
+            self._gguf_decode_slot_w3_blocks = torch.empty(
+                (capacity,) + tuple(w3_first[0].shape), device=device, dtype=w3_first[0].dtype
+            )
+            self._gguf_decode_slot_w2_blocks = torch.empty(
+                (capacity,) + tuple(w2_first[0].shape), device=device, dtype=w2_first[0].dtype
+            )
+        assert meta is not None
+        assert self._gguf_decode_slot_w1_blocks is not None
+        assert self._gguf_decode_slot_w3_blocks is not None
+        assert self._gguf_decode_slot_w2_blocks is not None
+        w1_type, w1_in_dim, w3_type, w3_in_dim, w2_type, w2_in_dim = meta
+        capacity = int(self.gpu_gguf_decode_slot_cache_size)
+        route_slot_values = []
+        for local_id in local_ids_cpu:
+            local_id = int(local_id)
+            slot = self._gguf_decode_slot_cache.pop(local_id, None)
+            if slot is None:
+                if len(self._gguf_decode_slot_cache) >= capacity:
+                    _evicted_local, slot = self._gguf_decode_slot_cache.popitem(last=False)
+                else:
+                    used_slots = set(self._gguf_decode_slot_cache.values())
+                    slot = next(idx for idx in range(capacity) if idx not in used_slots)
+                values = first_values if first_values is not None and local_id == int(local_ids_cpu[0]) else read_values(local_id)
+                if values is None:
+                    return None
+                w1_value, w3_value, w2_value = values
+                if (
+                    w1_value[1] != w1_type
+                    or int(w1_value[2]) != w1_in_dim
+                    or w3_value[1] != w3_type
+                    or int(w3_value[2]) != w3_in_dim
+                    or w2_value[1] != w2_type
+                    or int(w2_value[2]) != w2_in_dim
+                ):
+                    return None
+                self._gguf_decode_slot_w1_blocks[slot].copy_(w1_value[0])
+                self._gguf_decode_slot_w3_blocks[slot].copy_(w3_value[0])
+                self._gguf_decode_slot_w2_blocks[slot].copy_(w2_value[0])
+            self._gguf_decode_slot_cache[local_id] = int(slot)
+            route_slot_values.append(int(slot))
+        route_slots = torch.tensor(route_slot_values, device=device, dtype=torch.long)
+        return (
+            self._gguf_decode_slot_w1_blocks,
+            self._gguf_decode_slot_w3_blocks,
+            self._gguf_decode_slot_w2_blocks,
+            route_slots,
+            w1_type,
+            w1_in_dim,
+            w3_type,
+            w3_in_dim,
+            w2_type,
+            w2_in_dim,
+        )
+
+    def _forward_gguf_decode_grouped(self, x: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor) -> torch.Tensor | None:
+        cuda_mod = load_cuda_kernel()
+        if cuda_mod is None or not hasattr(cuda_mod, "gguf_moe_prefill_grouped_forward"):
+            return None
+        profile = self.gpu_gguf_decode_grouped_profile
+        t0 = time.perf_counter() if profile else 0.0
+        route_slots = None
+        compact_starts = None
+        use_cpu_single_route = x.shape[0] == 1 and not _env_enabled("DEEPSEEK_GGUF_GPU_DECODE_DEVICE_ROUTE")
+        local_ids = None
+        seg_starts = None
+        if use_cpu_single_route:
+            used_cpp_single_route = False
+            if hasattr(cuda_mod, "gguf_single_token_route_slots"):
+                try:
+                    grouped = cuda_mod.gguf_single_token_route_slots(
+                        indices.contiguous(),
+                        weights.contiguous().to(torch.float32),
+                        int(self.experts_start_idx),
+                        int(self.n_local_experts),
+                    )
+                    local_ids_cpu_tensor, route_tokens, route_weights, route_slots, compact_starts = grouped
+                    if local_ids_cpu_tensor.numel() == 0:
+                        return torch.zeros((x.shape[0], self.dim), device=x.device, dtype=torch.float32)
+                    local_ids_cpu = local_ids_cpu_tensor.to(torch.long).tolist()
+                    used_cpp_single_route = True
+                except Exception:
+                    used_cpp_single_route = False
+            if not used_cpp_single_route:
+                idx_cpu = indices[0].detach().cpu().to(torch.long).tolist()
+                routes_by_local: dict[int, list[int]] = {}
+                for route_pos, expert_id in enumerate(idx_cpu):
+                    if self.experts_start_idx <= int(expert_id) < self.experts_end_idx:
+                        routes_by_local.setdefault(int(expert_id) - int(self.experts_start_idx), []).append(route_pos)
+                local_ids_cpu = sorted(routes_by_local.keys())
+                if not local_ids_cpu:
+                    return torch.zeros((x.shape[0], self.dim), device=x.device, dtype=torch.float32)
+                route_positions = []
+                route_slot_values = []
+                seg_values = [0]
+                for slot, local_id in enumerate(local_ids_cpu):
+                    local_positions = routes_by_local[local_id]
+                    route_positions.extend(local_positions)
+                    route_slot_values.extend([slot] * len(local_positions))
+                    seg_values.append(len(route_positions))
+                route_tokens = torch.zeros((len(route_positions),), device=x.device, dtype=torch.long)
+                route_pos_tensor = torch.tensor(route_positions, device=x.device, dtype=torch.long)
+                route_weights = weights[0].to(torch.float32).index_select(0, route_pos_tensor)
+                route_slots = torch.tensor(route_slot_values, device=x.device, dtype=torch.long)
+                compact_starts = torch.tensor(seg_values, device=x.device, dtype=torch.int32)
+            if profile:
+                torch.cuda.synchronize(x.device)
+                t_group = t_ids = time.perf_counter()
+        else:
+            if not hasattr(cuda_mod, "moe_group_routes"):
+                return None
+            grouped = cuda_mod.moe_group_routes(
+                indices.contiguous(),
+                weights.contiguous().to(torch.float32),
+                int(self.experts_start_idx),
+                int(self.n_local_experts),
+            )
+            if profile:
+                torch.cuda.synchronize(x.device)
+                t_group = time.perf_counter()
+            if grouped is None:
+                return None
+            local_ids, route_tokens, route_weights, seg_starts = grouped
+            if local_ids.numel() == 0:
+                return torch.zeros((x.shape[0], self.dim), device=x.device, dtype=torch.float32)
+            local_ids_cpu = local_ids.detach().cpu().to(torch.long).tolist()
+            if route_slots is None and x.shape[0] == 1 and self.gpu_gguf_decode_single_token_enabled:
+                seg_i32 = seg_starts if seg_starts.dtype == torch.int32 else seg_starts.to(torch.int32)
+                route_slots = torch.repeat_interleave(torch.arange(local_ids.numel(), device=x.device, dtype=torch.long), (seg_i32[local_ids + 1] - seg_i32[local_ids]).to(torch.long))
+            if profile:
+                torch.cuda.synchronize(x.device)
+                t_ids = time.perf_counter()
+
+        try:
+            from src.gguf.tensor_reader import get_cached_gguf_tensor_reader
+
+            first_expert = next((expert for expert in self.experts if expert is not None and expert._gguf_raw_backing is not None), None)
+            if first_expert is None:
+                return None
+            reader = get_cached_gguf_tensor_reader(first_expert._gguf_raw_backing.gguf_path)
+            slot_cached = None
+            if route_slots is not None and self.gpu_gguf_decode_single_token_enabled:
+                slot_cached = self._gguf_decode_slot_cache_get(reader, local_ids_cpu, x.device)
+            if slot_cached is not None:
+                (
+                    w1_blocks,
+                    w3_blocks,
+                    w2_blocks,
+                    route_slots,
+                    w1_type,
+                    w1_in_dim,
+                    w3_type,
+                    w3_in_dim,
+                    w2_type,
+                    w2_in_dim,
+                ) = slot_cached
+            else:
+                w1_values = []
+                w3_values = []
+                w2_values = []
+                for local_id in local_ids_cpu:
+                    expert_id = int(local_id) + int(self.experts_start_idx)
+                    expert = self.experts[expert_id]
+                    if expert is None or expert._gguf_raw_backing is None:
+                        return None
+                    w1_packed = expert._gguf_cuda_get_blocks(reader, expert._gguf_raw_backing.w1_name, x.device)
+                    w3_packed = expert._gguf_cuda_get_blocks(reader, expert._gguf_raw_backing.w3_name, x.device)
+                    w2_packed = expert._gguf_cuda_get_blocks(reader, expert._gguf_raw_backing.w2_name, x.device)
+                    if w1_packed is None or w3_packed is None or w2_packed is None:
+                        return None
+                    w1_values.append(w1_packed)
+                    w3_values.append(w3_packed)
+                    w2_values.append(w2_packed)
+                w1_type = w1_values[0][1]
+                w3_type = w3_values[0][1]
+                w2_type = w2_values[0][1]
+                w1_in_dim = int(w1_values[0][2])
+                w3_in_dim = int(w3_values[0][2])
+                w2_in_dim = int(w2_values[0][2])
+                if any(v[1] != w1_type or int(v[2]) != w1_in_dim for v in w1_values):
+                    return None
+                if any(v[1] != w3_type or int(v[2]) != w3_in_dim for v in w3_values):
+                    return None
+                if any(v[1] != w2_type or int(v[2]) != w2_in_dim for v in w2_values):
+                    return None
+                w1_blocks = torch.stack([v[0] for v in w1_values], dim=0).contiguous()
+                w3_blocks = torch.stack([v[0] for v in w3_values], dim=0).contiguous()
+                w2_blocks = torch.stack([v[0] for v in w2_values], dim=0).contiguous()
+            if profile:
+                torch.cuda.synchronize(x.device)
+                t_fetch = time.perf_counter()
+                t_stack = t_fetch
+            if compact_starts is None:
+                seg_i32 = seg_starts if seg_starts.dtype == torch.int32 else seg_starts.to(torch.int32)
+                compact_starts = torch.cat([seg_i32[local_ids.to(seg_i32.device)], seg_i32[-1:]], dim=0).contiguous()
+            iq2_grid = first_expert._gguf_cuda_grid(x.device)
+            if (
+                route_slots is not None
+                and self.gpu_gguf_decode_single_token_enabled
+                and hasattr(cuda_mod, "gguf_moe_single_token_iq2_q2k_forward")
+                and w1_type == "iq2_xxs"
+                and w3_type == "iq2_xxs"
+                and w2_type == "q2_k"
+            ):
+                y = cuda_mod.gguf_moe_single_token_iq2_q2k_forward(
+                    x.contiguous(),
+                    route_slots,
+                    route_weights.contiguous(),
+                    w1_blocks,
+                    w3_blocks,
+                    w2_blocks,
+                    iq2_grid,
+                    float(self.cpu_backend._swiglu_limit),
+                )
+            else:
+                y = cuda_mod.gguf_moe_prefill_grouped_forward(
+                    x.contiguous(),
+                    route_tokens,
+                    route_weights.contiguous(),
+                    compact_starts,
+                    w1_blocks,
+                    w3_blocks,
+                    w2_blocks,
+                    w1_in_dim,
+                    0 if w1_type == "iq2_xxs" else 1,
+                    w3_in_dim,
+                    0 if w3_type == "iq2_xxs" else 1,
+                    w2_in_dim,
+                    0 if w2_type == "iq2_xxs" else 1,
+                    iq2_grid,
+                    float(self.cpu_backend._swiglu_limit),
+                )
+            if profile:
+                torch.cuda.synchronize(x.device)
+                t_kernel = time.perf_counter()
+                print(
+                    f"gguf_decode_grouped_profile layer={self.layer_id} rank={rank} "
+                    f"active={len(local_ids_cpu)} routes={int(route_tokens.numel())} "
+                    f"group={t_group - t0:.6f}s ids={t_ids - t_group:.6f}s fetch={t_fetch - t_ids:.6f}s "
+                    f"stack={t_stack - t_fetch:.6f}s kernel={t_kernel - t_stack:.6f}s total={t_kernel - t0:.6f}s",
+                    flush=True,
+                )
+            return y
+        except Exception as exc:
+            if _env_enabled("DEEPSEEK_GGUF_GPU_PROFILE"):
+                print(f"gguf_decode_grouped_fallback rank={rank} layer={self.layer_id} error={exc}", flush=True)
+            return None
+
+    def _forward_gguf_decode_active_expert(self, x: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        y = torch.zeros((x.shape[0], self.dim), device=x.device, dtype=torch.float32)
+        routes_by_expert: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+        for top_idx in range(indices.size(1)):
+            ids_col = indices[:, top_idx]
+            local_mask = (ids_col >= self.experts_start_idx) & (ids_col < self.experts_end_idx)
+            if not bool(local_mask.any().item()):
+                continue
+            rows = torch.nonzero(local_mask, as_tuple=False).flatten()
+            expert_ids = ids_col[rows]
+            sort_order = torch.argsort(expert_ids)
+            rows = rows[sort_order]
+            expert_ids = expert_ids[sort_order]
+            unique_ids, counts = torch.unique_consecutive(expert_ids, return_counts=True)
+            offset = 0
+            for expert_id, count in zip(unique_ids.tolist(), counts.tolist()):
+                group_rows = rows[offset:offset + count]
+                group_weights = weights[group_rows, top_idx:top_idx + 1].contiguous()
+                routes_by_expert.setdefault(int(expert_id), []).append((group_rows, group_weights))
+                offset += count
+        reader = None
+        try:
+            from src.gguf.tensor_reader import get_cached_gguf_tensor_reader
+            first_expert = next((expert for expert in self.experts if expert is not None and expert._gguf_raw_backing is not None), None)
+            if first_expert is not None:
+                reader = get_cached_gguf_tensor_reader(first_expert._gguf_raw_backing.gguf_path)
+        except Exception:
+            reader = None
+        for expert_id in sorted(routes_by_expert.keys()):
+            expert = self.experts[expert_id]
+            if expert is None:
+                continue
+            route_groups = routes_by_expert[expert_id]
+            group_rows = torch.cat([rows for rows, _weights in route_groups], dim=0)
+            group_x = x[group_rows].contiguous()
+            group_weights = torch.cat([weights_part for _rows, weights_part in route_groups], dim=0)
+            out = None
+            if reader is not None:
+                try:
+                    expert.prefetch_cuda_gguf(reader, x.device)
+                    out = expert.forward_cuda_gguf(group_x, group_weights)
+                except Exception:
+                    out = None
+                finally:
+                    if not self.gpu_gguf_decode_keep_cache:
+                        expert.clear_cuda_gguf_cache()
+            if out is None:
+                out = self.cpu_backend.dispatch_forward(
+                    group_x,
+                    group_rows.new_full((group_rows.numel(),), int(expert_id)),
+                    group_weights.view(-1).contiguous(),
+                ).to(device=x.device, dtype=torch.float32)
+            y.index_add_(0, group_rows, out.to(torch.float32))
+        return y
 
     def _should_use_gpu_decode_active_moe(self, x: torch.Tensor) -> bool:
         return (
@@ -2993,9 +3600,9 @@ class MoE(nn.Module):
                         iq2_grid = first_expert._gguf_cuda_grid(x.device)
                     else:
                         iq2_grid = torch.empty(0, dtype=torch.int8, device=x.device)
-                    w1_blocks = w1_layer[0][self.experts_start_idx:self.experts_end_idx]
-                    w3_blocks = w3_layer[0][self.experts_start_idx:self.experts_end_idx]
-                    w2_blocks = w2_layer[0][self.experts_start_idx:self.experts_end_idx]
+                    w1_blocks = w1_layer[0]
+                    w3_blocks = w3_layer[0]
+                    w2_blocks = w2_layer[0]
                     y = cuda_mod.gguf_moe_prefill_grouped_forward(
                         x.contiguous(),
                         route_tokens,
@@ -3052,6 +3659,8 @@ class MoE(nn.Module):
                     if reader is not None:
                         expert.prefetch_cuda_gguf(reader, x.device)
                     out = expert.forward_cuda_gguf(group_x, group_weights)
+                    if not self.gpu_gguf_prefill_active_keep_cache:
+                        expert.clear_cuda_gguf_cache()
                     if out is None:
                         out = self.cpu_backend.dispatch_forward(
                             group_x,
@@ -3087,9 +3696,9 @@ class MoE(nn.Module):
                         out = expert.forward_cuda_gguf_staged(
                             group_x,
                             group_weights,
-                            (w1_layer[0][expert_id], w1_layer[1], w1_layer[2]),
-                            (w3_layer[0][expert_id], w3_layer[1], w3_layer[2]),
-                            (w2_layer[0][expert_id], w2_layer[1], w2_layer[2]),
+                            (w1_layer[0][expert_id - self.experts_start_idx], w1_layer[1], w1_layer[2]),
+                            (w3_layer[0][expert_id - self.experts_start_idx], w3_layer[1], w3_layer[2]),
+                            (w2_layer[0][expert_id - self.experts_start_idx], w2_layer[1], w2_layer[2]),
                         )
                         if out is None:
                             out = self.cpu_backend.dispatch_forward(
@@ -3110,6 +3719,28 @@ class MoE(nn.Module):
                             group_weights.view(-1).contiguous(),
                         ).to(device=x.device, dtype=torch.float32)
                         y.index_add_(0, group_rows, out.to(torch.float32))
+            used_gpu_prefill_moe = True
+        elif self.routed_experts_device == "cpu" and self._should_use_gpu_gguf_decode_grouped(x):
+            if self.gpu_gguf_decode_active_prefetch_enabled:
+                self._prefetch_gguf_decode_expert_ids(x.device, indices.flatten().detach().to("cpu", dtype=torch.long).tolist())
+            if prefetch_next is not None and hasattr(prefetch_next, "ffn"):
+                prefetch_next.ffn.prefetch_cross_layer_gate_prediction(x.device)
+            if self.gpu_gguf_decode_overlap_shared_route and self._gguf_decode_shared_stream is not None:
+                shared_stream = self._gguf_decode_shared_stream
+                shared_stream.wait_stream(torch.cuda.current_stream(x.device))
+                with torch.cuda.stream(shared_stream):
+                    shared = self.shared_experts(x)
+                y = self._forward_gguf_decode_grouped(x, indices, weights)
+                torch.cuda.current_stream(x.device).wait_stream(shared_stream)
+            else:
+                shared = self.shared_experts(x)
+                y = self._forward_gguf_decode_grouped(x, indices, weights)
+            if y is None:
+                y = self._forward_gguf_decode_active_expert(x, indices, weights)
+            used_gpu_prefill_moe = True
+        elif self.routed_experts_device == "cpu" and self._should_use_gpu_gguf_decode_active_expert(x):
+            shared = self.shared_experts(x)
+            y = self._forward_gguf_decode_active_expert(x, indices, weights)
             used_gpu_prefill_moe = True
         elif self.routed_experts_device == "cpu" and self._should_use_gpu_spec_token2_moe(x):
             # Speculative verify mixed path: keep the first token on the normal

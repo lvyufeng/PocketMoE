@@ -2516,6 +2516,7 @@ class Expert(nn.Module):
 class MoE(nn.Module):
     _gguf_layer_cache_lru = OrderedDict()
     _gguf_max_cached_layers = int(os.getenv("DEEPSEEK_GGUF_GPU_PREFILL_MOE_MAX_CACHED_LAYERS", os.getenv("DEEPSEEK_GPU_PREFILL_MOE_MAX_CACHED_LAYERS", "3")))
+    _gguf_prefill_profile_count = 0
 
     """Mixture-of-Experts: gate routes each token to top-k routed experts + 1 shared expert.
     Experts are sharded across TP ranks; each rank handles n_routed_experts // tp_world_size experts."""
@@ -2647,6 +2648,7 @@ class MoE(nn.Module):
         self._gguf_layer_stage_event: torch.cuda.Event | None = None
         self._gguf_layer_stage_pending = False
         self._gguf_layer_stage_device: torch.device | None = None
+        self._gguf_layer_stage_profile = _env_enabled("DEEPSEEK_GGUF_LAYER_STAGE_PROFILE")
         self._gguf_decode_slot_cache_device: torch.device | None = None
         self._gguf_decode_slot_cache: "OrderedDict[int, int]" = OrderedDict()
         self._gguf_decode_slot_w1_blocks: torch.Tensor | None = None
@@ -2697,6 +2699,7 @@ class MoE(nn.Module):
         first_expert = next((expert for expert in self.experts if expert is not None and expert._gguf_raw_backing is not None), None)
         if first_expert is None:
             return
+
         from src.gguf.tensor_reader import get_cached_gguf_tensor_reader
 
         t0 = time.perf_counter() if self._gguf_layer_stage_profile else 0.0
@@ -2734,7 +2737,7 @@ class MoE(nn.Module):
         (w1_host, w1_type, w1_in_dim), (w3_host, w3_type, w3_in_dim), (w2_host, w2_type, w2_in_dim) = host_cache
         copy_stream = _get_gguf_gpu_prefill_copy_stream(device) if async_copy else torch.cuda.current_stream(device)
         current_stream = torch.cuda.current_stream(device)
-        if async_copy:
+        if async_copy and os.getenv("DEEPSEEK_GGUF_PREFILL_COPY_WAIT_CURRENT", "1").lower() not in {"0", "false", "no"}:
             copy_stream.wait_stream(current_stream)
         event = torch.cuda.Event()
         with torch.cuda.stream(copy_stream):
@@ -2761,7 +2764,8 @@ class MoE(nn.Module):
         if self._gguf_layer_stage_profile:
             print(
                 f"gguf_gpu_layer_stage layer={self.layer_id} rank={rank} async={int(async_copy)} "
-                f"bytes={(w1_host.numel() + w3_host.numel() + w2_host.numel()) / 1024 ** 2:.1f}MiB total={time.perf_counter() - t0:.4f}s",
+                f"bytes={(w1_host.numel() + w3_host.numel() + w2_host.numel()) / 1024 ** 2:.1f}MiB "
+                f"total={time.perf_counter() - t0:.4f}s",
                 flush=True,
             )
 
@@ -3539,9 +3543,24 @@ class MoE(nn.Module):
                 )
             used_gpu_prefill_moe = True
         elif self.routed_experts_device == "cpu" and self._should_use_gpu_gguf_prefill_moe(x):
+            gguf_prefill_profile = False
+            if _env_enabled("DEEPSEEK_GGUF_PREFILL_PROFILE"):
+                profile_limit = max(0, int(os.getenv("DEEPSEEK_GGUF_PREFILL_PROFILE_LIMIT", "64")))
+                profile_every = max(1, int(os.getenv("DEEPSEEK_GGUF_PREFILL_PROFILE_EVERY", "1")))
+                profile_index = MoE._gguf_prefill_profile_count
+                MoE._gguf_prefill_profile_count += 1
+                gguf_prefill_profile = profile_index < profile_limit and profile_index % profile_every == 0
+            if gguf_prefill_profile:
+                torch.cuda.synchronize(x.device)
+                t_gguf_start = time.perf_counter()
             shared = self.shared_experts(x)
+            if gguf_prefill_profile:
+                torch.cuda.synchronize(x.device)
+                t_gguf_shared = time.perf_counter()
             y = torch.zeros((x.shape[0], self.dim), device=x.device, dtype=torch.float32)
             grouped = None
+            grouped_routes = 0
+            expert_ids_order = []
             cuda_mod = load_cuda_kernel()
             if cuda_mod is not None and hasattr(cuda_mod, "moe_group_routes"):
                 grouped = cuda_mod.moe_group_routes(
@@ -3550,6 +3569,9 @@ class MoE(nn.Module):
                     int(self.experts_start_idx),
                     int(self.n_local_experts),
                 )
+            if gguf_prefill_profile:
+                torch.cuda.synchronize(x.device)
+                t_gguf_group = time.perf_counter()
             if grouped is None:
                 routes_by_expert: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = {}
                 for top_idx in range(indices.size(1)):
@@ -3572,8 +3594,14 @@ class MoE(nn.Module):
                         routes_by_expert.setdefault(int(expert_id), []).append((group_rows, group_weights))
                         offset += count
                 expert_ids_order = sorted(routes_by_expert.keys())
+                grouped_routes = sum(
+                    int(rows.numel())
+                    for route_groups in routes_by_expert.values()
+                    for rows, _weights in route_groups
+                )
             else:
                 _local_ids, route_tokens, route_weights, seg_starts = grouped
+                grouped_routes = int(route_tokens.numel())
                 if _local_ids.numel() == 0:
                     routes_by_expert = {}
                     expert_ids_order = []
@@ -3581,6 +3609,9 @@ class MoE(nn.Module):
                     routes_by_expert = {}
                     expert_ids_order = []
             staged_ready = False if self.gpu_gguf_prefill_active_expert_enabled else self.wait_gguf_gpu_prefill_moe(x.device)
+            if gguf_prefill_profile:
+                torch.cuda.synchronize(x.device)
+                t_gguf_stage = time.perf_counter()
             used_grouped_gguf = False
             if (
                 _env_enabled("DEEPSEEK_GGUF_GPU_GROUPED_MOE")
@@ -3719,6 +3750,17 @@ class MoE(nn.Module):
                             group_weights.view(-1).contiguous(),
                         ).to(device=x.device, dtype=torch.float32)
                         y.index_add_(0, group_rows, out.to(torch.float32))
+            if gguf_prefill_profile:
+                torch.cuda.synchronize(x.device)
+                t_gguf_done = time.perf_counter()
+                print(
+                    f"gguf_prefill_profile layer={self.layer_id} rank={rank} tokens={x.shape[0]} "
+                    f"routes={grouped_routes} experts={len(expert_ids_order)} staged={int(staged_ready)} grouped={int(used_grouped_gguf)} "
+                    f"shared={t_gguf_shared - t_gguf_start:.4f}s group={t_gguf_group - t_gguf_shared:.4f}s "
+                    f"stage={t_gguf_stage - t_gguf_group:.4f}s compute={t_gguf_done - t_gguf_stage:.4f}s "
+                    f"total={t_gguf_done - t_gguf_start:.4f}s",
+                    flush=True,
+                )
             used_gpu_prefill_moe = True
         elif self.routed_experts_device == "cpu" and self._should_use_gpu_gguf_decode_grouped(x):
             if self.gpu_gguf_decode_active_prefetch_enabled:
@@ -4626,6 +4668,11 @@ class Transformer(nn.Module):
             for layer in local_layers[:prefetch_window]
         )
         keep_staged_after_forward = os.getenv("DEEPSEEK_GGUF_GPU_PREFILL_MOE_KEEP_STAGED", "1").lower() not in {"0", "false", "no"}
+        release_staged_after_forward = (
+            gguf_prefetch_window
+            and not keep_staged_after_forward
+            and any(token_count >= getattr(layer.ffn, "gpu_prefill_moe_min_tokens", 64) for layer in local_layers)
+        )
         if gguf_prefetch_window:
             for layer in local_layers[:prefetch_window]:
                 layer.prefetch_gpu_prefill_moe(h.device, token_count)
@@ -4635,7 +4682,7 @@ class Transformer(nn.Module):
             prefetch_next = local_layers[layer_idx + 1] if layer_idx + 1 < len(local_layers) else None
             h = layer(h, start_pos, input_ids, prefetch_next=prefetch_next)
             if gguf_prefetch_window:
-                if not keep_staged_after_forward:
+                if release_staged_after_forward:
                     layer.release_gpu_prefill_moe_cache()
                 ahead_idx = layer_idx + prefetch_window
                 if ahead_idx < len(local_layers):

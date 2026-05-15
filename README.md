@@ -62,7 +62,7 @@ The runtime has validated 65,536-token prompts on this 4 x RTX 2080 Ti machine. 
 
 ### GGUF Q2 TP resident path
 
-The GGUF IQ2_XXS/Q2_K path is also supported through `scripts/run_gguf_q2_tp_resident.sh` with `PARTITION_POLICY=baseline_4gpu`. Its current default path enables grouped GPU prefill, IQ2_XXS W1/W3 DP4A expert-tile kernels, Q2_K W2 DP4A expert-tile kernels, active-expert decode, the decode slot cache, async all-reduce/fused finalize, and 4096-token prefill chunks. Routed GGUF expert weights remain CPU-resident and are staged to GPU as quantized blocks rather than expanded fp32 weights.
+The GGUF IQ2_XXS/Q2_K path is also supported through `scripts/run_gguf_q2_tp_resident.sh`. On 4 GPUs the script defaults to `PARTITION_POLICY=baseline_4gpu`, grouped GPU prefill, IQ2_XXS W1/W3 DP4A expert-tile kernels, Q2_K W2 DP4A expert-tile kernels, active-expert decode, the decode slot cache, async all-reduce/fused finalize, and 4096-token prefill chunks. Routed GGUF expert weights remain CPU-resident and are staged to GPU as quantized blocks rather than expanded fp32 weights.
 
 Resident OpenAI-compatible benchmark, no explicit warmup, `CASE=all REPEAT=2`, 4 x RTX 2080 Ti:
 
@@ -76,6 +76,8 @@ Resident OpenAI-compatible benchmark, no explicit warmup, `CASE=all REPEAT=2`, 4
 | `long_short` | 2 | 2,148 | 7 | 9.94s (216.17 tok/s) | 4.44 | 11.66s | Warm prefill staging; just below the 4.5 tok/s decode target. |
 | `long_long` | 1 | 2,148 | 63 | 10.01s (214.52 tok/s) | 3.71 | 27.29s | Longer decode remains below the short-decode target. |
 | `long_long` | 2 | 2,148 | 63 | 10.08s (213.05 tok/s) | 3.75 | 27.18s | Warm prefill does not fully fix long decode. |
+
+Single-GPU 2080 Ti + host-memory mode is also available by setting `NPROC_PER_NODE=1`; it is intended for smoke/demo use with very short prompts, not practical long-prompt serving. See [GGUF_Q2_SINGLE_GPU.md](GGUF_Q2_SINGLE_GPU.md) for run commands, memory usage, context limits, and benchmark results.
 
 Real HTTP `stream=true` SSE test with different realistic prompts and no warmup:
 

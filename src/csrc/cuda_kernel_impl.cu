@@ -19,6 +19,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <atomic>
 
 namespace {
 
@@ -39,6 +40,14 @@ struct CustomAllreduceHandle {
 std::mutex g_custom_allreduce_mutex;
 std::unordered_map<int64_t, CustomAllreduceHandle> g_custom_allreduce_handles;
 int64_t g_custom_allreduce_next_handle = 1;
+std::atomic<int> g_gguf_prefill_profile_count{0};
+
+int env_int_default(const char* name, int default_value) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return default_value;
+    return std::atoi(v);
+}
+
 
 int custom_dtype_code(at::ScalarType dtype) {
     if (dtype == at::kBFloat16) return 1;
@@ -6216,6 +6225,269 @@ __global__ void gguf_moe_w13_iq2_xxs_dp4a_kernel(
     }
 }
 
+__global__ void gguf_moe_w13_iq2_xxs_dp4a_expert_tile_kernel(
+    const int8_t* __restrict__ x_q,
+    const float* __restrict__ x_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ seg_starts,
+    const uint8_t* __restrict__ w1_blocks,
+    const uint8_t* __restrict__ w3_blocks,
+    const int8_t* __restrict__ signed_grid,
+    float* __restrict__ gate,
+    float* __restrict__ up,
+    int n_experts,
+    int dim,
+    int inter_dim,
+    int blocks_per_row,
+    int x_groups) {
+    constexpr int kRouteTile = 8;
+    const int expert = blockIdx.y;
+    const int route_tile = blockIdx.z;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int out_col = blockIdx.x * kGGUFQuantTileN + warp;
+    if (expert >= n_experts || warp >= kGGUFQuantTileN) return;
+
+    const int route_start = seg_starts[expert] + route_tile * kRouteTile;
+    const int route_end = seg_starts[expert + 1];
+    const int valid_rows = min(kRouteTile, route_end - route_start);
+    if (valid_rows <= 0) return;
+
+    __shared__ int x_shared_q[kRouteTile][64];
+    __shared__ float x_shared_scale[kRouteTile][8];
+
+    float acc1[kRouteTile];
+    float acc3[kRouteTile];
+    #pragma unroll
+    for (int r = 0; r < kRouteTile; ++r) {
+        acc1[r] = 0.0f;
+        acc3[r] = 0.0f;
+    }
+
+    const uint8_t* w1_row = w1_blocks + (static_cast<int64_t>(expert) * inter_dim + out_col) * blocks_per_row * 66;
+    const uint8_t* w3_row = w3_blocks + (static_cast<int64_t>(expert) * inter_dim + out_col) * blocks_per_row * 66;
+
+    for (int block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const int k_base = block_idx * 256;
+        const int tid = threadIdx.x;
+        #pragma unroll
+        for (int r = 0; r < kRouteTile; ++r) {
+            if (r < valid_rows) {
+                const int64_t token = route_tokens[route_start + r];
+                const int8_t* x_q_row = x_q + token * dim;
+                const float* x_scale_row = x_scale + token * x_groups;
+                if (tid < 64) {
+                    const int byte_off = tid * 4;
+                    int v = 0;
+                    if (k_base + byte_off + 4 <= dim) {
+                        v = *reinterpret_cast<const int*>(x_q_row + k_base + byte_off);
+                    }
+                    x_shared_q[r][tid] = v;
+                }
+                if (tid < 8) {
+                    const int sg_idx = block_idx * 8 + tid;
+                    x_shared_scale[r][tid] = sg_idx < x_groups ? x_scale_row[sg_idx] : 0.0f;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (out_col < inter_dim) {
+            const int sub = lane >> 2;
+            const int part = lane & 3;
+            const uint8_t* w1_block = w1_row + static_cast<int64_t>(block_idx) * 66;
+            const uint8_t* w3_block = w3_row + static_cast<int64_t>(block_idx) * 66;
+            const uint8_t* chunk1 = w1_block + 2 + sub * 8;
+            const uint8_t* chunk3 = w3_block + 2 + sub * 8;
+
+            const float d1 = gguf_block_scale_f16(w1_block);
+            const float d3 = gguf_block_scale_f16(w3_block);
+
+            const uint32_t aux1 = static_cast<uint32_t>(chunk1[4]) |
+                (static_cast<uint32_t>(chunk1[5]) << 8) |
+                (static_cast<uint32_t>(chunk1[6]) << 16) |
+                (static_cast<uint32_t>(chunk1[7]) << 24);
+            const uint32_t aux3 = static_cast<uint32_t>(chunk3[4]) |
+                (static_cast<uint32_t>(chunk3[5]) << 8) |
+                (static_cast<uint32_t>(chunk3[6]) << 16) |
+                (static_cast<uint32_t>(chunk3[7]) << 24);
+
+            const int grid_id1 = chunk1[part];
+            const int grid_id3 = chunk3[part];
+            const int sign_idx1 = static_cast<int>((aux1 >> (7 * part)) & 127);
+            const int sign_idx3 = static_cast<int>((aux3 >> (7 * part)) & 127);
+
+            const float s1 = 0.125f * d1 * static_cast<float>(2 * (aux1 >> 28) + 1);
+            const float s3 = 0.125f * d3 * static_cast<float>(2 * (aux3 >> 28) + 1);
+
+            const int8_t* vals1 = signed_grid + (grid_id1 * 128 + sign_idx1) * 8;
+            const int8_t* vals3 = signed_grid + (grid_id3 * 128 + sign_idx3) * 8;
+            const int v1_p0 = *reinterpret_cast<const int*>(vals1);
+            const int v1_p1 = *reinterpret_cast<const int*>(vals1 + 4);
+            const int v3_p0 = *reinterpret_cast<const int*>(vals3);
+            const int v3_p1 = *reinterpret_cast<const int*>(vals3 + 4);
+
+            const int xq_base = sub * 8 + part * 2;
+            #pragma unroll
+            for (int r = 0; r < kRouteTile; ++r) {
+                float local1 = 0.0f;
+                float local3 = 0.0f;
+                if (r < valid_rows) {
+                    const int x_p0 = x_shared_q[r][xq_base];
+                    const int x_p1 = x_shared_q[r][xq_base + 1];
+
+                    int sumi1 = __dp4a(v1_p0, x_p0, 0);
+                    sumi1 = __dp4a(v1_p1, x_p1, sumi1);
+                    int sumi3 = __dp4a(v3_p0, x_p0, 0);
+                    sumi3 = __dp4a(v3_p1, x_p1, sumi3);
+
+                    const float xs = x_shared_scale[r][sub];
+                    local1 = s1 * xs * static_cast<float>(sumi1);
+                    local3 = s3 * xs * static_cast<float>(sumi3);
+                }
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    local1 += __shfl_down_sync(0xffffffff, local1, offset);
+                    local3 += __shfl_down_sync(0xffffffff, local3, offset);
+                }
+                if (lane == 0) {
+                    acc1[r] += local1;
+                    acc3[r] += local3;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0 && out_col < inter_dim) {
+        #pragma unroll
+        for (int r = 0; r < kRouteTile; ++r) {
+            if (r < valid_rows) {
+                const int route = route_start + r;
+                gate[static_cast<int64_t>(route) * inter_dim + out_col] = acc1[r];
+                up[static_cast<int64_t>(route) * inter_dim + out_col] = acc3[r];
+            }
+        }
+    }
+}
+
+__global__ void gguf_moe_w13_iq2_xxs_dp4a_subwarp_kernel(
+    const int8_t* __restrict__ x_q,
+    const float* __restrict__ x_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ route_experts,
+    const uint8_t* __restrict__ w1_blocks,
+    const uint8_t* __restrict__ w3_blocks,
+    const int8_t* __restrict__ signed_grid,
+    float* __restrict__ gate,
+    float* __restrict__ up,
+    int routes,
+    int dim,
+    int inter_dim,
+    int blocks_per_row,
+    int x_groups) {
+    constexpr int kSubwarpCols = 8;
+    const int route = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int sub_col = lane >> 2;
+    const int part = lane & 3;
+    const int out_col = blockIdx.x * (kGGUFQuantTileN * kSubwarpCols) + warp * kSubwarpCols + sub_col;
+    if (route >= routes || warp >= kGGUFQuantTileN) return;
+
+    const int64_t token = route_tokens[route];
+    const int expert = route_experts[route];
+    const int8_t* x_q_row = x_q + token * dim;
+    const float* x_scale_row = x_scale + token * x_groups;
+
+    __shared__ int x_shared_q[64];
+    __shared__ float x_shared_scale[8];
+
+    const unsigned mask = 0x0fu << (sub_col * 4);
+    float acc1 = 0.0f;
+    float acc3 = 0.0f;
+
+    for (int block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const int k_base = block_idx * 256;
+        const int tid = threadIdx.x;
+        if (tid < 64) {
+            const int byte_off = tid * 4;
+            int v = 0;
+            if (k_base + byte_off + 4 <= dim) {
+                v = *reinterpret_cast<const int*>(x_q_row + k_base + byte_off);
+            }
+            x_shared_q[tid] = v;
+        }
+        if (tid < 8) {
+            const int sg_idx = block_idx * 8 + tid;
+            x_shared_scale[tid] = sg_idx < x_groups ? x_scale_row[sg_idx] : 0.0f;
+        }
+        __syncthreads();
+
+        if (out_col < inter_dim) {
+            const uint8_t* w1_row = w1_blocks + (static_cast<int64_t>(expert) * inter_dim + out_col) * blocks_per_row * 66;
+            const uint8_t* w3_row = w3_blocks + (static_cast<int64_t>(expert) * inter_dim + out_col) * blocks_per_row * 66;
+            const uint8_t* w1_block = w1_row + static_cast<int64_t>(block_idx) * 66;
+            const uint8_t* w3_block = w3_row + static_cast<int64_t>(block_idx) * 66;
+            const float d1 = gguf_block_scale_f16(w1_block);
+            const float d3 = gguf_block_scale_f16(w3_block);
+            const float s1_base = 0.125f * d1;
+            const float s3_base = 0.125f * d3;
+
+            #pragma unroll
+            for (int sub = 0; sub < 8; ++sub) {
+                const uint8_t* chunk1 = w1_block + 2 + sub * 8;
+                const uint8_t* chunk3 = w3_block + 2 + sub * 8;
+                const uint32_t aux1 = static_cast<uint32_t>(chunk1[4]) |
+                    (static_cast<uint32_t>(chunk1[5]) << 8) |
+                    (static_cast<uint32_t>(chunk1[6]) << 16) |
+                    (static_cast<uint32_t>(chunk1[7]) << 24);
+                const uint32_t aux3 = static_cast<uint32_t>(chunk3[4]) |
+                    (static_cast<uint32_t>(chunk3[5]) << 8) |
+                    (static_cast<uint32_t>(chunk3[6]) << 16) |
+                    (static_cast<uint32_t>(chunk3[7]) << 24);
+                const int grid_id1 = chunk1[part];
+                const int grid_id3 = chunk3[part];
+                const int sign_idx1 = static_cast<int>((aux1 >> (7 * part)) & 127);
+                const int sign_idx3 = static_cast<int>((aux3 >> (7 * part)) & 127);
+                const float s1 = s1_base * static_cast<float>(2 * (aux1 >> 28) + 1);
+                const float s3 = s3_base * static_cast<float>(2 * (aux3 >> 28) + 1);
+                const int8_t* vals1 = signed_grid + (grid_id1 * 128 + sign_idx1) * 8;
+                const int8_t* vals3 = signed_grid + (grid_id3 * 128 + sign_idx3) * 8;
+                const int v1_p0 = *reinterpret_cast<const int*>(vals1);
+                const int v1_p1 = *reinterpret_cast<const int*>(vals1 + 4);
+                const int v3_p0 = *reinterpret_cast<const int*>(vals3);
+                const int v3_p1 = *reinterpret_cast<const int*>(vals3 + 4);
+                const int xq_base = sub * 8 + part * 2;
+                const int x_p0 = x_shared_q[xq_base];
+                const int x_p1 = x_shared_q[xq_base + 1];
+                int sumi1 = __dp4a(v1_p0, x_p0, 0);
+                sumi1 = __dp4a(v1_p1, x_p1, sumi1);
+                int sumi3 = __dp4a(v3_p0, x_p0, 0);
+                sumi3 = __dp4a(v3_p1, x_p1, sumi3);
+                const float xs = x_shared_scale[sub];
+                float local1 = s1 * xs * static_cast<float>(sumi1);
+                float local3 = s3 * xs * static_cast<float>(sumi3);
+                #pragma unroll
+                for (int offset = 2; offset > 0; offset >>= 1) {
+                    local1 += __shfl_down_sync(mask, local1, offset);
+                    local3 += __shfl_down_sync(mask, local3, offset);
+                }
+                if (part == 0) {
+                    acc1 += local1;
+                    acc3 += local3;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (part == 0 && out_col < inter_dim) {
+        gate[static_cast<int64_t>(route) * inter_dim + out_col] = acc1;
+        up[static_cast<int64_t>(route) * inter_dim + out_col] = acc3;
+    }
+}
+
 __global__ void gguf_moe_w2_scatter_kernel(
     const float* __restrict__ hidden,
     const int64_t* __restrict__ route_tokens,
@@ -6387,6 +6659,171 @@ __global__ void gguf_moe_w2_scatter_q2k_dp4a_kernel(
 
     if (lane == 0) {
         atomicAdd(y + token * dim + out_col, acc);
+    }
+}
+
+__global__ void gguf_moe_w2_scatter_q2k_dp4a_subwarp_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ route_experts,
+    const uint8_t* __restrict__ w2_blocks,
+    float* __restrict__ y,
+    int routes,
+    int dim,
+    int inter_dim,
+    int w2_blocks_per_row,
+    int hidden_groups) {
+    constexpr int kSubwarpCols = 8;
+    const int route = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int sub = lane >> 2;
+    const int part = lane & 3;
+    const int out_col = blockIdx.x * (kGGUFQuantTileN * kSubwarpCols) + warp * kSubwarpCols + sub;
+    if (route >= routes || warp >= kGGUFQuantTileN || out_col >= dim) return;
+
+    const int64_t token = route_tokens[route];
+    const int expert = route_experts[route];
+    const int8_t* hidden_row = hidden_q + static_cast<int64_t>(route) * inter_dim;
+    const float* hs_row = hidden_scale + static_cast<int64_t>(route) * hidden_groups;
+    const uint8_t* w2_row = w2_blocks + (static_cast<int64_t>(expert) * dim + out_col) * w2_blocks_per_row * 84;
+    const unsigned mask = 0x0fu << (sub * 4);
+    float acc = 0.0f;
+
+    for (int block_idx = 0; block_idx < w2_blocks_per_row; ++block_idx) {
+        const uint8_t* block = w2_row + static_cast<int64_t>(block_idx) * 84;
+        const uint8_t* scales = block;
+        const uint8_t* qs = block + 16;
+        const float d = gguf_block_scale_f16(block + 80);
+        const float dmin = gguf_block_scale_f16(block + 82);
+        const int k_base = block_idx * 256;
+        for (int group = 0; group < 16; ++group) {
+            const int half_block = group >> 3;
+            const int group_in_half = group & 7;
+            const int shift = (group_in_half >> 1) * 2;
+            const int byte_start = half_block * 32 + (group_in_half & 1) * 16;
+            const int idx = part * 4;
+            const int q0 = static_cast<int>((qs[byte_start + idx + 0] >> shift) & 0x03);
+            const int q1 = static_cast<int>((qs[byte_start + idx + 1] >> shift) & 0x03);
+            const int q2 = static_cast<int>((qs[byte_start + idx + 2] >> shift) & 0x03);
+            const int q3 = static_cast<int>((qs[byte_start + idx + 3] >> shift) & 0x03);
+            const int w_pack = pack_i8x4(q0, q1, q2, q3);
+            const int h_idx = k_base + group * 16 + idx;
+            const int h_pack = pack_i8x4(
+                static_cast<int>(hidden_row[h_idx + 0]),
+                static_cast<int>(hidden_row[h_idx + 1]),
+                static_cast<int>(hidden_row[h_idx + 2]),
+                static_cast<int>(hidden_row[h_idx + 3]));
+            const int dot_q = __dp4a(w_pack, h_pack, 0);
+            const int sum_h = __dp4a(0x01010101, h_pack, 0);
+            const float qscale = d * static_cast<float>(scales[group] & 0x0f);
+            const float base = dmin * static_cast<float>(scales[group] >> 4);
+            float local = hs_row[block_idx * 16 + group] * (qscale * static_cast<float>(dot_q) - base * static_cast<float>(sum_h));
+            #pragma unroll
+            for (int offset = 2; offset > 0; offset >>= 1) {
+                local += __shfl_down_sync(mask, local, offset);
+            }
+            if (part == 0) acc += local;
+        }
+    }
+
+    if (part == 0) {
+        atomicAdd(y + token * dim + out_col, acc);
+    }
+}
+
+__global__ void gguf_moe_w2_scatter_q2k_dp4a_expert_tile_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ seg_starts,
+    const uint8_t* __restrict__ w2_blocks,
+    float* __restrict__ y,
+    int n_experts,
+    int dim,
+    int inter_dim,
+    int w2_blocks_per_row,
+    int hidden_groups) {
+    constexpr int kRouteTile = 8;
+    constexpr int kSubwarpCols = 8;
+    const int expert = blockIdx.y;
+    const int route_tile = blockIdx.z;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int sub = lane >> 2;
+    const int part = lane & 3;
+    const int out_col = blockIdx.x * (kGGUFQuantTileN * kSubwarpCols) + warp * kSubwarpCols + sub;
+    if (expert >= n_experts || warp >= kGGUFQuantTileN || out_col >= dim) return;
+
+    const int route_start = seg_starts[expert] + route_tile * kRouteTile;
+    const int route_end = seg_starts[expert + 1];
+    const int valid_rows = min(kRouteTile, route_end - route_start);
+    if (valid_rows <= 0) return;
+
+    const uint8_t* w2_row = w2_blocks + (static_cast<int64_t>(expert) * dim + out_col) * w2_blocks_per_row * 84;
+    const unsigned mask = 0x0fu << (sub * 4);
+    float acc[kRouteTile];
+    #pragma unroll
+    for (int r = 0; r < kRouteTile; ++r) {
+        acc[r] = 0.0f;
+    }
+
+    for (int block_idx = 0; block_idx < w2_blocks_per_row; ++block_idx) {
+        const uint8_t* block = w2_row + static_cast<int64_t>(block_idx) * 84;
+        const uint8_t* scales = block;
+        const uint8_t* qs = block + 16;
+        const float d = gguf_block_scale_f16(block + 80);
+        const float dmin = gguf_block_scale_f16(block + 82);
+        const int k_base = block_idx * 256;
+        for (int group = 0; group < 16; ++group) {
+            const int half_block = group >> 3;
+            const int group_in_half = group & 7;
+            const int shift = (group_in_half >> 1) * 2;
+            const int byte_start = half_block * 32 + (group_in_half & 1) * 16;
+            const int idx = part * 4;
+            const int q0 = static_cast<int>((qs[byte_start + idx + 0] >> shift) & 0x03);
+            const int q1 = static_cast<int>((qs[byte_start + idx + 1] >> shift) & 0x03);
+            const int q2 = static_cast<int>((qs[byte_start + idx + 2] >> shift) & 0x03);
+            const int q3 = static_cast<int>((qs[byte_start + idx + 3] >> shift) & 0x03);
+            const int w_pack = pack_i8x4(q0, q1, q2, q3);
+            const float qscale = d * static_cast<float>(scales[group] & 0x0f);
+            const float base = dmin * static_cast<float>(scales[group] >> 4);
+            const int h_idx = k_base + group * 16 + idx;
+            #pragma unroll
+            for (int r = 0; r < kRouteTile; ++r) {
+                float local = 0.0f;
+                if (r < valid_rows) {
+                    const int route = route_start + r;
+                    const int8_t* hidden_row = hidden_q + static_cast<int64_t>(route) * inter_dim;
+                    const float* hs_row = hidden_scale + static_cast<int64_t>(route) * hidden_groups;
+                    const int h_pack = pack_i8x4(
+                        static_cast<int>(hidden_row[h_idx + 0]),
+                        static_cast<int>(hidden_row[h_idx + 1]),
+                        static_cast<int>(hidden_row[h_idx + 2]),
+                        static_cast<int>(hidden_row[h_idx + 3]));
+                    const int dot_q = __dp4a(w_pack, h_pack, 0);
+                    const int sum_h = __dp4a(0x01010101, h_pack, 0);
+                    local = hs_row[block_idx * 16 + group] * (qscale * static_cast<float>(dot_q) - base * static_cast<float>(sum_h));
+                }
+                #pragma unroll
+                for (int offset = 2; offset > 0; offset >>= 1) {
+                    local += __shfl_down_sync(mask, local, offset);
+                }
+                if (part == 0) acc[r] += local;
+            }
+        }
+    }
+
+    if (part == 0) {
+        #pragma unroll
+        for (int r = 0; r < kRouteTile; ++r) {
+            if (r < valid_rows) {
+                const int route = route_start + r;
+                const int64_t token = route_tokens[route];
+                atomicAdd(y + token * dim + out_col, acc[r]);
+            }
+        }
     }
 }
 
@@ -6886,6 +7323,22 @@ torch::Tensor gguf_moe_prefill_grouped_forward_cuda(
         grid_ptr = grid_contig.data_ptr<int8_t>();
     }
 
+    const bool profile = env_enabled_explicit("DEEPSEEK_GGUF_PREFILL_KERNEL_PROFILE");
+    const int profile_limit = std::max(0, env_int_default("DEEPSEEK_GGUF_PREFILL_KERNEL_PROFILE_LIMIT", 256));
+    const int profile_index = profile ? g_gguf_prefill_profile_count.fetch_add(1) : 0;
+    const bool emit_profile = profile && profile_index < profile_limit;
+    cudaEvent_t ev_start = nullptr;
+    cudaEvent_t ev_w13 = nullptr;
+    cudaEvent_t ev_hidden = nullptr;
+    cudaEvent_t ev_w2 = nullptr;
+    if (emit_profile) {
+        check_cuda(cudaEventCreate(&ev_start), "create gguf prefill profile start event");
+        check_cuda(cudaEventCreate(&ev_w13), "create gguf prefill profile w13 event");
+        check_cuda(cudaEventCreate(&ev_hidden), "create gguf prefill profile hidden event");
+        check_cuda(cudaEventCreate(&ev_w2), "create gguf prefill profile w2 event");
+        check_cuda(cudaEventRecord(ev_start, at::cuda::getCurrentCUDAStream()), "record gguf prefill profile start event");
+    }
+
     auto gate = torch::empty({routes, inter_dim}, x.options().dtype(torch::kFloat32));
     auto up = torch::empty({routes, inter_dim}, x.options().dtype(torch::kFloat32));
     const dim3 w13_grid(ceil_div(inter_dim, kGGUFQuantTileN), routes);
@@ -6909,21 +7362,59 @@ torch::Tensor gguf_moe_prefill_grouped_forward_cuda(
                 dim);
         });
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-        gguf_moe_w13_iq2_xxs_dp4a_kernel<<<w13_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-            x_q.data_ptr<int8_t>(),
-            x_scale.data_ptr<float>(),
-            route_tokens_contig.data_ptr<int64_t>(),
-            route_experts.data_ptr<int32_t>(),
-            w1_contig.data_ptr<uint8_t>(),
-            w3_contig.data_ptr<uint8_t>(),
-            grid_ptr,
-            gate.data_ptr<float>(),
-            up.data_ptr<float>(),
-            routes,
-            dim,
-            inter_dim,
-            w1_blocks_per_row,
-            x_groups);
+        if (env_enabled_explicit("DEEPSEEK_GGUF_IQ2_XXS_W13_EXPERT_TILE")) {
+            auto counts_i32 = seg_i32.slice(0, 1, n_experts + 1) - seg_i32.slice(0, 0, n_experts);
+            const int max_count = counts_i32.max().item<int>();
+            const dim3 expert_tile_grid(ceil_div(inter_dim, kGGUFQuantTileN), n_experts, ceil_div(max_count, 8));
+            gguf_moe_w13_iq2_xxs_dp4a_expert_tile_kernel<<<expert_tile_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                x_q.data_ptr<int8_t>(),
+                x_scale.data_ptr<float>(),
+                route_tokens_contig.data_ptr<int64_t>(),
+                seg_i32.data_ptr<int32_t>(),
+                w1_contig.data_ptr<uint8_t>(),
+                w3_contig.data_ptr<uint8_t>(),
+                grid_ptr,
+                gate.data_ptr<float>(),
+                up.data_ptr<float>(),
+                n_experts,
+                dim,
+                inter_dim,
+                w1_blocks_per_row,
+                x_groups);
+        } else if (env_enabled_explicit("DEEPSEEK_GGUF_IQ2_XXS_W13_SUBWARP")) {
+            const dim3 subwarp_grid(ceil_div(inter_dim, kGGUFQuantTileN * 8), routes);
+            gguf_moe_w13_iq2_xxs_dp4a_subwarp_kernel<<<subwarp_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                x_q.data_ptr<int8_t>(),
+                x_scale.data_ptr<float>(),
+                route_tokens_contig.data_ptr<int64_t>(),
+                route_experts.data_ptr<int32_t>(),
+                w1_contig.data_ptr<uint8_t>(),
+                w3_contig.data_ptr<uint8_t>(),
+                grid_ptr,
+                gate.data_ptr<float>(),
+                up.data_ptr<float>(),
+                routes,
+                dim,
+                inter_dim,
+                w1_blocks_per_row,
+                x_groups);
+        } else {
+            gguf_moe_w13_iq2_xxs_dp4a_kernel<<<w13_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                x_q.data_ptr<int8_t>(),
+                x_scale.data_ptr<float>(),
+                route_tokens_contig.data_ptr<int64_t>(),
+                route_experts.data_ptr<int32_t>(),
+                w1_contig.data_ptr<uint8_t>(),
+                w3_contig.data_ptr<uint8_t>(),
+                grid_ptr,
+                gate.data_ptr<float>(),
+                up.data_ptr<float>(),
+                routes,
+                dim,
+                inter_dim,
+                w1_blocks_per_row,
+                x_groups);
+        }
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     } else {
         AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x_contig.scalar_type(), "gguf_moe_w13", [&] {
@@ -6946,6 +7437,9 @@ torch::Tensor gguf_moe_prefill_grouped_forward_cuda(
                 w3_block_bytes,
                 static_cast<int>(w3_type_id));
         });
+    }
+    if (emit_profile) {
+        check_cuda(cudaEventRecord(ev_w13, at::cuda::getCurrentCUDAStream()), "record gguf prefill profile w13 event");
     }
 
     const dim3 w2_grid(ceil_div(dim, kGGUFQuantTileN), routes);
@@ -6988,18 +7482,53 @@ torch::Tensor gguf_moe_prefill_grouped_forward_cuda(
                 inter_dim);
         }
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-        gguf_moe_w2_scatter_q2k_dp4a_kernel<<<w2_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-            hidden_q.data_ptr<int8_t>(),
-            hidden_scale.data_ptr<float>(),
-            route_tokens_contig.data_ptr<int64_t>(),
-            route_experts.data_ptr<int32_t>(),
-            w2_contig.data_ptr<uint8_t>(),
-            y.data_ptr<float>(),
-            routes,
-            dim,
-            inter_dim,
-            w2_blocks_per_row,
-            hidden_groups);
+        if (emit_profile) {
+            check_cuda(cudaEventRecord(ev_hidden, at::cuda::getCurrentCUDAStream()), "record gguf prefill profile hidden event");
+        }
+        if (env_enabled_explicit("DEEPSEEK_GGUF_Q2K_W2_EXPERT_TILE")) {
+            auto counts_i32 = seg_i32.slice(0, 1, n_experts + 1) - seg_i32.slice(0, 0, n_experts);
+            const int max_count = counts_i32.max().item<int>();
+            const dim3 expert_tile_grid(ceil_div(dim, kGGUFQuantTileN * 8), n_experts, ceil_div(max_count, 8));
+            gguf_moe_w2_scatter_q2k_dp4a_expert_tile_kernel<<<expert_tile_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                hidden_q.data_ptr<int8_t>(),
+                hidden_scale.data_ptr<float>(),
+                route_tokens_contig.data_ptr<int64_t>(),
+                seg_i32.data_ptr<int32_t>(),
+                w2_contig.data_ptr<uint8_t>(),
+                y.data_ptr<float>(),
+                n_experts,
+                dim,
+                inter_dim,
+                w2_blocks_per_row,
+                hidden_groups);
+        } else if (env_enabled_explicit("DEEPSEEK_GGUF_Q2K_W2_SUBWARP")) {
+            const dim3 subwarp_grid(ceil_div(dim, kGGUFQuantTileN * 8), routes);
+            gguf_moe_w2_scatter_q2k_dp4a_subwarp_kernel<<<subwarp_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                hidden_q.data_ptr<int8_t>(),
+                hidden_scale.data_ptr<float>(),
+                route_tokens_contig.data_ptr<int64_t>(),
+                route_experts.data_ptr<int32_t>(),
+                w2_contig.data_ptr<uint8_t>(),
+                y.data_ptr<float>(),
+                routes,
+                dim,
+                inter_dim,
+                w2_blocks_per_row,
+                hidden_groups);
+        } else {
+            gguf_moe_w2_scatter_q2k_dp4a_kernel<<<w2_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                hidden_q.data_ptr<int8_t>(),
+                hidden_scale.data_ptr<float>(),
+                route_tokens_contig.data_ptr<int64_t>(),
+                route_experts.data_ptr<int32_t>(),
+                w2_contig.data_ptr<uint8_t>(),
+                y.data_ptr<float>(),
+                routes,
+                dim,
+                inter_dim,
+                w2_blocks_per_row,
+                hidden_groups);
+        }
     } else {
         auto hidden = torch::empty({routes, inter_dim}, x.options().dtype(torch::kFloat32));
         const int hidden_threads = 256;
@@ -7012,6 +7541,9 @@ torch::Tensor gguf_moe_prefill_grouped_forward_cuda(
             routes,
             inter_dim,
             static_cast<float>(swiglu_limit));
+        if (emit_profile) {
+            check_cuda(cudaEventRecord(ev_hidden, at::cuda::getCurrentCUDAStream()), "record gguf prefill profile hidden event");
+        }
         gguf_moe_w2_scatter_kernel<<<w2_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
             hidden.data_ptr<float>(),
             route_tokens_contig.data_ptr<int64_t>(),
@@ -7027,6 +7559,37 @@ torch::Tensor gguf_moe_prefill_grouped_forward_cuda(
             static_cast<int>(w2_type_id));
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (emit_profile) {
+        check_cuda(cudaEventRecord(ev_w2, at::cuda::getCurrentCUDAStream()), "record gguf prefill profile w2 event");
+        check_cuda(cudaEventSynchronize(ev_w2), "synchronize gguf prefill profile w2 event");
+        float w13_ms = 0.0f;
+        float hidden_ms = 0.0f;
+        float w2_ms = 0.0f;
+        float total_ms = 0.0f;
+        check_cuda(cudaEventElapsedTime(&w13_ms, ev_start, ev_w13), "measure gguf prefill profile w13 time");
+        check_cuda(cudaEventElapsedTime(&hidden_ms, ev_w13, ev_hidden), "measure gguf prefill profile hidden time");
+        check_cuda(cudaEventElapsedTime(&w2_ms, ev_hidden, ev_w2), "measure gguf prefill profile w2 time");
+        check_cuda(cudaEventElapsedTime(&total_ms, ev_start, ev_w2), "measure gguf prefill profile total time");
+        std::printf(
+            "gguf_prefill_kernel_profile call=%d tokens=%d routes=%d experts=%d dim=%d inter=%d w13_dp4a=%d w2_dp4a=%d w13=%.4fms hidden=%.4fms w2=%.4fms total=%.4fms\n",
+            profile_index,
+            tokens,
+            routes,
+            n_experts,
+            dim,
+            inter_dim,
+            static_cast<int>(use_iq2_xxs_w13_dp4a),
+            static_cast<int>(use_q2k_w2_dp4a),
+            w13_ms,
+            hidden_ms,
+            w2_ms,
+            total_ms);
+        std::fflush(stdout);
+        cudaEventDestroy(ev_start);
+        cudaEventDestroy(ev_w13);
+        cudaEventDestroy(ev_hidden);
+        cudaEventDestroy(ev_w2);
+    }
     return y;
 }
 

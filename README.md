@@ -40,7 +40,7 @@ Memory and interconnect constraints:
 
 ## Current performance
 
-Best currently validated path:
+Best currently validated FP4 resident path:
 
 - Routed MoE expert weights live on CPU.
 - Decode uses active routed-expert H2D staging and GPU MoE compute.
@@ -50,7 +50,7 @@ Best currently validated path:
 - Logical PD scheduler is enabled.
 - OpenAI service uses the same default optimized environment as the best scheduler script.
 
-Representative benchmark results on this machine:
+Representative FP4 benchmark results on this machine:
 
 | Scenario | Prompt / prefill tokens | Decode tokens | Prefill | Decode TPS | Notes |
 | --- | ---: | ---: | ---: | ---: | --- |
@@ -59,6 +59,33 @@ Representative benchmark results on this machine:
 | Short prompt decode | 29 | 127 | ~1.7-3.2s observed | 3.16 tok/s mean | Earlier OpenAI short-prompt reference; short prefill timing is noisier than the long-prompt case. |
 
 The runtime has validated 65,536-token prompts on this 4 x RTX 2080 Ti machine. The server script keeps `MAX_MODEL_LEN=4096` by default for normal serving; set `MAX_MODEL_LEN=65536` explicitly when testing the maximum context path. Short prefill numbers are noisy on this machine, so compare decode TPS and long-prompt cases when evaluating optimization changes.
+
+### GGUF Q2 TP resident path
+
+The GGUF IQ2_XXS/Q2_K path is also supported through `scripts/run_gguf_q2_tp_resident.sh` with `PARTITION_POLICY=baseline_4gpu`. Its current default path enables grouped GPU prefill, IQ2_XXS W1/W3 DP4A expert-tile kernels, Q2_K W2 DP4A expert-tile kernels, active-expert decode, the decode slot cache, async all-reduce/fused finalize, and 4096-token prefill chunks. Routed GGUF expert weights remain CPU-resident and are staged to GPU as quantized blocks rather than expanded fp32 weights.
+
+Resident OpenAI-compatible benchmark, no explicit warmup, `CASE=all REPEAT=2`, 4 x RTX 2080 Ti:
+
+| Case | Request | Prompt tokens | Service decode tokens | Prefill | Decode TPS | Wall time | Notes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `short_short` | 1 | 5 | 7 | 3.17s (1.58 tok/s) | 2.94 | 5.64s | Cold decode cache. |
+| `short_short` | 2 | 5 | 7 | 2.46s (2.03 tok/s) | 4.83 | 3.98s | Warm slot/cache path; meets the 4.5 tok/s short-decode target. |
+| `short_long` | 1 | 5 | 9 | 2.46s (2.03 tok/s) | 4.49 | 4.53s | Near the decode target even cold. |
+| `short_long` | 2 | 5 | 9 | 2.46s (2.03 tok/s) | 4.89 | 4.37s | Warm slot/cache path. |
+| `long_short` | 1 | 2,148 | 7 | 14.17s (151.58 tok/s) | 3.26 | 16.47s | Cold long prefill / decode-cache path. |
+| `long_short` | 2 | 2,148 | 7 | 9.94s (216.17 tok/s) | 4.44 | 11.66s | Warm prefill staging; just below the 4.5 tok/s decode target. |
+| `long_long` | 1 | 2,148 | 63 | 10.01s (214.52 tok/s) | 3.71 | 27.29s | Longer decode remains below the short-decode target. |
+| `long_long` | 2 | 2,148 | 63 | 10.08s (213.05 tok/s) | 3.75 | 27.18s | Warm prefill does not fully fix long decode. |
+
+Real HTTP `stream=true` SSE test with different realistic prompts and no warmup:
+
+| Order | Prompt type | Prompt tokens | Service decode tokens | Client TTFC | Prefill | Decode TPS | Client wall time |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | Short Chinese chat | 33 | 95 | 7.52s | 7.45s (4.43 tok/s) | 3.93 | 31.94s |
+| 2 | README summary | 918 | 159 | 7.40s | 7.32s (125.41 tok/s) | 3.82 | 49.44s |
+| 3 | Long technical summary | 2,148 | 115 | 10.15s | 10.01s (214.64 tok/s) | 3.81 | 40.68s |
+
+Current GGUF Q2 conclusion: the prefill path is close to the best result reached by the current architecture for this checkpoint and hardware. Repeated or later requests become much faster in prefill/TTFC because the staged GGUF expert path and OS/GPU caches are hot, but decode remains limited by active-expert cache misses/H2D copies plus TP all-reduce/finalize and long-context attention cost. Short warm-cache decode can reach about 4.8 tok/s, while realistic heterogeneous streaming and long-output decode are typically about 3.7-3.9 tok/s. Further large gains likely require decode-side work such as better active-expert cache scheduling or reducing communication/copy cost, not more prefill kernel tuning.
 
 ## Quickstart
 

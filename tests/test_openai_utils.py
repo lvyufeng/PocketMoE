@@ -1,0 +1,182 @@
+import json
+
+from src.server.openai import (
+    _completion_response,
+    _make_payload,
+    _normalize_tool_calls,
+    _prepare_messages,
+    _StreamingDecoder,
+)
+
+
+def test_prepare_messages_preserves_tool_role_and_tool_choice_required():
+    body = {
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "weather?"}]},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "weather", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+            {"role": "user", "content": "summarize"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "weather", "parameters": {"type": "object"}}}],
+        "tool_choice": "required",
+    }
+    messages = _prepare_messages(body)
+    assert messages[0]["role"] == "system"
+    assert messages[0].get("tools") == body["tools"]
+    tool_msg = next(m for m in messages if m["role"] == "tool")
+    assert tool_msg["tool_call_id"] == "call_1"
+    assert "must call" in messages[-1]["content"]
+
+
+def test_builtin_web_search_auto_is_promoted_for_search_intent():
+    body = {
+        "messages": [{"role": "user", "content": "搜索一下特朗普访华"}],
+        "tools": [{"type": "function", "function": {"name": "builtin_web_search", "parameters": {"type": "object"}}}],
+        "tool_choice": "auto",
+    }
+    messages = _prepare_messages(body)
+    assert messages[0]["role"] == "system"
+    assert messages[0].get("tools") == body["tools"]
+    assert "must call the tool named builtin_web_search" in messages[-1]["content"]
+
+
+
+def test_auto_tools_are_attached_for_plain_chat():
+    body = {
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [{"type": "function", "function": {"name": "builtin_web_search", "parameters": {"type": "object"}}}],
+        "tool_choice": "auto",
+    }
+    messages = _prepare_messages(body)
+    assert messages[0]["role"] == "system"
+    assert messages[0].get("tools") == body["tools"]
+
+
+
+def test_tool_choice_none_does_not_attach_tools():
+    body = {
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [{"type": "function", "function": {"name": "noop"}}],
+        "tool_choice": "none",
+    }
+    messages = _prepare_messages(body)
+    assert "tools" not in messages[0]
+    assert "Do not call" in messages[0]["content"]
+
+
+def test_make_payload_accepts_common_openai_params():
+    payload = _make_payload({
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_completion_tokens": 7,
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "top_k": 40,
+        "frequency_penalty": 0.1,
+        "presence_penalty": 0.2,
+        "repetition_penalty": 1.1,
+        "seed": 123,
+        "stop": ["END"],
+        "n": 2,
+        "logprobs": True,
+        "top_logprobs": 3,
+        "parallel_tool_calls": False,
+        "user": "u",
+    })
+    assert payload["max_tokens"] == 7
+    assert payload["n"] == 2
+    assert payload["stop"] == ["END"]
+    assert payload["parallel_tool_calls"] is False
+    assert payload["generation_options"]["top_p"] == 0.9
+    assert payload["generation_options"]["top_k"] == 40
+    assert payload["generation_options"]["seed"] == 123
+    assert payload["generation_options"]["logprobs"] is True
+
+
+def test_normalize_tool_calls_adds_ids_and_openai_shape():
+    calls = _normalize_tool_calls([{"type": "function", "function": {"name": "weather", "arguments": {"city": "sh"}}}])
+    assert len(calls) == 1
+    assert calls[0]["id"].startswith("call_")
+    assert calls[0]["type"] == "function"
+    assert calls[0]["function"]["name"] == "weather"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"city": "sh"}
+
+
+def test_completion_response_includes_logprobs():
+    runtime = {"model_id": "m"}
+    payload = {"request_id": "chatcmpl_x", "top_logprobs": 1}
+    result = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "content": "A",
+        "reasoning_content": "",
+        "tool_calls": [],
+        "finish_reason": "stop",
+        "token_texts": ["A"],
+        "token_logprobs": [-0.2],
+        "top_logprobs": [[{"token": "A", "logprob": -0.2}]],
+        "timings": {},
+    }
+    response = _completion_response(runtime, payload, result)
+    logprobs = response["choices"][0]["logprobs"]["content"]
+    assert logprobs[0]["token"] == "A"
+    assert logprobs[0]["top_logprobs"][0]["logprob"] == -0.2
+
+
+
+def test_completion_response_multiple_choices_and_tool_finish():
+    runtime = {"model_id": "m"}
+    payload = {"request_id": "chatcmpl_x", "top_logprobs": None}
+    result = [
+        {
+            "prompt_tokens": 3,
+            "completion_tokens": 2,
+            "content": "",
+            "reasoning_content": "",
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "weather", "arguments": "{}"}}],
+            "finish_reason": "tool_calls",
+            "timings": {"prefill_time": 1.0},
+        },
+        {
+            "prompt_tokens": 3,
+            "completion_tokens": 4,
+            "content": "ok",
+            "reasoning_content": "",
+            "tool_calls": [],
+            "finish_reason": "stop",
+            "timings": {"prefill_time": 1.0},
+        },
+    ]
+    response = _completion_response(runtime, payload, result)
+    assert len(response["choices"]) == 2
+    assert response["choices"][0]["finish_reason"] == "tool_calls"
+    assert response["choices"][0]["message"]["tool_calls"][0]["id"] == "call_1"
+    assert response["usage"]["completion_tokens"] == 6
+
+
+class _CharTokenizer:
+    eos_token_id = 0
+
+    def __init__(self):
+        self._table: dict[int, str] = {}
+
+    def add(self, text: str) -> int:
+        token_id = len(self._table) + 1
+        self._table[token_id] = text
+        return token_id
+
+    def decode(self, token_ids):
+        return "".join(self._table.get(int(t), "") for t in token_ids)
+
+
+def test_streaming_decoder_hides_dsml_tool_call_prefix():
+    from src.encoding.dsv4 import dsml_token
+
+    tokenizer = _CharTokenizer()
+    chunks = ["hi", "\n", "\n", "<", dsml_token, "tool", "_calls", ">"]
+    chunk_ids = [tokenizer.add(c) for c in chunks]
+    decoder = _StreamingDecoder(tokenizer, "no_thinking")
+    visible = ""
+    for tid in chunk_ids:
+        for delta in decoder.append([tid]):
+            visible += delta.get("content", "")
+    assert visible == "hi"

@@ -8,6 +8,7 @@ from argparse import ArgumentParser
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import urlparse
 
 
 def _set_best_env_defaults() -> None:
@@ -69,7 +70,7 @@ from src.runtime.pd_scheduler import PDExecutionFacade, PDScheduler
 from src.server.engine import DeepSeekServingEngine
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-from src.encoding.dsv4 import encode_messages, eos_token, parse_message_from_completion_text  # noqa: E402
+from src.encoding.dsv4 import dsml_token, encode_messages, eos_token, parse_message_from_completion_text  # noqa: E402
 
 
 DEFAULT_MODEL_ID = "deepseek-v4-flash-w8a8"
@@ -193,6 +194,10 @@ def _init_runtime(args):
     }
 
 
+def _openai_error(message: str, error_type: str = "invalid_request_error", param: str | None = None, code: str | None = None) -> dict[str, Any]:
+    return {"error": {"message": message, "type": error_type, "param": param, "code": code}}
+
+
 def _normalize_content(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -202,7 +207,7 @@ def _normalize_content(content: Any) -> str:
             if isinstance(block, dict) and block.get("type") == "text":
                 parts.append(str(block.get("text", "")))
             elif isinstance(block, dict):
-                parts.append(f"[Unsupported {block.get('type', 'content')}]" )
+                parts.append(f"[Unsupported {block.get('type', 'content')}]")
             else:
                 parts.append(str(block))
         return "\n".join(parts)
@@ -211,25 +216,104 @@ def _normalize_content(content: Any) -> str:
     return str(content)
 
 
+def _tool_names(tools: Any) -> set[str]:
+    names: set[str] = set()
+    if not isinstance(tools, list):
+        return names
+    for tool in tools:
+        if isinstance(tool, dict) and tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+            name = tool["function"].get("name")
+            if isinstance(name, str):
+                names.add(name)
+    return names
+
+
+def _looks_like_web_search_request(text: str) -> bool:
+    stripped = text.strip()
+    lowered = stripped.lower()
+    if not stripped:
+        return False
+    if len(stripped) <= 12 and not any(ch in stripped for ch in "搜索联网查询查最新新闻今天现在实时"):
+        return False
+    prefixes = (
+        "联网搜索", "联网查", "搜索", "搜一下", "帮我搜", "查一下", "查询",
+        "please search", "search for", "web search",
+    )
+    triggers = ("联网", "搜索", "查询", "查一下", "最新", "新闻", "今天", "现在", "实时", "latest", "news", "current", "today", "search", "web")
+    return any(lowered.startswith(prefix.lower()) for prefix in prefixes) or any(trigger in lowered for trigger in triggers)
+
+
+def _last_user_content(messages: list[dict[str, Any]]) -> str:
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            return _normalize_content(msg.get("content", ""))
+    return ""
+
+
+def _tool_choice_instruction(tool_choice: Any, tools: Any) -> tuple[bool, str | None]:
+    if tool_choice is None or tool_choice == "auto":
+        names = _tool_names(tools)
+        return True, None
+    if tool_choice == "none":
+        return False, "Do not call any tools. Answer directly."
+    if tool_choice == "required":
+        return True, "You must call at least one available tool if the user request can be answered with a tool."
+    if isinstance(tool_choice, dict):
+        if tool_choice.get("type") != "function" or not isinstance(tool_choice.get("function"), dict):
+            raise ValueError("tool_choice object must be {type:'function', function:{name:'...'}}")
+        name = tool_choice["function"].get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("tool_choice.function.name must be a non-empty string")
+        names = _tool_names(tools)
+        if names and name not in names:
+            raise ValueError(f"tool_choice references unknown tool: {name}")
+        return True, f"You must call the tool named {name}. Do not call any other tool."
+    raise ValueError("tool_choice must be 'auto', 'none', 'required', or a function choice object")
+
+
 def _prepare_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
-    messages = []
-    for msg in body.get("messages", []):
-        copied = dict(msg)
-        if "content" in copied:
-            copied["content"] = _normalize_content(copied["content"])
-        messages.append(copied)
-    if not messages:
+    raw_messages = body.get("messages", [])
+    if not isinstance(raw_messages, list) or not raw_messages:
         raise ValueError("messages must be a non-empty list")
-    attach_idx = None
+    messages = []
+    for msg in raw_messages:
+        if not isinstance(msg, dict):
+            raise ValueError("each message must be an object")
+        copied = dict(msg)
+        role = copied.get("role")
+        if "content" in copied and role != "tool":
+            copied["content"] = _normalize_content(copied["content"])
+        elif role == "tool" and isinstance(copied.get("content"), list):
+            copied["content"] = _normalize_content(copied.get("content"))
+        messages.append(copied)
+    tools = body.get("tools")
+    tool_choice = body.get("tool_choice")
+    if tool_choice in {None, "auto"} and "builtin_web_search" in _tool_names(tools) and _looks_like_web_search_request(_last_user_content(messages)):
+        tool_choice = {"type": "function", "function": {"name": "builtin_web_search"}}
+    attach_tools, instruction = _tool_choice_instruction(tool_choice, tools)
+    if instruction is None and tool_choice in {None, "auto"} and "builtin_web_search" in _tool_names(tools) and _looks_like_web_search_request(_last_user_content(messages)):
+        instruction = "You must call builtin_web_search before answering. Use the prepared search query from the tool description. Do not answer from memory."
+    tool_attach_idx = None
+    for idx, msg in enumerate(messages):
+        if msg.get("role") in {"system", "developer"}:
+            tool_attach_idx = idx
+            break
+    if tools is not None and attach_tools and tool_attach_idx is None:
+        messages.insert(0, {"role": "system", "content": ""})
+        tool_attach_idx = 0
+    last_user_idx = None
     for idx in range(len(messages) - 1, -1, -1):
         if messages[idx].get("role") in {"user", "developer", "system"}:
-            attach_idx = idx
+            last_user_idx = idx
             break
-    if attach_idx is not None:
-        if body.get("tools") is not None:
-            messages[attach_idx]["tools"] = body["tools"]
+    if tools is not None and attach_tools and tool_attach_idx is not None:
+        messages[tool_attach_idx]["tools"] = tools
+    if last_user_idx is not None:
         if body.get("response_format") is not None:
-            messages[attach_idx]["response_format"] = body["response_format"]
+            messages[last_user_idx]["response_format"] = body["response_format"]
+        if instruction:
+            content = messages[last_user_idx].get("content") or ""
+            messages[last_user_idx]["content"] = f"{content}\n\n{instruction}" if content else instruction
     return messages
 
 
@@ -270,7 +354,68 @@ def _timing_metrics(prefill_time: float, decode_time: float, prefill_tokens: int
     }
 
 
-def _format_completion_result(tokenizer, thinking_mode: str, prompt_ids: list[int], completion_ids: list[int], prefill_time: float, decode_time: float, prefill_tokens: int, decode_tokens: int) -> dict[str, Any]:
+def _normalize_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
+    normalized = []
+    if not isinstance(tool_calls, list):
+        return normalized
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            continue
+        function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+        name = function.get("name") or tool_call.get("name")
+        arguments = function.get("arguments", tool_call.get("arguments", "{}"))
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        if not name:
+            continue
+        normalized.append({
+            "id": tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": str(name), "arguments": arguments},
+        })
+    return normalized
+
+
+def _stop_strings(stop: Any) -> list[str]:
+    if isinstance(stop, str):
+        return [stop]
+    if isinstance(stop, list):
+        return [s for s in stop if isinstance(s, str) and s]
+    return []
+
+
+def _apply_stop_to_result(result: dict[str, Any], stop: Any) -> None:
+    stops = _stop_strings(stop)
+    if not stops:
+        return
+    content = result.get("content") or ""
+    earliest = None
+    for item in stops:
+        pos = content.find(item)
+        if pos >= 0 and (earliest is None or pos < earliest):
+            earliest = pos
+    if earliest is not None:
+        result["content"] = content[:earliest]
+        result["finish_reason"] = "stop"
+
+
+def _format_logprobs(tokenizer, rows: list[dict] | None) -> tuple[list[str], list[float], list[list[dict[str, Any]]]]:
+    token_texts: list[str] = []
+    token_logprobs: list[float] = []
+    top_rows: list[list[dict[str, Any]]] = []
+    for row in rows or []:
+        token_id = int(row["token_id"])
+        text = tokenizer.decode([token_id])
+        token_texts.append(text)
+        token_logprobs.append(float(row["logprob"]))
+        top_rows.append([
+            {"token": tokenizer.decode([int(candidate["token_id"])]), "logprob": float(candidate["logprob"])}
+            for candidate in row.get("top_logprobs", [])
+        ])
+    return token_texts, token_logprobs, top_rows
+
+
+def _format_completion_result(tokenizer, thinking_mode: str, prompt_ids: list[int], completion_ids: list[int], prefill_time: float, decode_time: float, prefill_tokens: int, decode_tokens: int, stop: Any = None, max_tokens: int | None = None, logprobs: list[dict] | None = None) -> dict[str, Any]:
     completion_text = tokenizer.decode(completion_ids)
     try:
         assistant_msg = parse_message_from_completion_text(completion_text, thinking_mode)
@@ -283,15 +428,26 @@ def _format_completion_result(tokenizer, thinking_mode: str, prompt_ids: list[in
         }
     content = assistant_msg.get("content") or ""
     reasoning = assistant_msg.get("reasoning_content") or ""
-    tool_calls = assistant_msg.get("tool_calls") or []
-    return {
+    tool_calls = _normalize_tool_calls(assistant_msg.get("tool_calls") or [])
+    finish_reason = "tool_calls" if tool_calls else "stop"
+    if max_tokens is not None and len(completion_ids) >= int(max_tokens) and not tool_calls:
+        finish_reason = "length"
+    result = {
         "prompt_tokens": len(prompt_ids),
         "completion_tokens": len(completion_ids),
         "content": content,
         "reasoning_content": reasoning,
         "tool_calls": tool_calls,
+        "finish_reason": finish_reason,
         "timings": _timing_metrics(prefill_time, decode_time, prefill_tokens, decode_tokens),
     }
+    if logprobs is not None:
+        token_texts, token_logprobs, top_rows = _format_logprobs(tokenizer, logprobs)
+        result["token_texts"] = token_texts
+        result["token_logprobs"] = token_logprobs
+        result["top_logprobs"] = top_rows
+    _apply_stop_to_result(result, stop)
+    return result
 
 
 def _run_payload(runtime: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | list[dict[str, Any]]:
@@ -311,13 +467,20 @@ def _run_payload(runtime: dict[str, Any], payload: dict[str, Any]) -> dict[str, 
             raise RuntimeError("batched non-stream requests must use the same max_tokens in the first serving engine version")
         max_tokens = max_tokens_list[0]
         temperature = float(payload.get("temperature", 0.0) or 0.0)
-        completion_tokens, prefill_time, decode_time, prefill_tokens, decode_tokens = executor.run(
+        generation_options = payload.get("generation_options") or {}
+        completion_result = executor.run(
             model,
             prompt_ids_list,
             max_tokens,
             tokenizer.eos_token_id,
             temperature,
+            generation_options=generation_options,
         )
+        if len(completion_result) == 6:
+            completion_tokens, prefill_time, decode_time, prefill_tokens, decode_tokens, batch_logprobs = completion_result
+        else:
+            completion_tokens, prefill_time, decode_time, prefill_tokens, decode_tokens = completion_result
+            batch_logprobs = [None] * len(prompt_ids_list)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         return [
@@ -330,6 +493,9 @@ def _run_payload(runtime: dict[str, Any], payload: dict[str, Any]) -> dict[str, 
                 decode_time,
                 prefill_tokens,
                 decode_tokens,
+                stop=payload.get("stop"),
+                max_tokens=max_tokens,
+                logprobs=batch_logprobs[i] if batch_logprobs else None,
             )
             for i in range(len(prompt_ids_list))
         ]
@@ -345,31 +511,117 @@ def _run_payload(runtime: dict[str, Any], payload: dict[str, Any]) -> dict[str, 
         prompt_ids = [int(t) for t in prompt_ids]
     max_tokens = int(payload.get("max_tokens") or 512)
     temperature = float(payload.get("temperature", 0.0) or 0.0)
-    completion_tokens, prefill_time, decode_time, prefill_tokens, decode_tokens = executor.run(
+    n = int(payload.get("n", 1) or 1)
+    prompt_batch = [prompt_ids for _ in range(n)]
+    generation_options = payload.get("generation_options") or {}
+    completion_result = executor.run(
         model,
-        [prompt_ids],
+        prompt_batch,
         max_tokens,
         tokenizer.eos_token_id,
         temperature,
+        generation_options=generation_options,
     )
+    if len(completion_result) == 6:
+        completion_tokens, prefill_time, decode_time, prefill_tokens, decode_tokens, batch_logprobs = completion_result
+    else:
+        completion_tokens, prefill_time, decode_time, prefill_tokens, decode_tokens = completion_result
+        batch_logprobs = [None] * n
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    completion_ids = completion_tokens[0]
-    return _format_completion_result(tokenizer, thinking_mode, prompt_ids, completion_ids, prefill_time, decode_time, prefill_tokens, decode_tokens)
+    if n == 1:
+        completion_ids = completion_tokens[0]
+        return _format_completion_result(
+            tokenizer,
+            thinking_mode,
+            prompt_ids,
+            completion_ids,
+            prefill_time,
+            decode_time,
+            prefill_tokens,
+            decode_tokens,
+            stop=payload.get("stop"),
+            max_tokens=max_tokens,
+            logprobs=batch_logprobs[0] if batch_logprobs else None,
+        )
+    return [
+        _format_completion_result(
+            tokenizer,
+            thinking_mode,
+            prompt_ids,
+            completion_tokens[i],
+            prefill_time,
+            decode_time,
+            prefill_tokens,
+            decode_tokens,
+            stop=payload.get("stop"),
+            max_tokens=max_tokens,
+            logprobs=batch_logprobs[i] if batch_logprobs else None,
+        )
+        for i in range(n)
+    ]
+
+
+def _int_param(body: dict[str, Any], key: str, default: int | None = None) -> int | None:
+    value = body.get(key, default)
+    if value is None:
+        return None
+    return int(value)
+
+
+def _float_param(body: dict[str, Any], key: str, default: float | None = None) -> float | None:
+    value = body.get(key, default)
+    if value is None:
+        return None
+    return float(value)
 
 
 def _make_payload(body: dict[str, Any]) -> dict[str, Any]:
     thinking_mode, reasoning_effort = _thinking_config(body)
     max_tokens = body.get("max_tokens", body.get("max_completion_tokens", 512))
+    n = int(body.get("n", 1) or 1)
+    stream = bool(body.get("stream", False))
+    if n < 1:
+        raise ValueError("n must be >= 1")
+    if stream and n != 1:
+        raise ValueError("streaming currently supports n=1")
+    if stream and body.get("logprobs"):
+        raise ValueError("streaming logprobs are not supported")
     return {
         "op": "chat_completion",
         "request_id": f"chatcmpl-{uuid.uuid4().hex}",
         "messages": _prepare_messages(body),
         "max_tokens": int(max_tokens or 512),
         "temperature": float(body.get("temperature", 0.0) or 0.0),
+        "top_p": _float_param(body, "top_p"),
+        "top_k": _int_param(body, "top_k"),
+        "min_p": _float_param(body, "min_p"),
+        "frequency_penalty": _float_param(body, "frequency_penalty", 0.0),
+        "presence_penalty": _float_param(body, "presence_penalty", 0.0),
+        "repetition_penalty": _float_param(body, "repetition_penalty", 1.0),
+        "seed": _int_param(body, "seed"),
+        "stop": body.get("stop"),
+        "logprobs": bool(body.get("logprobs", False)),
+        "top_logprobs": _int_param(body, "top_logprobs"),
+        "n": n,
+        "generation_options": {
+            "top_p": _float_param(body, "top_p"),
+            "top_k": _int_param(body, "top_k"),
+            "min_p": _float_param(body, "min_p"),
+            "frequency_penalty": _float_param(body, "frequency_penalty", 0.0),
+            "presence_penalty": _float_param(body, "presence_penalty", 0.0),
+            "repetition_penalty": _float_param(body, "repetition_penalty", 1.0),
+            "seed": _int_param(body, "seed"),
+            "logprobs": bool(body.get("logprobs", False)),
+            "top_logprobs": _int_param(body, "top_logprobs"),
+        },
+        "tool_choice": body.get("tool_choice"),
+        "parallel_tool_calls": bool(body.get("parallel_tool_calls", True)),
+        "user": body.get("user"),
+        "metadata": body.get("metadata"),
         "thinking_mode": thinking_mode,
         "reasoning_effort": reasoning_effort,
-        "stream": bool(body.get("stream", False)),
+        "stream": stream,
         "stream_options": body.get("stream_options") or {},
     }
 
@@ -398,6 +650,7 @@ def _run_payload_stream(runtime: dict[str, Any], payload: dict[str, Any]):
         max_tokens,
         tokenizer.eos_token_id,
         temperature,
+        generation_options=payload.get("generation_options") or {},
     )
     for event in events:
         if event.get("type") == "done":
@@ -407,6 +660,8 @@ def _run_payload_stream(runtime: dict[str, Any], payload: dict[str, Any]):
 
 
 class _StreamingDecoder:
+    _TOOL_CALLS_START = f"\n\n<{dsml_token}tool_calls"
+
     def __init__(self, tokenizer, thinking_mode: str):
         self.tokenizer = tokenizer
         self.thinking_mode = thinking_mode
@@ -414,19 +669,37 @@ class _StreamingDecoder:
         self.emitted_text = ""
         self.content_emitted = ""
         self.reasoning_emitted = ""
+        self._content_truncated = False
+        self._content_visible_len: int | None = None
+
+    def _truncate_for_tool_calls(self, content_text: str) -> str:
+        if self._content_truncated:
+            return content_text[: self._content_visible_len or 0]
+        idx = content_text.find(self._TOOL_CALLS_START)
+        if idx >= 0:
+            self._content_truncated = True
+            self._content_visible_len = idx
+            return content_text[:idx]
+        marker = self._TOOL_CALLS_START
+        max_overlap = min(len(content_text), len(marker) - 1)
+        for n in range(max_overlap, 0, -1):
+            if content_text.endswith(marker[:n]):
+                return content_text[: len(content_text) - n]
+        return content_text
 
     def append(self, token_ids: list[int]) -> list[dict[str, str]]:
         self.token_ids.extend(int(t) for t in token_ids)
         decoded = _strip_special_eos(self.tokenizer.decode(self.token_ids))
         if len(decoded) < len(self.emitted_text):
             return []
-        delta = decoded[len(self.emitted_text):]
         self.emitted_text = decoded
-        if not delta:
-            return []
         if self.thinking_mode != "thinking":
-            self.content_emitted += delta
-            return [{"content": delta}]
+            visible = self._truncate_for_tool_calls(decoded)
+            if len(visible) <= len(self.content_emitted):
+                return []
+            delta_text = visible[len(self.content_emitted):]
+            self.content_emitted = visible
+            return [{"content": delta_text}]
         outputs: list[dict[str, str]] = []
         marker = "</think>"
         marker_idx = decoded.find(marker)
@@ -441,9 +714,10 @@ class _StreamingDecoder:
         if len(reasoning_text) > len(self.reasoning_emitted):
             outputs.append({"reasoning_content": reasoning_text[len(self.reasoning_emitted):]})
             self.reasoning_emitted = reasoning_text
-        if len(content_text) > len(self.content_emitted):
-            outputs.append({"content": content_text[len(self.content_emitted):]})
-            self.content_emitted = content_text
+        visible_content = self._truncate_for_tool_calls(content_text)
+        if len(visible_content) > len(self.content_emitted):
+            outputs.append({"content": visible_content[len(self.content_emitted):]})
+            self.content_emitted = visible_content
         return outputs
 
     def final_message(self, thinking_mode: str) -> dict[str, Any]:
@@ -464,39 +738,66 @@ def _broadcast_payload(payload: dict[str, Any], runtime: dict[str, Any]) -> None
         dist.broadcast_object_list([payload], src=0, group=runtime["control_group"])
 
 
-def _completion_response(runtime: dict[str, Any], payload: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
-    created = int(time.time())
-    message = {
-        "role": "assistant",
-        "content": result["content"],
-    }
-    if result["reasoning_content"]:
+def _logprobs_payload(result: dict[str, Any], top_logprobs: int | None) -> dict[str, Any] | None:
+    token_logprobs = result.get("token_logprobs")
+    token_texts = result.get("token_texts")
+    top_candidates = result.get("top_logprobs")
+    if not token_logprobs or not token_texts:
+        return None
+    content = []
+    for idx, text in enumerate(token_texts):
+        entry = {"token": text, "logprob": float(token_logprobs[idx]), "bytes": list(text.encode("utf-8"))}
+        if top_candidates and idx < len(top_candidates) and top_candidates[idx]:
+            entry["top_logprobs"] = [
+                {
+                    "token": cand.get("token", ""),
+                    "logprob": float(cand.get("logprob", 0.0)),
+                    "bytes": list(str(cand.get("token", "")).encode("utf-8")),
+                }
+                for cand in top_candidates[idx][: max(int(top_logprobs or 0), 0)]
+            ]
+        content.append(entry)
+    return {"content": content}
+
+
+def _completion_choice(result: dict[str, Any], index: int, top_logprobs: int | None = None) -> dict[str, Any]:
+    message = {"role": "assistant", "content": result.get("content", "")}
+    if result.get("reasoning_content"):
         message["reasoning_content"] = result["reasoning_content"]
-    if result["tool_calls"]:
+    if result.get("tool_calls"):
         message["tool_calls"] = result["tool_calls"]
+    choice = {
+        "index": index,
+        "message": message,
+        "finish_reason": result.get("finish_reason", "stop"),
+    }
+    logprobs = _logprobs_payload(result, top_logprobs)
+    if logprobs is not None:
+        choice["logprobs"] = logprobs
+    return choice
+
+
+def _completion_response(runtime: dict[str, Any], payload: dict[str, Any], result: dict[str, Any] | list[dict[str, Any]]) -> dict[str, Any]:
+    results = result if isinstance(result, list) else [result]
+    prompt_tokens = int(results[0].get("prompt_tokens", 0)) if results else 0
+    completion_tokens = sum(int(item.get("completion_tokens", 0)) for item in results)
     return {
         "id": payload["request_id"],
         "object": "chat.completion",
-        "created": created,
+        "created": int(time.time()),
         "model": runtime["model_id"],
-        "choices": [
-            {
-                "index": 0,
-                "message": message,
-                "finish_reason": "tool_calls" if result["tool_calls"] else "stop",
-            }
-        ],
+        "choices": [_completion_choice(item, idx, payload.get("top_logprobs")) for idx, item in enumerate(results)],
         "usage": {
-            "prompt_tokens": result["prompt_tokens"],
-            "completion_tokens": result["completion_tokens"],
-            "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         },
-        "deepseek_timings": result["timings"],
+        "deepseek_timings": results[0].get("timings", {}) if results else {},
     }
 
 
-def _chunk_payload(runtime: dict[str, Any], payload: dict[str, Any], delta: dict[str, Any], finish_reason: str | None = None) -> dict[str, Any]:
-    choice = {"index": 0, "delta": delta}
+def _chunk_payload(runtime: dict[str, Any], payload: dict[str, Any], delta: dict[str, Any], finish_reason: str | None = None, index: int = 0) -> dict[str, Any]:
+    choice = {"index": index, "delta": delta}
     if finish_reason is not None:
         choice["finish_reason"] = finish_reason
     return {
@@ -518,19 +819,124 @@ def _sse_line(obj: Any) -> bytes:
     return b"data: " + _json_bytes(obj) + b"\n\n"
 
 
+def _debug_tool_schema(body: dict[str, Any]) -> None:
+    if os.getenv("DEEPSEEK_OPENAI_DEBUG_REQUESTS", "0").lower() not in {"1", "true", "yes"}:
+        return
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return
+    for tool in tools:
+        if not isinstance(tool, dict) or not isinstance(tool.get("function"), dict):
+            continue
+        function = tool["function"]
+        if function.get("name") != "builtin_web_search":
+            continue
+        schema = {
+            "name": function.get("name"),
+            "description": function.get("description"),
+            "parameters": function.get("parameters"),
+        }
+        print(f"openai_tool_schema {json.dumps(schema, ensure_ascii=False)[:2000]}", flush=True)
+
+
+def _builtin_web_search_call(body: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
+    if os.getenv("DEEPSEEK_OPENAI_FORCE_BUILTIN_WEB_SEARCH", "1").lower() in {"0", "false", "no"}:
+        return None
+    if body.get("tool_choice") == "none":
+        return None
+    messages = body.get("messages") or []
+    if not isinstance(messages, list) or _has_tool_context(messages):
+        return None
+    tools = body.get("tools")
+    if "builtin_web_search" not in _tool_names(tools):
+        return None
+    raw_query = _latest_user_text(messages)
+    if not raw_query or not _should_force_web_search(raw_query):
+        return None
+    query = _clean_search_query(raw_query)
+    return {
+        "prompt_tokens": len(payload.get("_prompt_ids") or []),
+        "completion_tokens": 0,
+        "content": "",
+        "reasoning_content": "",
+        "tool_calls": [
+            {
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": "builtin_web_search", "arguments": json.dumps(_web_search_arguments(query, tools), ensure_ascii=False)},
+            }
+        ],
+        "finish_reason": "tool_calls",
+        "timings": _timing_metrics(0.0, 0.0, len(payload.get("_prompt_ids") or []), 0),
+    }
+
+
+def _debug_request_summary(body: dict[str, Any], payload: dict[str, Any], prompt_tokens: int) -> None:
+    if os.getenv("DEEPSEEK_OPENAI_DEBUG_REQUESTS", "0").lower() not in {"1", "true", "yes"}:
+        return
+    tools = body.get("tools")
+    tool_names = []
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict) and isinstance(tool.get("function"), dict):
+                tool_names.append(str(tool["function"].get("name", "")))
+    print(
+        "openai_request "
+        f"id={payload.get('request_id')} "
+        f"stream={payload.get('stream')} "
+        f"messages={len(body.get('messages') or [])} "
+        f"prompt_tokens={prompt_tokens} "
+        f"tools={len(tools) if isinstance(tools, list) else 0} "
+        f"tool_names={tool_names[:20]} "
+        f"tool_choice={body.get('tool_choice')} "
+        f"payload_tool_choice={payload.get('tool_choice')} "
+        f"parallel_tool_calls={body.get('parallel_tool_calls')} "
+        f"response_format={body.get('response_format')} "
+        f"mcp_keys={[key for key in body.keys() if 'mcp' in str(key).lower()]}",
+        flush=True,
+    )
+    raw_messages = body.get("messages") or []
+    if isinstance(raw_messages, list):
+        for idx, msg in enumerate(raw_messages):
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            content_repr = _normalize_content(msg.get("content"))
+            content_repr = (content_repr or "").replace("\n", "\\n")
+            tool_call_id = msg.get("tool_call_id")
+            tool_calls = msg.get("tool_calls")
+            print(
+                f"openai_request_msg id={payload.get('request_id')} idx={idx} role={role} "
+                f"tool_call_id={tool_call_id} has_tool_calls={bool(tool_calls)} "
+                f"content_len={len(content_repr)} content_head={content_repr[:600]!r}",
+                flush=True,
+            )
+
+
 class OpenAIHandler(BaseHTTPRequestHandler):
     server_version = "DeepSeekOpenAIServer/0.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"{self.address_string()} - {fmt % args}", flush=True)
 
+    def _send_common_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
     def _send_json(self, status: int, obj: Any) -> None:
         data = _json_bytes(obj)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        self._send_common_headers()
         self.end_headers()
         self.wfile.write(data)
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self._send_common_headers()
+        self.end_headers()
 
     def _read_json_body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -539,18 +945,19 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         runtime = self.server.runtime
-        if self.path == "/health":
+        path = urlparse(self.path).path
+        if path == "/health":
             self._send_json(200, {"status": "ok", "rank": runtime["rank"], "world_size": runtime["world_size"], "model": runtime["model_id"]})
             return
-        if self.path == "/v1/models":
+        if path == "/v1/models":
             now = int(time.time())
             self._send_json(200, {"object": "list", "data": [{"id": runtime["model_id"], "object": "model", "created": now, "owned_by": "local"}]})
             return
-        self._send_json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
+        self._send_json(404, _openai_error("not found"))
 
     def do_POST(self) -> None:
-        if self.path != "/v1/chat/completions":
-            self._send_json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
+        if urlparse(self.path).path != "/v1/chat/completions":
+            self._send_json(404, _openai_error("not found"))
             return
         runtime = self.server.runtime
         try:
@@ -563,14 +970,23 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 reasoning_effort=payload.get("reasoning_effort"),
             )
             payload["_prompt_ids"] = runtime["tokenizer"].encode(prompt_text)
+            _debug_tool_schema(body)
+            max_seq_len = int(getattr(runtime.get("model"), "max_seq_len", 0) or 0)
+            max_tokens = int(payload.get("max_tokens") or 0)
+            if max_seq_len > 0 and len(payload["_prompt_ids"]) + max(max_tokens, 1) > max_seq_len:
+                keep = max(max_seq_len - max(max_tokens, 1), 1)
+                if os.getenv("DEEPSEEK_OPENAI_DEBUG_REQUESTS", "0").lower() in {"1", "true", "yes"}:
+                    print(f"openai_truncate_prompt id={payload.get('request_id')} from={len(payload['_prompt_ids'])} to={keep} max_seq_len={max_seq_len}", flush=True)
+                payload["_prompt_ids"] = payload["_prompt_ids"][-keep:]
+            _debug_request_summary(body, payload, len(payload["_prompt_ids"]))
         except Exception as exc:
-            self._send_json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+            self._send_json(400, _openai_error(str(exc)))
             return
         if not stream:
             try:
                 result = self.server.engine.submit(payload)
             except Exception as exc:
-                self._send_json(500, {"error": {"message": str(exc), "type": "server_error"}})
+                self._send_json(500, _openai_error(str(exc), "server_error"))
                 return
             self._send_json(200, _completion_response(runtime, payload, result))
             return
@@ -578,8 +994,13 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
+        self._send_common_headers()
         self.end_headers()
         disconnected = False
+        stopped_by_sequence = False
+        stop_strings = _stop_strings(payload.get("stop"))
+        stop_hold = ""
+        stop_hold_limit = max((len(item) for item in stop_strings), default=0) - 1
         decoder = _StreamingDecoder(runtime["tokenizer"], payload["thinking_mode"])
         self.wfile.write(_sse_line(_chunk_payload(runtime, payload, {"role": "assistant"})))
         self.wfile.flush()
@@ -591,8 +1012,31 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     if disconnected:
                         continue
                     for delta in decoder.append(event.get("token_ids", [])):
+                        if stopped_by_sequence:
+                            continue
+                        emit_delta = dict(delta)
+                        if "content" in emit_delta and stop_strings:
+                            combined = stop_hold + emit_delta["content"]
+                            earliest = None
+                            for stop_text in stop_strings:
+                                pos = combined.find(stop_text)
+                                if pos >= 0 and (earliest is None or pos < earliest):
+                                    earliest = pos
+                            if earliest is not None:
+                                visible = combined[:earliest]
+                                stopped_by_sequence = True
+                                stop_hold = ""
+                            elif stop_hold_limit > 0:
+                                visible = combined[:-stop_hold_limit] if len(combined) > stop_hold_limit else ""
+                                stop_hold = combined[-stop_hold_limit:]
+                            else:
+                                visible = combined
+                                stop_hold = ""
+                            emit_delta["content"] = visible
+                        if not emit_delta.get("content") and not emit_delta.get("reasoning_content"):
+                            continue
                         try:
-                            self.wfile.write(_sse_line(_chunk_payload(runtime, payload, delta)))
+                            self.wfile.write(_sse_line(_chunk_payload(runtime, payload, emit_delta)))
                             self.wfile.flush()
                         except (BrokenPipeError, ConnectionResetError, OSError):
                             disconnected = True
@@ -604,11 +1048,23 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             return
         if done_event is None:
             return
+        if not disconnected and not stopped_by_sequence and stop_hold:
+            try:
+                self.wfile.write(_sse_line(_chunk_payload(runtime, payload, {"content": stop_hold})))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                disconnected = True
         final_msg = decoder.final_message(payload["thinking_mode"])
-        final_tool_calls = final_msg.get("tool_calls") or []
+        final_tool_calls = _normalize_tool_calls(final_msg.get("tool_calls") or [])
         if not disconnected and final_tool_calls:
-            self.wfile.write(_sse_line(_chunk_payload(runtime, payload, {"tool_calls": final_tool_calls})))
-        finish = "tool_calls" if final_tool_calls else done_event.get("finish_reason", "stop")
+            tool_delta = {
+                "tool_calls": [
+                    {"index": idx, **tool_call}
+                    for idx, tool_call in enumerate(final_tool_calls)
+                ]
+            }
+            self.wfile.write(_sse_line(_chunk_payload(runtime, payload, tool_delta)))
+        finish = "tool_calls" if final_tool_calls else "stop" if stopped_by_sequence else done_event.get("finish_reason", "stop")
         if not disconnected:
             include_usage = bool(payload.get("stream_options", {}).get("include_usage", False))
             final_chunk = _chunk_payload(runtime, payload, {}, finish_reason=finish)

@@ -100,7 +100,7 @@ PYTHONPATH=$PWD python -m src.cli.convert_checkpoint \
 CKPT_PATH=$PWD/checkpoints/DeepSeek-V4-Flash-w8a8 bash scripts/run_openai_server.sh
 ```
 
-The server exposes an OpenAI-compatible subset:
+The server exposes an OpenAI-compatible chat-completions subset:
 
 - `GET /health`
 - `GET /v1/models`
@@ -108,6 +108,11 @@ The server exposes an OpenAI-compatible subset:
 - `stream=false` non-streaming responses
 - `stream=true` token-level SSE responses
 - `stream_options.include_usage=true` final usage/timing chunk
+- common OpenAI request parameters: `max_tokens`, `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `frequency_penalty`, `presence_penalty`, `repetition_penalty`, `seed`, `stop`, `n`, `logprobs`, `top_logprobs`, `user`, and `parallel_tool_calls`
+- standard OpenAI `tools`, `tool_choice`, assistant `tool_calls`, and `role=tool` continuation messages
+- `response_format` and reasoning effort prompt hints
+
+Notes: streaming currently supports `n=1`; streaming `logprobs` are rejected; tool-call streaming emits the parsed `delta.tool_calls` once near the end instead of character-by-character argument deltas.
 
 Useful runtime environment variables:
 
@@ -271,8 +276,8 @@ PYTHONPATH=$PWD python tests/test_encoding_dsv4.py
 
 Known limitations:
 
-- The OpenAI API is intentionally minimal and currently targets single-request serving. Multi-request concurrency is still on the to-do list.
-- Fine-grained streaming tool-call deltas are not implemented; tool calls are emitted after final parsing.
+- The OpenAI API targets chat-completions compatibility for common clients, but it is not a complete OpenAI API implementation.
+- Fine-grained streaming tool-call deltas are not implemented; parsed tool calls are emitted once after final parsing.
 - The runtime is specialized for the converted `DeepSeek-V4-Flash-w8a8` checkpoint format.
 - Performance numbers are hardware- and NUMA-sensitive; short prefill timings are especially noisy.
 

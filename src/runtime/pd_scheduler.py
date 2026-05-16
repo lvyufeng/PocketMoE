@@ -72,14 +72,16 @@ class PDExecutionFacade:
         max_new_tokens: int,
         eos_id: int,
         temperature: float,
+        **generate_kwargs,
     ):
-        return self._call_generate(
+        return self._call_generate_with_kwargs(
             self._generate_fn,
             model,
             prompt_tokens,
             max_new_tokens,
             eos_id,
             temperature,
+            generate_kwargs,
         )
 
     def stream(
@@ -89,14 +91,16 @@ class PDExecutionFacade:
         max_new_tokens: int,
         eos_id: int,
         temperature: float,
+        **generate_kwargs,
     ) -> Iterator[dict[str, Any]]:
-        yield from self._call_generate(
+        yield from self._call_generate_with_kwargs(
             self._generate_stream_fn,
             model,
             prompt_tokens,
             max_new_tokens,
             eos_id,
             temperature,
+            generate_kwargs,
         )
 
     def _call_generate(

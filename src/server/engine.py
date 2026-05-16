@@ -210,11 +210,28 @@ class DeepSeekServingEngine:
     def _is_batch_compatible(self, first: _QueuedRequest, candidate: _QueuedRequest) -> bool:
         if candidate.stream:
             return False
-        first_temp = float(first.payload.get("temperature", 0.0) or 0.0)
-        cand_temp = float(candidate.payload.get("temperature", 0.0) or 0.0)
         first_max_tokens = int(first.payload.get("max_tokens") or 0)
         cand_max_tokens = int(candidate.payload.get("max_tokens") or 0)
-        return first_temp == cand_temp and first_max_tokens == cand_max_tokens
+        if first_max_tokens != cand_max_tokens:
+            return False
+        compare_keys = (
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "repetition_penalty",
+            "seed",
+            "stop",
+            "logprobs",
+            "top_logprobs",
+            "n",
+        )
+        for key in compare_keys:
+            if first.payload.get(key) != candidate.payload.get(key):
+                return False
+        return True
 
     def _batch_payload(self, batch: list[_QueuedRequest]) -> dict[str, Any]:
         payload0 = dict(batch[0].payload)

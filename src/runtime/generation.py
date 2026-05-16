@@ -520,12 +520,93 @@ def load_model(model: Transformer, ckpt_path: str, world_size: int, rank: int, c
         return
     raise ValueError(f"Unsupported checkpoint format: {ckpt_format}")
 
-def sample(logits, temperature: float = 1.0):
+def _has_generation_processors(options: dict | None) -> bool:
+    if not options:
+        return False
+    return any([
+        options.get("top_p") is not None and float(options.get("top_p")) < 1.0,
+        options.get("top_k") is not None and int(options.get("top_k")) > 0,
+        options.get("min_p") is not None and float(options.get("min_p")) > 0.0,
+        abs(float(options.get("frequency_penalty") or 0.0)) > 1e-9,
+        abs(float(options.get("presence_penalty") or 0.0)) > 1e-9,
+        abs(float(options.get("repetition_penalty") or 1.0) - 1.0) > 1e-9,
+        bool(options.get("logprobs")),
+    ])
+
+
+def _apply_generation_processors(logits: torch.Tensor, tokens: torch.Tensor, cur_pos: int, options: dict | None) -> torch.Tensor:
+    if not options:
+        return logits
+    processed = logits.float()
+    repetition_penalty = float(options.get("repetition_penalty") or 1.0)
+    frequency_penalty = float(options.get("frequency_penalty") or 0.0)
+    presence_penalty = float(options.get("presence_penalty") or 0.0)
+    if repetition_penalty != 1.0 or frequency_penalty != 0.0 or presence_penalty != 0.0:
+        for row in range(processed.size(0)):
+            history = tokens[row, :cur_pos]
+            history = history[history >= 0]
+            if history.numel() == 0:
+                continue
+            unique, counts = torch.unique(history, return_counts=True)
+            if repetition_penalty != 1.0:
+                values = processed[row, unique]
+                processed[row, unique] = torch.where(values > 0, values / repetition_penalty, values * repetition_penalty)
+            if frequency_penalty != 0.0:
+                processed[row, unique] -= counts.to(processed.dtype) * frequency_penalty
+            if presence_penalty != 0.0:
+                processed[row, unique] -= presence_penalty
+    top_k = options.get("top_k")
+    if top_k is not None and int(top_k) > 0 and int(top_k) < processed.size(-1):
+        kth = torch.topk(processed, int(top_k), dim=-1).values[..., -1, None]
+        processed = processed.masked_fill(processed < kth, float("-inf"))
+    top_p = options.get("top_p")
+    if top_p is not None and 0.0 < float(top_p) < 1.0:
+        sorted_logits, sorted_indices = torch.sort(processed, descending=True, dim=-1)
+        sorted_probs = torch.softmax(sorted_logits, dim=-1)
+        remove = torch.cumsum(sorted_probs, dim=-1) > float(top_p)
+        remove[..., 0] = False
+        mask = torch.zeros_like(remove).scatter(1, sorted_indices, remove)
+        processed = processed.masked_fill(mask, float("-inf"))
+    min_p = options.get("min_p")
+    if min_p is not None and float(min_p) > 0.0:
+        probs = torch.softmax(processed, dim=-1)
+        threshold = probs.max(dim=-1, keepdim=True).values * float(min_p)
+        processed = processed.masked_fill(probs < threshold, float("-inf"))
+    return processed
+
+
+def sample(logits, temperature: float = 1.0, generator: torch.Generator | None = None):
     """Gumbel-max trick: equivalent to multinomial sampling but faster on GPU,
     since it avoids the GPU-to-CPU sync in torch.multinomial."""
     logits = logits / max(temperature, 1e-5)
     probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
-    return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1)
+    noise = torch.empty_like(probs).exponential_(1, generator=generator)
+    return probs.div_(noise).argmax(dim=-1)
+
+
+def _record_generation_logprobs(
+    rows: list[list[dict]],
+    logits: torch.Tensor,
+    next_token: torch.Tensor,
+    generated_mask: torch.Tensor,
+    top_logprobs: int,
+) -> None:
+    log_probs = torch.log_softmax(logits.float(), dim=-1)
+    selected = log_probs.gather(1, next_token.unsqueeze(-1)).squeeze(-1)
+    if top_logprobs > 0:
+        top_values, top_indices = torch.topk(log_probs, min(top_logprobs, log_probs.size(-1)), dim=-1)
+    else:
+        top_values = top_indices = None
+    for row in range(next_token.size(0)):
+        if not bool(generated_mask[row].item()):
+            continue
+        entry = {"token_id": int(next_token[row].item()), "logprob": float(selected[row].item())}
+        if top_values is not None and top_indices is not None:
+            entry["top_logprobs"] = [
+                {"token_id": int(tok.item()), "logprob": float(val.item())}
+                for tok, val in zip(top_indices[row].detach().cpu(), top_values[row].detach().cpu())
+            ]
+        rows[row].append(entry)
 
 
 def _sync_timing_boundary(model, enabled: bool) -> None:
@@ -550,6 +631,7 @@ def generate(
     temperature: float = 1.0,
     phase_callback=None,
     prefill_chunk_tokens: int = 0,
+    generation_options: dict | None = None,
 ) -> List[List[int]]:
     prompt_lens = [len(t) for t in prompt_tokens]
     assert max(prompt_lens) <= model.max_seq_len, f"Prompt length exceeds model maximum sequence length (max_seq_len={model.max_seq_len})"
@@ -577,14 +659,23 @@ def generate(
     # [prev_tok, draft] with strict greedy match (accept iff
     # main.argmax[t+1] == draft). On accept we advance prev_pos by 2.
     mtp_spec_enabled = os.environ.get("DEEPSEEK_DECODE_MTP_SPEC", "0").lower() in {"1", "true", "yes"}
-    if getattr(model, "is_layer_pp", False) and temperature > 0:
+    generation_options = generation_options or {}
+    needs_logits = temperature > 0 or _has_generation_processors(generation_options)
+    generator = None
+    if generation_options.get("seed") is not None and torch.cuda.is_available():
+        generator = torch.Generator(device="cuda")
+        generator.manual_seed(int(generation_options["seed"]))
+    collect_logprobs = bool(generation_options.get("logprobs"))
+    top_logprobs = max(int(generation_options.get("top_logprobs") or 0), 0)
+    logprob_rows: list[list[dict]] = [[] for _ in prompt_tokens]
+    if getattr(model, "is_layer_pp", False) and needs_logits:
         raise RuntimeError("layer_pp_4gpu currently supports greedy decoding only")
     if getattr(model, "is_layer_pp", False) and (mtp_log_enabled or mtp_spec_enabled):
         raise RuntimeError("layer_pp_4gpu does not support MTP log/speculative paths yet")
     # Single-prompt requirement for spec mode: prompt_mask handling is
     # easier when all rows have the same prompt length. Disable spec for
     # multi-prompt or temperature > 0 calls.
-    if mtp_spec_enabled and (temperature > 0 or len(set(prompt_lens)) > 1):
+    if mtp_spec_enabled and (needs_logits or len(set(prompt_lens)) > 1):
         mtp_spec_enabled = False
     pending_drafts = None  # tensor [b] of last-step MTP drafts, or None
     mtp_accept = 0
@@ -642,8 +733,11 @@ def generate(
         )
         _sync_timing_boundary(model, sync_timings and sync_each_step)
         step_start = time.perf_counter()
-        if temperature > 0:
+        if needs_logits:
             logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            if logits.dim() == 3:
+                logits = logits[:, -1, :]
+            logits = _apply_generation_processors(logits, tokens, cur_pos, generation_options)
             last_hidden = None
             spec_verify = False
         elif prev_pos == 0 and prefill_chunk_tokens > 0 and cur_pos - prev_pos > prefill_chunk_tokens:
@@ -734,8 +828,11 @@ def generate(
                     model.release_cpu_expert_int8_prepare_cache()
             # Standard length-1 prefill step finishes here -- handle next_token
             # write below.
-            if temperature > 0:
-                next_token = sample(logits, temperature)
+            if needs_logits:
+                next_token = sample(logits, temperature, generator=generator) if temperature > 0 else logits.argmax(dim=-1)
+            generated_mask = ~prompt_mask[:, cur_pos]
+            if collect_logprobs and needs_logits:
+                _record_generation_logprobs(logprob_rows, logits, next_token, generated_mask, top_logprobs)
             next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
             tokens[:, cur_pos] = next_token
             finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
@@ -846,8 +943,11 @@ def generate(
         decode_time += step_time
         generated_this_step = int((~prompt_mask[:, cur_pos]).sum().item())
         decode_tokens += generated_this_step
-        if temperature > 0:
-            next_token = sample(logits, temperature)
+        if needs_logits:
+            next_token = sample(logits, temperature, generator=generator) if temperature > 0 else logits.argmax(dim=-1)
+        generated_mask = ~prompt_mask[:, cur_pos]
+        if collect_logprobs and needs_logits:
+            _record_generation_logprobs(logprob_rows, logits, next_token, generated_mask, top_logprobs)
         next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
         tokens[:, cur_pos] = next_token
         # Phase 1 MTP probe: verify the previous step's MTP draft against this
@@ -907,6 +1007,8 @@ def generate(
             toks = toks[:toks.index(eos_id)]
         toks.append(eos_id)
         completion_tokens.append(toks)
+    if collect_logprobs:
+        return completion_tokens, prefill_time, decode_time, prompt_prefill_tokens, decode_tokens, logprob_rows
     return completion_tokens, prefill_time, decode_time, prompt_prefill_tokens, decode_tokens
 
 
@@ -919,6 +1021,7 @@ def generate_stream(
     temperature: float = 1.0,
     phase_callback=None,
     prefill_chunk_tokens: int = 0,
+    generation_options: dict | None = None,
 ):
     prompt_lens = [len(t) for t in prompt_tokens]
     assert max(prompt_lens) <= model.max_seq_len, f"Prompt length exceeds model maximum sequence length (max_seq_len={model.max_seq_len})"
@@ -934,11 +1037,17 @@ def generate_stream(
     profiler_active = None
     mtp_log_enabled = os.environ.get("DEEPSEEK_MTP_LOG", "0").lower() in {"1", "true", "yes"}
     mtp_spec_enabled = os.environ.get("DEEPSEEK_DECODE_MTP_SPEC", "0").lower() in {"1", "true", "yes"}
-    if getattr(model, "is_layer_pp", False) and temperature > 0:
+    generation_options = generation_options or {}
+    needs_logits = temperature > 0 or _has_generation_processors(generation_options)
+    generator = None
+    if generation_options.get("seed") is not None and torch.cuda.is_available():
+        generator = torch.Generator(device="cuda")
+        generator.manual_seed(int(generation_options["seed"]))
+    if getattr(model, "is_layer_pp", False) and needs_logits:
         raise RuntimeError("layer_pp_4gpu currently supports greedy streaming only")
     if getattr(model, "is_layer_pp", False) and (mtp_log_enabled or mtp_spec_enabled):
         raise RuntimeError("layer_pp_4gpu does not support MTP log/speculative streaming paths yet")
-    if mtp_spec_enabled and (temperature > 0 or len(set(prompt_lens)) > 1):
+    if mtp_spec_enabled and (needs_logits or len(set(prompt_lens)) > 1):
         mtp_spec_enabled = False
     pending_drafts = None
     prev_pos = 0
@@ -988,8 +1097,11 @@ def generate_stream(
         )
         _sync_timing_boundary(model, sync_timings and sync_each_step)
         step_start = time.perf_counter()
-        if temperature > 0:
+        if needs_logits:
             logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            if logits.dim() == 3:
+                logits = logits[:, -1, :]
+            logits = _apply_generation_processors(logits, tokens, cur_pos, generation_options)
             last_hidden = None
             spec_verify = False
         elif prev_pos == 0 and prefill_chunk_tokens > 0 and cur_pos - prev_pos > prefill_chunk_tokens:
@@ -1070,8 +1182,8 @@ def generate_stream(
                 model.release_gpu_prefill_moe_cache()
                 if os.environ.get("DEEPSEEK_RELEASE_PREFILL_INT8_AFTER_PREFILL", "0").lower() in {"1", "true", "yes"} and hasattr(model, "release_cpu_expert_int8_prepare_cache"):
                     model.release_cpu_expert_int8_prepare_cache()
-            if temperature > 0:
-                next_token = sample(logits, temperature)
+            if needs_logits:
+                next_token = sample(logits, temperature, generator=generator) if temperature > 0 else logits.argmax(dim=-1)
             next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
             tokens[:, cur_pos] = next_token
             emit_rank = (not dist.is_initialized() or dist.get_rank() == 0)
@@ -1154,8 +1266,8 @@ def generate_stream(
         decode_time += step_time
         generated_this_step = int((~prompt_mask[:, cur_pos]).sum().item())
         decode_tokens += generated_this_step
-        if temperature > 0:
-            next_token = sample(logits, temperature)
+        if needs_logits:
+            next_token = sample(logits, temperature, generator=generator) if temperature > 0 else logits.argmax(dim=-1)
         next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
         tokens[:, cur_pos] = next_token
         if generated_this_step > 0 and (not dist.is_initialized() or dist.get_rank() == 0):

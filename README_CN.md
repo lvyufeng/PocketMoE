@@ -101,7 +101,7 @@ PYTHONPATH=$PWD python -m src.cli.convert_checkpoint \
 CKPT_PATH=$PWD/checkpoints/DeepSeek-V4-Flash-w8a8 bash scripts/run_openai_server.sh
 ```
 
-服务暴露 OpenAI 兼容子集：
+服务暴露 OpenAI 兼容的 chat-completions 子集：
 
 - `GET /health`
 - `GET /v1/models`
@@ -109,6 +109,11 @@ CKPT_PATH=$PWD/checkpoints/DeepSeek-V4-Flash-w8a8 bash scripts/run_openai_server
 - `stream=false` 非流式响应
 - `stream=true` token-level SSE 响应
 - `stream_options.include_usage=true` 在最终 chunk 返回 usage/timing
+- 常用 OpenAI 请求参数：`max_tokens`、`max_completion_tokens`、`temperature`、`top_p`、`top_k`、`min_p`、`frequency_penalty`、`presence_penalty`、`repetition_penalty`、`seed`、`stop`、`n`、`logprobs`、`top_logprobs`、`user` 和 `parallel_tool_calls`
+- 标准 OpenAI `tools`、`tool_choice`、assistant `tool_calls` 以及 `role=tool` 续轮消息
+- `response_format` 和 reasoning effort prompt hint
+
+说明：streaming 当前支持 `n=1`；streaming `logprobs` 会被拒绝；tool-call streaming 会在末尾附近一次性返回解析后的 `delta.tool_calls`，不会逐字符流式输出 arguments。
 
 常用运行环境变量：
 
@@ -272,8 +277,8 @@ PYTHONPATH=$PWD python tests/test_encoding_dsv4.py
 
 已知限制：
 
-- OpenAI API 当前是最小可用子集，主要面向单请求服务；多请求并发仍在 to-do list 中。
-- 还没有实现细粒度 tool-call delta streaming；tool calls 会在最终解析后一次性返回。
+- OpenAI API 现在主要兼容常见 chat-completions 客户端，但还不是完整的 OpenAI API 实现。
+- 还没有实现细粒度 tool-call delta streaming；解析后的 tool calls 会在最终解析后一次性返回。
 - runtime 专门面向转换后的 `DeepSeek-V4-Flash-w8a8` checkpoint 格式。
 - 性能对硬件和 NUMA 很敏感；短 prompt 的 prefill timing 尤其容易波动。
 

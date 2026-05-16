@@ -232,7 +232,7 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
         messages: Full list of messages in the conversation.
         thinking_mode: Either "chat" or "thinking".
         drop_thinking: Whether to drop reasoning content from earlier turns.
-        reasoning_effort: Optional reasoning effort level ("max", "high", or None).
+        reasoning_effort: Optional reasoning effort level ("minimal", "low", "medium", "high", "max", or None).
 
     Returns:
         Encoded string for this message.
@@ -258,7 +258,7 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
         tool_calls = tool_calls_from_openai_format(tool_calls)
 
     # Reasoning effort prefix (only at index 0 in thinking mode with max effort)
-    assert reasoning_effort in ['max', None, 'high'], f"Invalid reasoning effort: {reasoning_effort}"
+    assert reasoning_effort in ['max', None, 'minimal', 'low', 'medium', 'high'], f"Invalid reasoning effort: {reasoning_effort}"
     if index == 0 and thinking_mode == "thinking" and reasoning_effort == 'max':
         prompt += REASONING_EFFORT_MAX
 
@@ -527,7 +527,7 @@ def encode_messages(
         drop_thinking: If True, drop reasoning_content from earlier assistant turns
                       (only keep reasoning for messages after the last user message).
         add_default_bos_token: Whether to prepend BOS token at conversation start.
-        reasoning_effort: Optional reasoning effort level ("max", "high", or None).
+        reasoning_effort: Optional reasoning effort level ("minimal", "low", "medium", "high", "max", or None).
 
     Returns:
         The encoded prompt string.

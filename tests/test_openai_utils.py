@@ -1,11 +1,13 @@
 import json
 
+from src.encoding.dsv4 import REASONING_EFFORT_MAX, encode_messages
 from src.server.openai import (
     _completion_response,
     _make_payload,
     _normalize_tool_calls,
     _prepare_messages,
     _StreamingDecoder,
+    _thinking_config,
 )
 
 
@@ -102,6 +104,36 @@ def test_tool_choice_none_does_not_attach_tools():
     messages = _prepare_messages(body)
     assert "tools" not in messages[0]
     assert "Do not call" in messages[0]["content"]
+
+
+def test_thinking_config_accepts_openai_and_deepseek_effort_fields():
+    assert _thinking_config({"messages": [{"role": "user", "content": "hello"}]}) == ("chat", None)
+    assert _thinking_config({"reasoning": {"effort": "high"}}) == ("thinking", "high")
+    assert _thinking_config({"reasoning": {"effort": "max"}}) == ("thinking", "max")
+    assert _thinking_config({"reasoning_effort": "max"}) == ("thinking", "max")
+    assert _thinking_config({"reasoning": {"effort": "low"}}) == ("thinking", "low")
+
+
+def test_nested_reasoning_effort_overrides_top_level_effort():
+    assert _thinking_config({"reasoning_effort": "max", "reasoning": {"effort": "medium"}}) == ("thinking", "medium")
+
+
+def test_invalid_reasoning_effort_keeps_thinking_without_effort_prefix():
+    assert _thinking_config({"reasoning_effort": "extreme"}) == ("thinking", None)
+
+
+def test_make_payload_accepts_top_level_reasoning_effort_max():
+    payload = _make_payload({"messages": [{"role": "user", "content": "hello"}], "reasoning_effort": "max"})
+    assert payload["thinking_mode"] == "thinking"
+    assert payload["reasoning_effort"] == "max"
+
+
+def test_encode_messages_injects_prefix_only_for_reasoning_effort_max():
+    messages = [{"role": "user", "content": "hello"}]
+    max_prompt = encode_messages(messages, thinking_mode="thinking", reasoning_effort="max")
+    high_prompt = encode_messages(messages, thinking_mode="thinking", reasoning_effort="high")
+    assert REASONING_EFFORT_MAX in max_prompt
+    assert REASONING_EFFORT_MAX not in high_prompt
 
 
 def test_make_payload_accepts_common_openai_params():

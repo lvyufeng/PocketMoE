@@ -293,12 +293,12 @@ def _prepare_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _thinking_config(body: dict[str, Any]) -> tuple[str, str | None]:
     reasoning = body.get("reasoning")
-    if reasoning is None:
-        return "chat", None
-    effort = None
-    if isinstance(reasoning, dict):
+    effort = body.get("reasoning_effort")
+    if isinstance(reasoning, dict) and reasoning.get("effort") is not None:
         effort = reasoning.get("effort")
-    if effort not in {None, "high", "max"}:
+    if reasoning is None and effort is None:
+        return "chat", None
+    if effort not in {None, "minimal", "low", "medium", "high", "max"}:
         effort = None
     return "thinking", effort
 

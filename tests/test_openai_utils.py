@@ -28,7 +28,7 @@ def test_prepare_messages_preserves_tool_role_and_tool_choice_required():
     assert "must call" in messages[-1]["content"]
 
 
-def test_builtin_web_search_auto_is_promoted_for_search_intent():
+def test_builtin_web_search_auto_does_not_force_search_intent():
     body = {
         "messages": [{"role": "user", "content": "搜索一下特朗普访华"}],
         "tools": [{"type": "function", "function": {"name": "builtin_web_search", "parameters": {"type": "object"}}}],
@@ -37,14 +37,54 @@ def test_builtin_web_search_auto_is_promoted_for_search_intent():
     messages = _prepare_messages(body)
     assert messages[0]["role"] == "system"
     assert messages[0].get("tools") == body["tools"]
+    assert "must call" not in messages[-1]["content"]
+
+
+def test_builtin_web_search_auto_does_not_force_ordinary_chinese_chat():
+    body = {
+        "messages": [{"role": "user", "content": "生成一些特殊表情，我看看现在还会不会出现�"}],
+        "tools": [{"type": "function", "function": {"name": "builtin_web_search", "parameters": {"type": "object"}}}],
+        "tool_choice": "auto",
+    }
+    messages = _prepare_messages(body)
+    assert messages[0]["role"] == "system"
+    assert messages[0].get("tools") == body["tools"]
+    assert "must call" not in messages[-1]["content"]
+
+
+def test_named_builtin_web_search_tool_choice_still_forces_tool():
+    body = {
+        "messages": [{"role": "user", "content": "搜索一下特朗普访华"}],
+        "tools": [{"type": "function", "function": {"name": "builtin_web_search", "parameters": {"type": "object"}}}],
+        "tool_choice": {"type": "function", "function": {"name": "builtin_web_search"}},
+    }
+    messages = _prepare_messages(body)
+    assert messages[0]["role"] == "system"
+    assert messages[0].get("tools") == body["tools"]
     assert "must call the tool named builtin_web_search" in messages[-1]["content"]
 
+
+def test_tools_are_passed_through_unchanged_for_prompt():
+    prepared_description = "Web search tool. Prepared queries: 把前面回复的特朗普访华信息里的�修复一下"
+    parameters = {"type": "object", "properties": {"additionalContext": {"type": "string"}}}
+    body = {
+        "messages": [{"role": "user", "content": "继续"}],
+        "tools": [
+            {"type": "function", "function": {"name": "builtin_web_search", "description": prepared_description, "parameters": parameters}},
+            {"type": "function", "function": {"name": "weather", "description": "Get weather", "parameters": {"type": "object"}}},
+        ],
+        "tool_choice": "auto",
+    }
+    messages = _prepare_messages(body)
+    assert messages[0].get("tools") == body["tools"]
+    assert messages[0]["tools"][0]["function"]["description"] == prepared_description
+    assert messages[0]["tools"] is body["tools"]
 
 
 def test_auto_tools_are_attached_for_plain_chat():
     body = {
         "messages": [{"role": "user", "content": "hello"}],
-        "tools": [{"type": "function", "function": {"name": "builtin_web_search", "parameters": {"type": "object"}}}],
+        "tools": [{"type": "function", "function": {"name": "noop", "parameters": {"type": "object"}}}],
         "tool_choice": "auto",
     }
     messages = _prepare_messages(body)

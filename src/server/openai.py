@@ -228,28 +228,6 @@ def _tool_names(tools: Any) -> set[str]:
     return names
 
 
-def _looks_like_web_search_request(text: str) -> bool:
-    stripped = text.strip()
-    lowered = stripped.lower()
-    if not stripped:
-        return False
-    if len(stripped) <= 12 and not any(ch in stripped for ch in "搜索联网查询查最新新闻今天现在实时"):
-        return False
-    prefixes = (
-        "联网搜索", "联网查", "搜索", "搜一下", "帮我搜", "查一下", "查询",
-        "please search", "search for", "web search",
-    )
-    triggers = ("联网", "搜索", "查询", "查一下", "最新", "新闻", "今天", "现在", "实时", "latest", "news", "current", "today", "search", "web")
-    return any(lowered.startswith(prefix.lower()) for prefix in prefixes) or any(trigger in lowered for trigger in triggers)
-
-
-def _last_user_content(messages: list[dict[str, Any]]) -> str:
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            return _normalize_content(msg.get("content", ""))
-    return ""
-
-
 def _tool_choice_instruction(tool_choice: Any, tools: Any) -> tuple[bool, str | None]:
     if tool_choice is None or tool_choice == "auto":
         names = _tool_names(tools)
@@ -288,11 +266,7 @@ def _prepare_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
         messages.append(copied)
     tools = body.get("tools")
     tool_choice = body.get("tool_choice")
-    if tool_choice in {None, "auto"} and "builtin_web_search" in _tool_names(tools) and _looks_like_web_search_request(_last_user_content(messages)):
-        tool_choice = {"type": "function", "function": {"name": "builtin_web_search"}}
     attach_tools, instruction = _tool_choice_instruction(tool_choice, tools)
-    if instruction is None and tool_choice in {None, "auto"} and "builtin_web_search" in _tool_names(tools) and _looks_like_web_search_request(_last_user_content(messages)):
-        instruction = "You must call builtin_web_search before answering. Use the prepared search query from the tool description. Do not answer from memory."
     tool_attach_idx = None
     for idx, msg in enumerate(messages):
         if msg.get("role") in {"system", "developer"}:
@@ -839,37 +813,6 @@ def _debug_tool_schema(body: dict[str, Any]) -> None:
         print(f"openai_tool_schema {json.dumps(schema, ensure_ascii=False)[:2000]}", flush=True)
 
 
-def _builtin_web_search_call(body: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
-    if os.getenv("DEEPSEEK_OPENAI_FORCE_BUILTIN_WEB_SEARCH", "1").lower() in {"0", "false", "no"}:
-        return None
-    if body.get("tool_choice") == "none":
-        return None
-    messages = body.get("messages") or []
-    if not isinstance(messages, list) or _has_tool_context(messages):
-        return None
-    tools = body.get("tools")
-    if "builtin_web_search" not in _tool_names(tools):
-        return None
-    raw_query = _latest_user_text(messages)
-    if not raw_query or not _should_force_web_search(raw_query):
-        return None
-    query = _clean_search_query(raw_query)
-    return {
-        "prompt_tokens": len(payload.get("_prompt_ids") or []),
-        "completion_tokens": 0,
-        "content": "",
-        "reasoning_content": "",
-        "tool_calls": [
-            {
-                "id": f"call_{uuid.uuid4().hex[:24]}",
-                "type": "function",
-                "function": {"name": "builtin_web_search", "arguments": json.dumps(_web_search_arguments(query, tools), ensure_ascii=False)},
-            }
-        ],
-        "finish_reason": "tool_calls",
-        "timings": _timing_metrics(0.0, 0.0, len(payload.get("_prompt_ids") or []), 0),
-    }
-
 
 def _debug_request_summary(body: dict[str, Any], payload: dict[str, Any], prompt_tokens: int) -> None:
     if os.getenv("DEEPSEEK_OPENAI_DEBUG_REQUESTS", "0").lower() not in {"1", "true", "yes"}:
@@ -1056,6 +999,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 disconnected = True
         final_msg = decoder.final_message(payload["thinking_mode"])
         final_tool_calls = _normalize_tool_calls(final_msg.get("tool_calls") or [])
+        if final_tool_calls and os.getenv("DEEPSEEK_OPENAI_DEBUG_REQUESTS", "0").lower() in {"1", "true", "yes"}:
+            print(f"openai_tool_calls id={payload.get('request_id')} calls={json.dumps(final_tool_calls, ensure_ascii=False)[:2000]}", flush=True)
         if not disconnected and final_tool_calls:
             tool_delta = {
                 "tool_calls": [

@@ -180,3 +180,21 @@ def test_streaming_decoder_hides_dsml_tool_call_prefix():
         for delta in decoder.append([tid]):
             visible += delta.get("content", "")
     assert visible == "hi"
+
+
+class _ResolvingTokenizer:
+    eos_token_id = 0
+
+    def decode(self, token_ids):
+        ids = [int(t) for t in token_ids]
+        if ids == [1]:
+            return "�"
+        if ids == [1, 2]:
+            return "中"
+        return ""
+
+
+def test_streaming_decoder_holds_back_trailing_replacement_character():
+    decoder = _StreamingDecoder(_ResolvingTokenizer(), "no_thinking")
+    assert decoder.append([1]) == []
+    assert decoder.append([2]) == [{"content": "中"}]

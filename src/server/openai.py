@@ -689,7 +689,7 @@ class _StreamingDecoder:
 
     def append(self, token_ids: list[int]) -> list[dict[str, str]]:
         self.token_ids.extend(int(t) for t in token_ids)
-        decoded = _strip_special_eos(self.tokenizer.decode(self.token_ids))
+        decoded = _strip_special_eos(self.tokenizer.decode(self.token_ids)).rstrip("�")
         if len(decoded) < len(self.emitted_text):
             return []
         self.emitted_text = decoded

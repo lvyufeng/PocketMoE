@@ -13,6 +13,7 @@ from transformers import AutoTokenizer
 from safetensors import safe_open
 
 from src.moe.shared_weights import SharedCPUMoEWeightArena
+from src.runtime.prefix_snapshot import PrefixSnapshotCache
 from src.runtime.partition_policy import (
     checkpoint_key_is_needed_for_policy,
     partition_rule_kind,
@@ -618,6 +619,27 @@ def _sync_timing_boundary(model, enabled: bool) -> None:
         dist.barrier()
 
 
+def _prefix_snapshot_settings(
+    model: Transformer,
+    prompt_tokens: List[List[int]],
+    prompt_lens: list[int],
+    prefix_snapshot_hint: dict | None,
+) -> tuple[int, list[int]]:
+    if not PrefixSnapshotCache.enabled() or len(prompt_tokens) != 1 or getattr(model, "is_layer_pp", False):
+        return 0, []
+    cache = PrefixSnapshotCache.instance()
+    restore_pos = cache.restore(model, prefix_snapshot_hint, prompt_tokens[0]) if prefix_snapshot_hint else 0
+    capture_pos = (prompt_lens[0] // cache.block) * cache.block
+    if capture_pos < cache.min_tokens:
+        return restore_pos, []
+    hinted_positions = prefix_snapshot_hint.get("capture_positions") if prefix_snapshot_hint else None
+    if hinted_positions:
+        capture_positions = [int(pos) for pos in hinted_positions if restore_pos < int(pos) <= capture_pos]
+    else:
+        capture_positions = [capture_pos] if restore_pos < capture_pos else []
+    return restore_pos, capture_positions
+
+
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).lower() in {"1", "true", "yes"}
 
@@ -632,6 +654,7 @@ def generate(
     phase_callback=None,
     prefill_chunk_tokens: int = 0,
     generation_options: dict | None = None,
+    prefix_snapshot_hint: dict | None = None,
 ) -> List[List[int]]:
     prompt_lens = [len(t) for t in prompt_tokens]
     assert max(prompt_lens) <= model.max_seq_len, f"Prompt length exceeds model maximum sequence length (max_seq_len={model.max_seq_len})"
@@ -677,12 +700,26 @@ def generate(
     # multi-prompt or temperature > 0 calls.
     if mtp_spec_enabled and (needs_logits or len(set(prompt_lens)) > 1):
         mtp_spec_enabled = False
+    prefix_snapshot_start_pos, prefix_snapshot_capture_positions = _prefix_snapshot_settings(
+        model, prompt_tokens, prompt_lens, prefix_snapshot_hint
+    )
+    prefix_snapshot_pending_captures = set(prefix_snapshot_capture_positions)
+    prefix_snapshot_cache = PrefixSnapshotCache.instance() if (prefix_snapshot_pending_captures or prefix_snapshot_start_pos > 0) else None
+
+    def maybe_capture_prefix_snapshot(pos: int) -> None:
+        if prefix_snapshot_cache is None or pos not in prefix_snapshot_pending_captures:
+            return
+        if len(prompt_tokens) != 1 or pos > prompt_lens[0]:
+            return
+        prefix_snapshot_cache.capture(model, prompt_tokens[0], pos)
+        prefix_snapshot_pending_captures.discard(pos)
+
     pending_drafts = None  # tensor [b] of last-step MTP drafts, or None
     mtp_accept = 0
     mtp_total = 0
     mtp_spec_accepts = 0
     mtp_spec_rounds = 0
-    prev_pos = 0
+    prev_pos = prefix_snapshot_start_pos
     finished = torch.tensor([False] * len(prompt_tokens))
     prompt_mask = tokens != -1
     sync_timings = _env_flag("DEEPSEEK_SYNC_TIMINGS", "1" if getattr(model, "is_layer_pp", False) else "0")
@@ -695,7 +732,8 @@ def generate(
     decode_wall_start = None
     cur_pos = min(prompt_lens)
     while cur_pos < total_len:
-        phase = "prefill" if prev_pos == 0 else "decode"
+        prefill_step = prev_pos < min(prompt_lens)
+        phase = "prefill" if prefill_step else "decode"
         if phase_callback is not None:
             phase_callback(phase)
         # Bump decode index up-front so profiler enable/disable logic is uniform.
@@ -740,13 +778,26 @@ def generate(
             logits = _apply_generation_processors(logits, tokens, cur_pos, generation_options)
             last_hidden = None
             spec_verify = False
-        elif prev_pos == 0 and prefill_chunk_tokens > 0 and cur_pos - prev_pos > prefill_chunk_tokens:
-            chunk_start = prev_pos
-            while chunk_start + prefill_chunk_tokens < cur_pos:
-                chunk_end = chunk_start + prefill_chunk_tokens
-                model.forward(tokens[:, chunk_start:chunk_end], chunk_start, return_next_token=False)
-                chunk_start = chunk_end
-            next_token = model.forward(tokens[:, chunk_start:cur_pos], chunk_start, return_next_token=True)
+        elif prefill_step:
+            capture_points = sorted(pos for pos in prefix_snapshot_pending_captures if prev_pos < pos < cur_pos)
+            if prefill_chunk_tokens > 0 and cur_pos - prev_pos > prefill_chunk_tokens:
+                chunk = prefill_chunk_tokens
+                chunk_start = prev_pos
+                while chunk_start + chunk < cur_pos:
+                    chunk_end = chunk_start + chunk
+                    model.forward(tokens[:, chunk_start:chunk_end], chunk_start, return_next_token=False)
+                    maybe_capture_prefix_snapshot(chunk_end)
+                    chunk_start = chunk_end
+                next_token = model.forward(tokens[:, chunk_start:cur_pos], chunk_start, return_next_token=True)
+            elif capture_points:
+                chunk_start = prev_pos
+                for chunk_end in capture_points:
+                    model.forward(tokens[:, chunk_start:chunk_end], chunk_start, return_next_token=False)
+                    maybe_capture_prefix_snapshot(chunk_end)
+                    chunk_start = chunk_end
+                next_token = model.forward(tokens[:, chunk_start:cur_pos], chunk_start, return_next_token=True)
+            else:
+                next_token = model.forward(tokens[:, prev_pos:cur_pos], prev_pos, return_next_token=True)
             last_hidden = None
             logits = None
         elif spec_verify:
@@ -815,7 +866,7 @@ def generate(
             except Exception as exc:
                 print(f"decode profile summary failed: {exc}", flush=True)
             profiler_active = None
-        if prev_pos == 0:
+        if prefill_step:
             _sync_timing_boundary(model, sync_timings and not sync_each_step)
             step_time = time.perf_counter() - step_start
             generated_this_step = int((~prompt_mask[:, cur_pos]).sum().item())
@@ -836,6 +887,7 @@ def generate(
             next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
             tokens[:, cur_pos] = next_token
             finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
+            maybe_capture_prefix_snapshot(cur_pos)
             prev_pos = cur_pos
             cur_pos += 1
             if finished.all():
@@ -1022,6 +1074,7 @@ def generate_stream(
     phase_callback=None,
     prefill_chunk_tokens: int = 0,
     generation_options: dict | None = None,
+    prefix_snapshot_hint: dict | None = None,
 ):
     prompt_lens = [len(t) for t in prompt_tokens]
     assert max(prompt_lens) <= model.max_seq_len, f"Prompt length exceeds model maximum sequence length (max_seq_len={model.max_seq_len})"
@@ -1049,8 +1102,22 @@ def generate_stream(
         raise RuntimeError("layer_pp_4gpu does not support MTP log/speculative streaming paths yet")
     if mtp_spec_enabled and (needs_logits or len(set(prompt_lens)) > 1):
         mtp_spec_enabled = False
+    prefix_snapshot_start_pos, prefix_snapshot_capture_positions = _prefix_snapshot_settings(
+        model, prompt_tokens, prompt_lens, prefix_snapshot_hint
+    )
+    prefix_snapshot_pending_captures = set(prefix_snapshot_capture_positions)
+    prefix_snapshot_cache = PrefixSnapshotCache.instance() if (prefix_snapshot_pending_captures or prefix_snapshot_start_pos > 0) else None
+
+    def maybe_capture_prefix_snapshot(pos: int) -> None:
+        if prefix_snapshot_cache is None or pos not in prefix_snapshot_pending_captures:
+            return
+        if len(prompt_tokens) != 1 or pos > prompt_lens[0]:
+            return
+        prefix_snapshot_cache.capture(model, prompt_tokens[0], pos)
+        prefix_snapshot_pending_captures.discard(pos)
+
     pending_drafts = None
-    prev_pos = 0
+    prev_pos = prefix_snapshot_start_pos
     finished = torch.tensor([False] * len(prompt_tokens))
     prompt_mask = tokens != -1
     sync_timings = _env_flag("DEEPSEEK_SYNC_TIMINGS", "1" if getattr(model, "is_layer_pp", False) else "0")
@@ -1063,7 +1130,8 @@ def generate_stream(
     decode_wall_start = None
     cur_pos = min(prompt_lens)
     while cur_pos < total_len:
-        phase = "prefill" if prev_pos == 0 else "decode"
+        prefill_step = prev_pos < min(prompt_lens)
+        phase = "prefill" if prefill_step else "decode"
         if phase_callback is not None:
             phase_callback(phase)
         if phase == "decode":
@@ -1104,13 +1172,26 @@ def generate_stream(
             logits = _apply_generation_processors(logits, tokens, cur_pos, generation_options)
             last_hidden = None
             spec_verify = False
-        elif prev_pos == 0 and prefill_chunk_tokens > 0 and cur_pos - prev_pos > prefill_chunk_tokens:
-            chunk_start = prev_pos
-            while chunk_start + prefill_chunk_tokens < cur_pos:
-                chunk_end = chunk_start + prefill_chunk_tokens
-                model.forward(tokens[:, chunk_start:chunk_end], chunk_start, return_next_token=False)
-                chunk_start = chunk_end
-            next_token = model.forward(tokens[:, chunk_start:cur_pos], chunk_start, return_next_token=True)
+        elif prefill_step:
+            capture_points = sorted(pos for pos in prefix_snapshot_pending_captures if prev_pos < pos < cur_pos)
+            if prefill_chunk_tokens > 0 and cur_pos - prev_pos > prefill_chunk_tokens:
+                chunk = prefill_chunk_tokens
+                chunk_start = prev_pos
+                while chunk_start + chunk < cur_pos:
+                    chunk_end = chunk_start + chunk
+                    model.forward(tokens[:, chunk_start:chunk_end], chunk_start, return_next_token=False)
+                    maybe_capture_prefix_snapshot(chunk_end)
+                    chunk_start = chunk_end
+                next_token = model.forward(tokens[:, chunk_start:cur_pos], chunk_start, return_next_token=True)
+            elif capture_points:
+                chunk_start = prev_pos
+                for chunk_end in capture_points:
+                    model.forward(tokens[:, chunk_start:chunk_end], chunk_start, return_next_token=False)
+                    maybe_capture_prefix_snapshot(chunk_end)
+                    chunk_start = chunk_end
+                next_token = model.forward(tokens[:, chunk_start:cur_pos], chunk_start, return_next_token=True)
+            else:
+                next_token = model.forward(tokens[:, prev_pos:cur_pos], prev_pos, return_next_token=True)
             last_hidden = None
             logits = None
         elif spec_verify:
@@ -1171,7 +1252,7 @@ def generate_stream(
             except Exception as exc:
                 print(f"decode profile summary failed: {exc}", flush=True)
             profiler_active = None
-        if prev_pos == 0:
+        if prefill_step:
             _sync_timing_boundary(model, sync_timings and not sync_each_step)
             step_time = time.perf_counter() - step_start
             generated_this_step = int((~prompt_mask[:, cur_pos]).sum().item())
@@ -1195,6 +1276,7 @@ def generate_stream(
                     "phase": "prefill",
                 }
             finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
+            maybe_capture_prefix_snapshot(cur_pos)
             prev_pos = cur_pos
             cur_pos += 1
             if finished.all():

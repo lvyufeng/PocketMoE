@@ -65,6 +65,7 @@ from src.runtime.generation import (
     generate_stream,
     load_model,
 )
+from src.runtime.prefix_snapshot import PrefixSnapshotCache
 from src.runtime.transformer import ModelArgs, Transformer
 from src.runtime.pd_scheduler import PDExecutionFacade, PDScheduler
 from src.server.engine import DeepSeekServingEngine
@@ -449,6 +450,7 @@ def _run_payload(runtime: dict[str, Any], payload: dict[str, Any]) -> dict[str, 
             tokenizer.eos_token_id,
             temperature,
             generation_options=generation_options,
+            prefix_snapshot_hint=payload.get("_prefix_snapshot_hint"),
         )
         if len(completion_result) == 6:
             completion_tokens, prefill_time, decode_time, prefill_tokens, decode_tokens, batch_logprobs = completion_result
@@ -495,6 +497,7 @@ def _run_payload(runtime: dict[str, Any], payload: dict[str, Any]) -> dict[str, 
         tokenizer.eos_token_id,
         temperature,
         generation_options=generation_options,
+        prefix_snapshot_hint=payload.get("_prefix_snapshot_hint"),
     )
     if len(completion_result) == 6:
         completion_tokens, prefill_time, decode_time, prefill_tokens, decode_tokens, batch_logprobs = completion_result
@@ -625,6 +628,7 @@ def _run_payload_stream(runtime: dict[str, Any], payload: dict[str, Any]):
         tokenizer.eos_token_id,
         temperature,
         generation_options=payload.get("generation_options") or {},
+        prefix_snapshot_hint=payload.get("_prefix_snapshot_hint"),
     )
     for event in events:
         if event.get("type") == "done":
@@ -921,6 +925,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 if os.getenv("DEEPSEEK_OPENAI_DEBUG_REQUESTS", "0").lower() in {"1", "true", "yes"}:
                     print(f"openai_truncate_prompt id={payload.get('request_id')} from={len(payload['_prompt_ids'])} to={keep} max_seq_len={max_seq_len}", flush=True)
                 payload["_prompt_ids"] = payload["_prompt_ids"][-keep:]
+            if PrefixSnapshotCache.enabled() and payload["_prompt_ids"]:
+                payload["_prefix_snapshot_hint"] = PrefixSnapshotCache.instance().lookup_hint(payload["_prompt_ids"])
             _debug_request_summary(body, payload, len(payload["_prompt_ids"]))
         except Exception as exc:
             self._send_json(400, _openai_error(str(exc)))

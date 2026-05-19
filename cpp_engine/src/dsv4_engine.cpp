@@ -143,6 +143,25 @@ std::vector<float> hc_head_cpu(const std::vector<float>& h4, const float* fn, co
     return out;
 }
 
+std::vector<float> bf16_matvec_cpu(const std::vector<float>& x, const uint16_t* w, int rows, int cols) {
+    std::vector<float> y(rows, 0.0f);
+    for (int r = 0; r < rows; ++r) {
+        double sum = 0.0;
+        for (int c = 0; c < cols; ++c) sum += static_cast<double>(bf16_to_float(w[static_cast<size_t>(r) * cols + c])) * x[c];
+        y[r] = static_cast<float>(sum);
+    }
+    return y;
+}
+
+std::vector<float> rmsnorm_cpu(const std::vector<float>& x, const uint16_t* gamma, float eps) {
+    double sum_sq = 0.0;
+    for (float v : x) sum_sq += static_cast<double>(v) * v;
+    const float inv = 1.0f / std::sqrt(static_cast<float>(sum_sq / x.size()) + eps);
+    std::vector<float> y(x.size());
+    for (size_t i = 0; i < x.size(); ++i) y[i] = x[i] * inv * bf16_to_float(gamma[i]);
+    return y;
+}
+
 struct AttentionSmokeDims {
     int dim = 0;
     int q_a_dim = 0;
@@ -309,10 +328,18 @@ struct SafeForwardContext {
         for (auto& [_, ptr] : kv_cache) cudaFree(ptr);
     }
 
-    std::vector<float>& compressor_state_for_layer(int layer_id, int ratio, int head_dim) {
-        auto it = compressor_state.find(layer_id);
-        if (it != compressor_state.end()) return it->second;
-        auto& state = compressor_state[layer_id];
+    std::vector<float>& compressor_kv_state_for_layer(int layer_id, int ratio, int head_dim) {
+        auto it = compressor_kv_state.find(layer_id);
+        if (it != compressor_kv_state.end()) return it->second;
+        auto& state = compressor_kv_state[layer_id];
+        state.assign(static_cast<size_t>(ratio) * head_dim, 0.0f);
+        return state;
+    }
+
+    std::vector<float>& compressor_score_state_for_layer(int layer_id, int ratio, int head_dim) {
+        auto it = compressor_score_state.find(layer_id);
+        if (it != compressor_score_state.end()) return it->second;
+        auto& state = compressor_score_state[layer_id];
         state.assign(static_cast<size_t>(ratio) * head_dim, 0.0f);
         return state;
     }
@@ -350,7 +377,8 @@ struct SafeForwardContext {
     const SafeTensorInfo* hc_head_base = nullptr;
     int kv_cache_tokens = 0;
     std::unordered_map<int, float*> kv_cache;
-    std::unordered_map<int, std::vector<float>> compressor_state;
+    std::unordered_map<int, std::vector<float>> compressor_kv_state;
+    std::unordered_map<int, std::vector<float>> compressor_score_state;
 };
 
 }  // namespace
@@ -542,7 +570,9 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         attn_dims.layer_id = li;
         attn_dims.cache_write_slot = position % attn_dims.window_size;
         float* d_layer_kv_cache = ctx.kv_cache_tokens > 0 ? ctx.kv_cache_for_layer(li, attn_dims.head_dim) : nullptr;
-        const int layer_cache_len = d_layer_kv_cache == nullptr ? 0 : std::min(position + 1, attn_dims.window_size);
+        uint64_t layer_compress_ratio = static_cast<size_t>(li) < ctx.config.compress_ratios.size() ? ctx.config.compress_ratios[static_cast<size_t>(li)] : 0;
+        const int compressed_ready = layer_compress_ratio == 0 ? 0 : position / static_cast<int>(layer_compress_ratio);
+        const int layer_cache_len = d_layer_kv_cache == nullptr ? 0 : std::min(ctx.kv_cache_capacity_for_layer(li), std::min(position + 1, attn_dims.window_size) + compressed_ready);
         SafeTensorsShard attn_norm_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn_norm.weight")));
         SafeTensorsShard qkv_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn.wq_a.weight")));
         SafeTensorsShard wo_a_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn.wo_a.weight")));
@@ -625,19 +655,37 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             throw std::runtime_error("single-token attention smoke launch failed");
         }
         uint64_t compress_ratio = static_cast<size_t>(li) < ctx.config.compress_ratios.size() ? ctx.config.compress_ratios[static_cast<size_t>(li)] : 0;
-        if (d_layer_kv_cache != nullptr && compress_ratio > 0 && compress_ratio <= 256) {
-            std::vector<float>& state = ctx.compressor_state_for_layer(li, static_cast<int>(compress_ratio), attn_dims.head_dim);
-            std::vector<float> kv_host(attn_dims.head_dim);
-            check_cuda(cudaMemcpy(kv_host.data(), d_kv_norm, static_cast<size_t>(attn_dims.head_dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy kv for compressor");
-            const int offset = position % static_cast<int>(compress_ratio);
-            std::copy(kv_host.begin(), kv_host.end(), state.begin() + static_cast<size_t>(offset) * attn_dims.head_dim);
-            if ((position + 1) % static_cast<int>(compress_ratio) == 0) {
+        if (d_layer_kv_cache != nullptr && compress_ratio > 0 && compress_ratio <= 256 && index.shard_for_tensor(prefix + "attn.compressor.wkv.weight") != nullptr) {
+            SafeTensorsShard comp_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn.compressor.wkv.weight")));
+            const auto* comp_wkv = require_tensor(comp_shard, prefix + "attn.compressor.wkv.weight");
+            const auto* comp_wgate = require_tensor(comp_shard, prefix + "attn.compressor.wgate.weight");
+            const auto* comp_ape = require_tensor(comp_shard, prefix + "attn.compressor.ape");
+            const auto* comp_norm = require_tensor(comp_shard, prefix + "attn.compressor.norm.weight");
+            std::vector<float> comp_kv = bf16_matvec_cpu(attn_hc.x, reinterpret_cast<const uint16_t*>(comp_shard.tensor_data(*comp_wkv)), attn_dims.head_dim, dim);
+            std::vector<float> comp_score = bf16_matvec_cpu(attn_hc.x, reinterpret_cast<const uint16_t*>(comp_shard.tensor_data(*comp_wgate)), attn_dims.head_dim, dim);
+            const int ratio = static_cast<int>(compress_ratio);
+            const int offset = position % ratio;
+            const float* ape = reinterpret_cast<const float*>(comp_shard.tensor_data(*comp_ape)) + static_cast<size_t>(offset) * attn_dims.head_dim;
+            std::vector<float>& kv_state = ctx.compressor_kv_state_for_layer(li, ratio, attn_dims.head_dim);
+            std::vector<float>& score_state = ctx.compressor_score_state_for_layer(li, ratio, attn_dims.head_dim);
+            for (int d = 0; d < attn_dims.head_dim; ++d) {
+                kv_state[static_cast<size_t>(offset) * attn_dims.head_dim + d] = comp_kv[d];
+                score_state[static_cast<size_t>(offset) * attn_dims.head_dim + d] = comp_score[d] + ape[d];
+            }
+            if ((position + 1) % ratio == 0) {
                 std::vector<float> pooled(attn_dims.head_dim, 0.0f);
-                for (int t = 0; t < static_cast<int>(compress_ratio); ++t) {
-                    for (int d = 0; d < attn_dims.head_dim; ++d) pooled[d] += state[static_cast<size_t>(t) * attn_dims.head_dim + d];
+                for (int d = 0; d < attn_dims.head_dim; ++d) {
+                    float max_score = -INFINITY;
+                    for (int t = 0; t < ratio; ++t) max_score = std::max(max_score, score_state[static_cast<size_t>(t) * attn_dims.head_dim + d]);
+                    float denom = 0.0f;
+                    for (int t = 0; t < ratio; ++t) denom += std::exp(score_state[static_cast<size_t>(t) * attn_dims.head_dim + d] - max_score);
+                    for (int t = 0; t < ratio; ++t) {
+                        const float w = std::exp(score_state[static_cast<size_t>(t) * attn_dims.head_dim + d] - max_score) / denom;
+                        pooled[d] += w * kv_state[static_cast<size_t>(t) * attn_dims.head_dim + d];
+                    }
                 }
-                for (float& v : pooled) v /= static_cast<float>(compress_ratio);
-                const int compressed_slot = attn_dims.window_size + position / static_cast<int>(compress_ratio);
+                pooled = rmsnorm_cpu(pooled, reinterpret_cast<const uint16_t*>(comp_shard.tensor_data(*comp_norm)), 1e-6f);
+                const int compressed_slot = attn_dims.window_size + position / ratio;
                 if (compressed_slot < ctx.kv_cache_capacity_for_layer(li)) {
                     check_cuda(cudaMemcpy(d_layer_kv_cache + static_cast<size_t>(compressed_slot) * attn_dims.head_dim, pooled.data(), static_cast<size_t>(attn_dims.head_dim) * sizeof(float), cudaMemcpyHostToDevice), "copy compressed kv");
                 }

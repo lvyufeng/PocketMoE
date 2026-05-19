@@ -77,4 +77,11 @@ bool vector_accum_cuda(
     float scale,
     void* stream = nullptr);
 
+bool repeat_vector_cuda(
+    const float* d_x,
+    float* d_y,
+    int cols,
+    int repeats,
+    void* stream = nullptr);
+
 }  // namespace dsv4

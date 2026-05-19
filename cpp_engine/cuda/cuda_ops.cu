@@ -21,6 +21,11 @@ __global__ void vector_accum_kernel(const float* x, float* y, int cols, float sc
     for (int c = threadIdx.x; c < cols; c += blockDim.x) y[c] += x[c] * scale;
 }
 
+__global__ void repeat_vector_kernel(const float* x, float* y, int cols, int repeats) {
+    const int total = cols * repeats;
+    for (int i = threadIdx.x; i < total; i += blockDim.x) y[i] = x[i % cols];
+}
+
 }  // namespace
 
 bool cuda_runtime_available() {
@@ -46,6 +51,13 @@ bool vector_accum_cuda(const float* d_x, float* d_y, int cols, float scale, void
     if (d_x == nullptr || d_y == nullptr || cols <= 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     vector_accum_kernel<<<1, 256, 0, cuda_stream>>>(d_x, d_y, cols, scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool repeat_vector_cuda(const float* d_x, float* d_y, int cols, int repeats, void* stream) {
+    if (d_x == nullptr || d_y == nullptr || cols <= 0 || repeats <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    repeat_vector_kernel<<<1, 256, 0, cuda_stream>>>(d_x, d_y, cols, repeats);
     return cudaGetLastError() == cudaSuccess;
 }
 

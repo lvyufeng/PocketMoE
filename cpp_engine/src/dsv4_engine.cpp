@@ -173,6 +173,7 @@ ForwardSmokeResult run_safetensors_layer_loop_smoke(const std::string& ckpt_dir,
     float* d_q = nullptr;
     float* d_kv_a = nullptr;
     float* d_kv_norm = nullptr;
+    float* d_attn_value = nullptr;
     float* d_attn_mid = nullptr;
     float* d_attn_out = nullptr;
     float* d_resid1 = nullptr;
@@ -214,6 +215,7 @@ ForwardSmokeResult run_safetensors_layer_loop_smoke(const std::string& ckpt_dir,
     check_cuda(cudaMalloc(&d_q, static_cast<size_t>(q_dim) * sizeof(float)), "cudaMalloc q");
     check_cuda(cudaMalloc(&d_kv_a, static_cast<size_t>(kv_dim) * sizeof(float)), "cudaMalloc kv_a");
     check_cuda(cudaMalloc(&d_kv_norm, static_cast<size_t>(kv_dim) * sizeof(float)), "cudaMalloc kv_norm");
+    check_cuda(cudaMalloc(&d_attn_value, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc attn value");
     check_cuda(cudaMalloc(&d_attn_mid, static_cast<size_t>(attn_mid) * sizeof(float)), "cudaMalloc attn mid");
     check_cuda(cudaMalloc(&d_attn_out, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc attn out");
     check_cuda(cudaMalloc(&d_resid1, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc resid1");
@@ -272,7 +274,8 @@ ForwardSmokeResult run_safetensors_layer_loop_smoke(const std::string& ckpt_dir,
         if (!fp8_e4m3_e8m0_matvec_cuda(d_q_norm, d_wq_b, d_wq_b_scale, d_q, q_dim, q_a_dim)) throw std::runtime_error("wq_b launch failed");
         if (!fp8_e4m3_e8m0_matvec_cuda(d_attn_norm, d_wkv, d_wkv_scale, d_kv_a, kv_dim, dim)) throw std::runtime_error("wkv launch failed");
         if (!rmsnorm_bf16_gamma_cuda(d_kv_a, d_kv_gamma, d_kv_norm, kv_dim, 1e-6f)) throw std::runtime_error("kv norm launch failed");
-        if (!fp8_e4m3_e8m0_matvec_cuda(d_attn_norm, d_wo_a, d_wo_a_scale, d_attn_mid, attn_mid, dim)) throw std::runtime_error("wo_a launch failed");
+        if (!repeat_vector_cuda(d_kv_norm, d_attn_value, kv_dim, dim / kv_dim)) throw std::runtime_error("single-token attention value expand failed");
+        if (!fp8_e4m3_e8m0_matvec_cuda(d_attn_value, d_wo_a, d_wo_a_scale, d_attn_mid, attn_mid, dim)) throw std::runtime_error("wo_a launch failed");
         if (!fp8_e4m3_e8m0_matvec_cuda(d_attn_mid, d_wo_b, d_wo_b_scale, d_attn_out, dim, attn_mid)) throw std::runtime_error("wo_b launch failed");
         if (!vector_add_cuda(d_x, d_attn_out, d_resid1, dim)) throw std::runtime_error("resid1 launch failed");
         if (!rmsnorm_bf16_gamma_cuda(d_resid1, d_ffn_gamma, d_ffn_norm, dim, 1e-6f)) throw std::runtime_error("ffn norm launch failed");
@@ -348,6 +351,7 @@ ForwardSmokeResult run_safetensors_layer_loop_smoke(const std::string& ckpt_dir,
     cudaFree(d_q);
     cudaFree(d_kv_a);
     cudaFree(d_kv_norm);
+    cudaFree(d_attn_value);
     cudaFree(d_attn_mid);
     cudaFree(d_attn_out);
     cudaFree(d_resid1);

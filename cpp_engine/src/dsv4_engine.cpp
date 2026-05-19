@@ -493,8 +493,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     attn_dims.rope_dim = static_cast<int>(config.rope_dim);
     attn_dims.position = position;
     attn_dims.window_size = static_cast<int>(config.window_size == 0 ? 128 : config.window_size);
-    attn_dims.rope_theta = static_cast<float>(config.compress_rope_theta > 0.0 ? config.compress_rope_theta : config.rope_theta);
-    if (attn_dims.q_a_dim <= 0 || attn_dims.heads <= 0 || attn_dims.head_dim <= 0 || attn_dims.kv_dim <= 0 || attn_dims.groups <= 0 || attn_dims.group_rank <= 0 || attn_dims.rope_dim <= 0 || attn_dims.rope_theta <= 0.0f) {
+    if (attn_dims.q_a_dim <= 0 || attn_dims.heads <= 0 || attn_dims.head_dim <= 0 || attn_dims.kv_dim <= 0 || attn_dims.groups <= 0 || attn_dims.group_rank <= 0 || attn_dims.rope_dim <= 0) {
         throw std::runtime_error("invalid attention dimensions in config");
     }
     if (attn_dims.q_dim % attn_dims.groups != 0) throw std::runtime_error("attention q dim must be divisible by output groups");
@@ -615,6 +614,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         attn_dims.cache_write_slot = position % attn_dims.window_size;
         float* d_layer_kv_cache = ctx.kv_cache_tokens > 0 ? ctx.kv_cache_for_layer(li, attn_dims.head_dim) : nullptr;
         uint64_t layer_compress_ratio = static_cast<size_t>(li) < ctx.config.compress_ratios.size() ? ctx.config.compress_ratios[static_cast<size_t>(li)] : 0;
+        attn_dims.rope_theta = static_cast<float>(layer_compress_ratio == 0 ? config.rope_theta : config.compress_rope_theta);
+        if (attn_dims.rope_theta <= 0.0f) throw std::runtime_error("invalid layer rope_theta");
         const int compressed_ready = layer_compress_ratio == 0 ? 0 : (position + 1) / static_cast<int>(layer_compress_ratio);
         const int window_len = std::min(position + 1, attn_dims.window_size);
         const int layer_cache_len = d_layer_kv_cache == nullptr ? 0 : std::min(ctx.kv_cache_capacity_for_layer(li), window_len + compressed_ready);

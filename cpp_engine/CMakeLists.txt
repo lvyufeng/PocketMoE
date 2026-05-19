@@ -72,3 +72,7 @@ set_target_properties(test_fp8_matvec PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAK
 add_executable(test_rmsnorm tests/test_rmsnorm.cpp)
 target_link_libraries(test_rmsnorm PRIVATE dsv4_cpp_core)
 set_target_properties(test_rmsnorm PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_attention_projection tests/test_attention_projection.cpp)
+target_link_libraries(test_attention_projection PRIVATE dsv4_cpp_core)
+set_target_properties(test_attention_projection PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

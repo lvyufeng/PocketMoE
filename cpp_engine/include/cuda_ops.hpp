@@ -105,6 +105,18 @@ bool cached_single_token_attention_cuda(
     float scale,
     void* stream = nullptr);
 
+bool indexed_cached_single_token_attention_cuda(
+    const float* d_q,
+    const float* d_kv_cache,
+    const int* d_indices,
+    const float* d_attn_sink,
+    float* d_y,
+    int heads,
+    int head_dim,
+    int index_count,
+    float scale,
+    void* stream = nullptr);
+
 bool head_rmsnorm_rope_cuda(
     float* d_x,
     int heads,

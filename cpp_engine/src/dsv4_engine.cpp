@@ -199,6 +199,8 @@ bool run_single_token_attention_smoke(
     const uint8_t* d_wo_b_scale,
     const float* d_attn_sink,
     float* d_kv_cache,
+    const int* d_kv_indices,
+    int index_count,
     int cache_len,
     float* d_attn_norm,
     float* d_q_a,
@@ -219,7 +221,9 @@ bool run_single_token_attention_smoke(
     if (!head_rmsnorm_rope_cuda(d_kv_norm, 1, dims.head_dim, dims.rope_dim, dims.position, dims.rope_theta, false, 0.0f)) return false;
     if (d_kv_cache != nullptr) {
         if (cudaMemcpy(d_kv_cache + static_cast<size_t>(dims.cache_write_slot) * dims.head_dim, d_kv_norm, static_cast<size_t>(dims.head_dim) * sizeof(float), cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
-        if (!cached_single_token_attention_cuda(d_q, d_kv_cache, d_attn_sink, d_attn_value, dims.heads, dims.head_dim, cache_len, 1.0f / std::sqrt(static_cast<float>(dims.head_dim)))) return false;
+        if (d_kv_indices != nullptr && index_count > 0) {
+            if (!indexed_cached_single_token_attention_cuda(d_q, d_kv_cache, d_kv_indices, d_attn_sink, d_attn_value, dims.heads, dims.head_dim, index_count, 1.0f / std::sqrt(static_cast<float>(dims.head_dim)))) return false;
+        } else if (!cached_single_token_attention_cuda(d_q, d_kv_cache, d_attn_sink, d_attn_value, dims.heads, dims.head_dim, cache_len, 1.0f / std::sqrt(static_cast<float>(dims.head_dim)))) return false;
     } else if (!single_token_sparse_attention_cuda(d_q, d_kv_norm, d_attn_sink, d_attn_value, dims.heads, dims.head_dim, 1.0f / std::sqrt(static_cast<float>(dims.head_dim)))) return false;
     if (!head_rmsnorm_rope_cuda(d_attn_value, dims.heads, dims.head_dim, dims.rope_dim, dims.position, dims.rope_theta, true, 0.0f)) return false;
     for (int g = 0; g < dims.groups; ++g) {
@@ -328,19 +332,19 @@ struct SafeForwardContext {
         for (auto& [_, ptr] : kv_cache) cudaFree(ptr);
     }
 
-    std::vector<float>& compressor_kv_state_for_layer(int layer_id, int ratio, int head_dim) {
+    std::vector<float>& compressor_kv_state_for_layer(int layer_id, int slots, int cols) {
         auto it = compressor_kv_state.find(layer_id);
         if (it != compressor_kv_state.end()) return it->second;
         auto& state = compressor_kv_state[layer_id];
-        state.assign(static_cast<size_t>(ratio) * head_dim, 0.0f);
+        state.assign(static_cast<size_t>(slots) * cols, 0.0f);
         return state;
     }
 
-    std::vector<float>& compressor_score_state_for_layer(int layer_id, int ratio, int head_dim) {
+    std::vector<float>& compressor_score_state_for_layer(int layer_id, int slots, int cols) {
         auto it = compressor_score_state.find(layer_id);
         if (it != compressor_score_state.end()) return it->second;
         auto& state = compressor_score_state[layer_id];
-        state.assign(static_cast<size_t>(ratio) * head_dim, 0.0f);
+        state.assign(static_cast<size_t>(slots) * cols, -INFINITY);
         return state;
     }
 
@@ -503,6 +507,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     float* d_attn_value = nullptr;
     float* d_attn_mid = nullptr;
     float* d_attn_out = nullptr;
+    int* d_kv_indices = nullptr;
     float* d_resid1 = nullptr;
     float* d_ffn_norm = nullptr;
     float* d_gate = nullptr;
@@ -547,6 +552,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     check_cuda(cudaMalloc(&d_attn_value, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "cudaMalloc attn value");
     check_cuda(cudaMalloc(&d_attn_mid, static_cast<size_t>(attn_dims.attn_mid) * sizeof(float)), "cudaMalloc attn mid");
     check_cuda(cudaMalloc(&d_attn_out, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc attn out");
+    check_cuda(cudaMalloc(&d_kv_indices, 640 * sizeof(int)), "cudaMalloc kv indices");
     check_cuda(cudaMalloc(&d_resid1, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc resid1");
     check_cuda(cudaMalloc(&d_ffn_norm, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc ffn norm");
     check_cuda(cudaMalloc(&d_gate, static_cast<size_t>(inter) * sizeof(float)), "cudaMalloc gate");
@@ -572,7 +578,19 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         float* d_layer_kv_cache = ctx.kv_cache_tokens > 0 ? ctx.kv_cache_for_layer(li, attn_dims.head_dim) : nullptr;
         uint64_t layer_compress_ratio = static_cast<size_t>(li) < ctx.config.compress_ratios.size() ? ctx.config.compress_ratios[static_cast<size_t>(li)] : 0;
         const int compressed_ready = layer_compress_ratio == 0 ? 0 : position / static_cast<int>(layer_compress_ratio);
-        const int layer_cache_len = d_layer_kv_cache == nullptr ? 0 : std::min(ctx.kv_cache_capacity_for_layer(li), std::min(position + 1, attn_dims.window_size) + compressed_ready);
+        const int window_len = std::min(position + 1, attn_dims.window_size);
+        const int layer_cache_len = d_layer_kv_cache == nullptr ? 0 : std::min(ctx.kv_cache_capacity_for_layer(li), window_len + compressed_ready);
+        std::vector<int> kv_indices;
+        if (d_layer_kv_cache != nullptr) {
+            kv_indices.reserve(static_cast<size_t>(window_len + compressed_ready));
+            const int window_start = std::max(0, position - window_len + 1);
+            for (int p = window_start; p <= position; ++p) kv_indices.push_back(p % attn_dims.window_size);
+            for (int c = 0; c < compressed_ready; ++c) {
+                const int slot = attn_dims.window_size + c;
+                if (slot < ctx.kv_cache_capacity_for_layer(li)) kv_indices.push_back(slot);
+            }
+            if (!kv_indices.empty()) check_cuda(cudaMemcpy(d_kv_indices, kv_indices.data(), kv_indices.size() * sizeof(int), cudaMemcpyHostToDevice), "copy kv indices");
+        }
         SafeTensorsShard attn_norm_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn_norm.weight")));
         SafeTensorsShard qkv_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn.wq_a.weight")));
         SafeTensorsShard wo_a_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn.wo_a.weight")));
@@ -642,6 +660,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                 d_wo_b_scale,
                 d_attn_sink,
                 d_layer_kv_cache,
+                kv_indices.empty() ? nullptr : d_kv_indices,
+                static_cast<int>(kv_indices.size()),
                 layer_cache_len,
                 d_attn_norm,
                 d_q_a,
@@ -661,33 +681,49 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             const auto* comp_wgate = require_tensor(comp_shard, prefix + "attn.compressor.wgate.weight");
             const auto* comp_ape = require_tensor(comp_shard, prefix + "attn.compressor.ape");
             const auto* comp_norm = require_tensor(comp_shard, prefix + "attn.compressor.norm.weight");
-            std::vector<float> comp_kv = bf16_matvec_cpu(attn_hc.x, reinterpret_cast<const uint16_t*>(comp_shard.tensor_data(*comp_wkv)), attn_dims.head_dim, dim);
-            std::vector<float> comp_score = bf16_matvec_cpu(attn_hc.x, reinterpret_cast<const uint16_t*>(comp_shard.tensor_data(*comp_wgate)), attn_dims.head_dim, dim);
+            const int comp_cols = static_cast<int>(comp_wkv->shape[0]);
             const int ratio = static_cast<int>(compress_ratio);
+            const bool overlap = comp_cols == attn_dims.head_dim * 2;
+            const int slots = ratio * (overlap ? 2 : 1);
+            std::vector<float> comp_kv = bf16_matvec_cpu(attn_hc.x, reinterpret_cast<const uint16_t*>(comp_shard.tensor_data(*comp_wkv)), comp_cols, dim);
+            std::vector<float> comp_score = bf16_matvec_cpu(attn_hc.x, reinterpret_cast<const uint16_t*>(comp_shard.tensor_data(*comp_wgate)), comp_cols, dim);
             const int offset = position % ratio;
-            const float* ape = reinterpret_cast<const float*>(comp_shard.tensor_data(*comp_ape)) + static_cast<size_t>(offset) * attn_dims.head_dim;
-            std::vector<float>& kv_state = ctx.compressor_kv_state_for_layer(li, ratio, attn_dims.head_dim);
-            std::vector<float>& score_state = ctx.compressor_score_state_for_layer(li, ratio, attn_dims.head_dim);
-            for (int d = 0; d < attn_dims.head_dim; ++d) {
-                kv_state[static_cast<size_t>(offset) * attn_dims.head_dim + d] = comp_kv[d];
-                score_state[static_cast<size_t>(offset) * attn_dims.head_dim + d] = comp_score[d] + ape[d];
+            const float* ape = reinterpret_cast<const float*>(comp_shard.tensor_data(*comp_ape)) + static_cast<size_t>(offset) * comp_cols;
+            std::vector<float>& kv_state = ctx.compressor_kv_state_for_layer(li, slots, attn_dims.head_dim);
+            std::vector<float>& score_state = ctx.compressor_score_state_for_layer(li, slots, attn_dims.head_dim);
+            if (overlap) {
+                for (int d = 0; d < attn_dims.head_dim; ++d) {
+                    kv_state[static_cast<size_t>(ratio + offset) * attn_dims.head_dim + d] = comp_kv[attn_dims.head_dim + d];
+                    score_state[static_cast<size_t>(ratio + offset) * attn_dims.head_dim + d] = comp_score[attn_dims.head_dim + d] + ape[attn_dims.head_dim + d];
+                }
+            } else {
+                for (int d = 0; d < attn_dims.head_dim; ++d) {
+                    kv_state[static_cast<size_t>(offset) * attn_dims.head_dim + d] = comp_kv[d];
+                    score_state[static_cast<size_t>(offset) * attn_dims.head_dim + d] = comp_score[d] + ape[d];
+                }
             }
             if ((position + 1) % ratio == 0) {
                 std::vector<float> pooled(attn_dims.head_dim, 0.0f);
+                const int pool_base = overlap ? 0 : 0;
+                const int pool_slots = overlap ? ratio * 2 : ratio;
                 for (int d = 0; d < attn_dims.head_dim; ++d) {
                     float max_score = -INFINITY;
-                    for (int t = 0; t < ratio; ++t) max_score = std::max(max_score, score_state[static_cast<size_t>(t) * attn_dims.head_dim + d]);
+                    for (int t = 0; t < pool_slots; ++t) max_score = std::max(max_score, score_state[static_cast<size_t>(pool_base + t) * attn_dims.head_dim + d]);
                     float denom = 0.0f;
-                    for (int t = 0; t < ratio; ++t) denom += std::exp(score_state[static_cast<size_t>(t) * attn_dims.head_dim + d] - max_score);
-                    for (int t = 0; t < ratio; ++t) {
-                        const float w = std::exp(score_state[static_cast<size_t>(t) * attn_dims.head_dim + d] - max_score) / denom;
-                        pooled[d] += w * kv_state[static_cast<size_t>(t) * attn_dims.head_dim + d];
+                    for (int t = 0; t < pool_slots; ++t) denom += std::exp(score_state[static_cast<size_t>(pool_base + t) * attn_dims.head_dim + d] - max_score);
+                    for (int t = 0; t < pool_slots; ++t) {
+                        const float w = std::exp(score_state[static_cast<size_t>(pool_base + t) * attn_dims.head_dim + d] - max_score) / denom;
+                        pooled[d] += w * kv_state[static_cast<size_t>(pool_base + t) * attn_dims.head_dim + d];
                     }
                 }
                 pooled = rmsnorm_cpu(pooled, reinterpret_cast<const uint16_t*>(comp_shard.tensor_data(*comp_norm)), 1e-6f);
                 const int compressed_slot = attn_dims.window_size + position / ratio;
                 if (compressed_slot < ctx.kv_cache_capacity_for_layer(li)) {
                     check_cuda(cudaMemcpy(d_layer_kv_cache + static_cast<size_t>(compressed_slot) * attn_dims.head_dim, pooled.data(), static_cast<size_t>(attn_dims.head_dim) * sizeof(float), cudaMemcpyHostToDevice), "copy compressed kv");
+                }
+                if (overlap) {
+                    std::copy(kv_state.begin() + static_cast<size_t>(ratio) * attn_dims.head_dim, kv_state.end(), kv_state.begin());
+                    std::copy(score_state.begin() + static_cast<size_t>(ratio) * attn_dims.head_dim, score_state.end(), score_state.begin());
                 }
             }
         }
@@ -806,6 +842,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     cudaFree(d_attn_value);
     cudaFree(d_attn_mid);
     cudaFree(d_attn_out);
+    cudaFree(d_kv_indices);
     cudaFree(d_resid1);
     cudaFree(d_ffn_norm);
     cudaFree(d_gate);

@@ -15,6 +15,15 @@ __global__ void silu_mul_kernel(const float* gate, const float* up, float* y, in
     }
 }
 
+__global__ void silu_mul_clamped_kernel(const float* gate, const float* up, float* y, int cols, float limit) {
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        const float g = fminf(gate[c], limit);
+        const float u = fminf(fmaxf(up[c], -limit), limit);
+        const float s = g / (1.0f + expf(-g));
+        y[c] = s * u;
+    }
+}
+
 __global__ void vector_add_kernel(const float* a, const float* b, float* y, int cols) {
     for (int c = threadIdx.x; c < cols; c += blockDim.x) y[c] = a[c] + b[c];
 }
@@ -288,6 +297,13 @@ bool silu_mul_cuda(const float* d_gate, const float* d_up, float* d_y, int cols,
     if (d_gate == nullptr || d_up == nullptr || d_y == nullptr || cols <= 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     silu_mul_kernel<<<1, 256, 0, cuda_stream>>>(d_gate, d_up, d_y, cols);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool silu_mul_clamped_cuda(const float* d_gate, const float* d_up, float* d_y, int cols, float limit, void* stream) {
+    if (d_gate == nullptr || d_up == nullptr || d_y == nullptr || cols <= 0 || limit <= 0.0f) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    silu_mul_clamped_kernel<<<1, 256, 0, cuda_stream>>>(d_gate, d_up, d_y, cols, limit);
     return cudaGetLastError() == cudaSuccess;
 }
 

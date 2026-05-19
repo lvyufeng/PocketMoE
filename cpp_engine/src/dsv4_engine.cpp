@@ -248,19 +248,32 @@ std::vector<RoutedExpert> select_smoke_experts(
     uint64_t topk,
     float route_scale) {
     const int k = static_cast<int>(std::max<uint64_t>(1, topk));
+    const std::string weight_name = prefix + "ffn.gate.weight";
     const std::string tid_name = prefix + "ffn.gate.tid2eid";
     if (static_cast<uint64_t>(layer_id) < n_hash_layers && index.shard_for_tensor(tid_name) != nullptr) {
-        SafeTensorsShard shard(index.shard_path(*index.shard_for_tensor(tid_name)));
-        const auto* info = require_tensor(shard, tid_name);
-        const auto* ids = reinterpret_cast<const int64_t*>(shard.tensor_data(*info));
+        SafeTensorsShard tid_shard(index.shard_path(*index.shard_for_tensor(tid_name)));
+        const auto* info = require_tensor(tid_shard, tid_name);
+        const auto* ids = reinterpret_cast<const int64_t*>(tid_shard.tensor_data(*info));
+        SafeTensorsShard weight_shard(index.shard_path(*index.shard_for_tensor(weight_name)));
+        const auto* weight = require_tensor(weight_shard, weight_name);
+        const auto* w = reinterpret_cast<const uint16_t*>(weight_shard.tensor_data(*weight));
         const int count = static_cast<int>(std::min<uint64_t>(info->shape[1], k));
+        const int dim = static_cast<int>(weight->shape[1]);
+        std::vector<float> original(count);
+        float denom = 0.0f;
+        for (int i = 0; i < count; ++i) {
+            const int e = static_cast<int>(ids[static_cast<size_t>(token) * info->shape[1] + i]);
+            float dot = 0.0f;
+            for (int d = 0; d < dim; ++d) dot += ffn_norm[d] * bf16_to_float(w[static_cast<size_t>(e) * dim + d]);
+            original[i] = std::sqrt(std::log1pf(std::exp(dot)));
+            denom += original[i];
+        }
+        if (denom == 0.0f) denom = 1.0f;
         std::vector<RoutedExpert> out(count);
-        const float weight = route_scale / static_cast<float>(count);
-        for (int i = 0; i < count; ++i) out[i] = RoutedExpert{static_cast<int>(ids[static_cast<size_t>(token) * info->shape[1] + i]), weight};
+        for (int i = 0; i < count; ++i) out[i] = RoutedExpert{static_cast<int>(ids[static_cast<size_t>(token) * info->shape[1] + i]), original[i] / denom * route_scale};
         return out;
     }
 
-    const std::string weight_name = prefix + "ffn.gate.weight";
     SafeTensorsShard weight_shard(index.shard_path(*index.shard_for_tensor(weight_name)));
     const auto* weight = require_tensor(weight_shard, weight_name);
     const auto* w = reinterpret_cast<const uint16_t*>(weight_shard.tensor_data(*weight));
@@ -873,7 +886,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             check_cuda(cudaMemcpy(d_s3, w3.shard.tensor_data(*w3.s), w3.s->nbytes, cudaMemcpyHostToDevice), "copy selected s3");
             if (!fp4_e2m1_e8m0_matvec_cuda(d_ffn_norm, d_w1, d_s1, d_gate, inter, dim)) throw std::runtime_error("w1 launch failed");
             if (!fp4_e2m1_e8m0_matvec_cuda(d_ffn_norm, d_w3, d_s3, d_up, inter, dim)) throw std::runtime_error("w3 launch failed");
-            if (!silu_mul_cuda(d_gate, d_up, d_hidden, inter)) throw std::runtime_error("silu launch failed");
+            if (!silu_mul_clamped_cuda(d_gate, d_up, d_hidden, inter, static_cast<float>(config.swiglu_limit))) throw std::runtime_error("silu launch failed");
             if (!fp4_e2m1_e8m0_matvec_cuda(d_hidden, d_w2, d_s2, d_resid2, dim, inter)) throw std::runtime_error("w2 launch failed");
             if (!vector_accum_cuda(d_resid2, d_moe, dim, route.weight)) throw std::runtime_error("moe accum failed");
         }

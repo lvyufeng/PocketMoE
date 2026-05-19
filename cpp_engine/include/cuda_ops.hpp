@@ -48,6 +48,14 @@ bool silu_mul_cuda(
     int cols,
     void* stream = nullptr);
 
+bool silu_mul_clamped_cuda(
+    const float* d_gate,
+    const float* d_up,
+    float* d_y,
+    int cols,
+    float limit,
+    void* stream = nullptr);
+
 bool bf16_row_to_float_cuda(
     const uint16_t* d_matrix_bf16,
     float* d_y,

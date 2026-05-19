@@ -537,6 +537,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     float* d_attn_value = nullptr;
     float* d_attn_mid = nullptr;
     float* d_attn_out = nullptr;
+    float* d_index_q = nullptr;
+    float* d_indexer_kv = nullptr;
     int* d_kv_indices = nullptr;
     float* d_resid1 = nullptr;
     float* d_ffn_norm = nullptr;
@@ -582,6 +584,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     check_cuda(cudaMalloc(&d_attn_value, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "cudaMalloc attn value");
     check_cuda(cudaMalloc(&d_attn_mid, static_cast<size_t>(attn_dims.attn_mid) * sizeof(float)), "cudaMalloc attn mid");
     check_cuda(cudaMalloc(&d_attn_out, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc attn out");
+    check_cuda(cudaMalloc(&d_index_q, static_cast<size_t>(std::max<uint64_t>(1, config.index_n_heads * config.index_head_dim)) * sizeof(float)), "cudaMalloc index q");
+    check_cuda(cudaMalloc(&d_indexer_kv, static_cast<size_t>(std::max<uint64_t>(1, config.index_head_dim)) * sizeof(float)), "cudaMalloc indexer kv tmp");
     check_cuda(cudaMalloc(&d_kv_indices, 640 * sizeof(int)), "cudaMalloc kv indices");
     check_cuda(cudaMalloc(&d_resid1, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc resid1");
     check_cuda(cudaMalloc(&d_ffn_norm, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc ffn norm");
@@ -718,9 +722,97 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             kv_indices.reserve(static_cast<size_t>(window_len + compressed_ready));
             const int window_start = std::max(0, position - window_len + 1);
             for (int p = window_start; p <= position; ++p) kv_indices.push_back(p % attn_dims.window_size);
-            for (int c = 0; c < compressed_ready; ++c) {
-                const int slot = attn_dims.window_size + c;
-                if (slot < ctx.kv_cache_capacity_for_layer(li)) kv_indices.push_back(slot);
+            if (compress_ratio == 4 && compressed_ready > 0 && index.shard_for_tensor(prefix + "attn.indexer.wq_b.weight") != nullptr) {
+                SafeTensorsShard idx_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn.indexer.wq_b.weight")));
+                const auto* idx_wq_b = require_tensor(idx_shard, prefix + "attn.indexer.wq_b.weight");
+                const auto* idx_wq_b_scale = require_tensor(idx_shard, prefix + "attn.indexer.wq_b.scale");
+                const auto* idx_weights = require_tensor(idx_shard, prefix + "attn.indexer.weights_proj.weight");
+                const auto* idx_comp_wkv = require_tensor(idx_shard, prefix + "attn.indexer.compressor.wkv.weight");
+                const auto* idx_comp_wgate = require_tensor(idx_shard, prefix + "attn.indexer.compressor.wgate.weight");
+                const auto* idx_comp_ape = require_tensor(idx_shard, prefix + "attn.indexer.compressor.ape");
+                const auto* idx_comp_norm = require_tensor(idx_shard, prefix + "attn.indexer.compressor.norm.weight");
+                const int idx_heads = static_cast<int>(config.index_n_heads);
+                const int idx_head_dim = static_cast<int>(config.index_head_dim);
+                const int idx_cols = static_cast<int>(idx_comp_wkv->shape[0]);
+                const bool idx_overlap = idx_cols == idx_head_dim * 2;
+                const int idx_slots = 4 * (idx_overlap ? 2 : 1);
+                std::vector<float> idx_comp_kv = bf16_matvec_cpu(attn_hc.x, reinterpret_cast<const uint16_t*>(idx_shard.tensor_data(*idx_comp_wkv)), idx_cols, dim);
+                std::vector<float> idx_comp_score = bf16_matvec_cpu(attn_hc.x, reinterpret_cast<const uint16_t*>(idx_shard.tensor_data(*idx_comp_wgate)), idx_cols, dim);
+                const int offset = position % 4;
+                const float* ape = reinterpret_cast<const float*>(idx_shard.tensor_data(*idx_comp_ape)) + static_cast<size_t>(offset) * idx_cols;
+                std::vector<float>& idx_kv_state = ctx.indexer_compressor_kv_state_for_layer(li, idx_slots, idx_head_dim);
+                std::vector<float>& idx_score_state = ctx.indexer_compressor_score_state_for_layer(li, idx_slots, idx_head_dim);
+                if (idx_overlap) {
+                    for (int d = 0; d < idx_head_dim; ++d) {
+                        idx_kv_state[static_cast<size_t>(4 + offset) * idx_head_dim + d] = idx_comp_kv[idx_head_dim + d];
+                        idx_score_state[static_cast<size_t>(4 + offset) * idx_head_dim + d] = idx_comp_score[idx_head_dim + d] + ape[idx_head_dim + d];
+                    }
+                } else {
+                    for (int d = 0; d < idx_head_dim; ++d) {
+                        idx_kv_state[static_cast<size_t>(offset) * idx_head_dim + d] = idx_comp_kv[d];
+                        idx_score_state[static_cast<size_t>(offset) * idx_head_dim + d] = idx_comp_score[d] + ape[d];
+                    }
+                }
+                if ((position + 1) % 4 == 0) {
+                    std::vector<float> pooled(idx_head_dim, 0.0f);
+                    const int pool_slots = idx_overlap ? 8 : 4;
+                    for (int d = 0; d < idx_head_dim; ++d) {
+                        float max_score = -INFINITY;
+                        for (int t = 0; t < pool_slots; ++t) max_score = std::max(max_score, idx_score_state[static_cast<size_t>(t) * idx_head_dim + d]);
+                        float denom = 0.0f;
+                        for (int t = 0; t < pool_slots; ++t) denom += std::exp(idx_score_state[static_cast<size_t>(t) * idx_head_dim + d] - max_score);
+                        for (int t = 0; t < pool_slots; ++t) {
+                            const float w = std::exp(idx_score_state[static_cast<size_t>(t) * idx_head_dim + d] - max_score) / denom;
+                            pooled[d] += w * idx_kv_state[static_cast<size_t>(t) * idx_head_dim + d];
+                        }
+                    }
+                    pooled = rmsnorm_cpu(pooled, reinterpret_cast<const uint16_t*>(idx_shard.tensor_data(*idx_comp_norm)), 1e-6f);
+                    float* d_idx_cache = ctx.indexer_kv_cache_for_layer(li, idx_head_dim);
+                    check_cuda(cudaMemcpy(d_idx_cache + static_cast<size_t>(position / 4) * idx_head_dim, pooled.data(), static_cast<size_t>(idx_head_dim) * sizeof(float), cudaMemcpyHostToDevice), "copy indexer compressed kv");
+                    if (idx_overlap) {
+                        std::copy(idx_kv_state.begin() + static_cast<size_t>(4) * idx_head_dim, idx_kv_state.end(), idx_kv_state.begin());
+                        std::copy(idx_score_state.begin() + static_cast<size_t>(4) * idx_head_dim, idx_score_state.end(), idx_score_state.begin());
+                    }
+                }
+                if (!rmsnorm_bf16_gamma_cuda(d_x, d_attn_gamma, d_attn_norm, dim, 1e-6f)) throw std::runtime_error("indexer attn norm launch failed");
+                if (!fp8_e4m3_e8m0_matvec_cuda(d_attn_norm, d_wq_a, d_wq_a_scale, d_q_a, attn_dims.q_a_dim, dim)) throw std::runtime_error("indexer wq_a launch failed");
+                if (!rmsnorm_bf16_gamma_cuda(d_q_a, d_q_gamma, d_q_norm, attn_dims.q_a_dim, 1e-6f)) throw std::runtime_error("indexer q norm launch failed");
+                check_cuda(cudaMemcpy(d_w2, idx_shard.tensor_data(*idx_wq_b), idx_wq_b->nbytes, cudaMemcpyHostToDevice), "copy indexer wq_b");
+                check_cuda(cudaMemcpy(d_s2, idx_shard.tensor_data(*idx_wq_b_scale), idx_wq_b_scale->nbytes, cudaMemcpyHostToDevice), "copy indexer wq_b scale");
+                if (!fp8_e4m3_e8m0_matvec_cuda(d_q_norm, d_w2, d_s2, d_index_q, idx_heads * idx_head_dim, attn_dims.q_a_dim)) throw std::runtime_error("indexer wq_b launch failed");
+                if (!head_rmsnorm_rope_cuda(d_index_q, idx_heads, idx_head_dim, attn_dims.rope_dim, position, attn_dims.rope_theta, false, 1e-6f)) throw std::runtime_error("indexer q rope launch failed");
+                std::vector<float> index_q(static_cast<size_t>(idx_heads) * idx_head_dim);
+                std::vector<float> index_weights(idx_heads);
+                std::vector<float> index_kv(static_cast<size_t>(compressed_ready) * idx_head_dim);
+                check_cuda(cudaMemcpy(index_q.data(), d_index_q, index_q.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy index q host");
+                check_cuda(cudaMemcpy(index_kv.data(), ctx.indexer_kv_cache_for_layer(li, idx_head_dim), index_kv.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy index kv host");
+                const auto* wproj = reinterpret_cast<const uint16_t*>(idx_shard.tensor_data(*idx_weights));
+                const float weight_scale = 1.0f / std::sqrt(static_cast<float>(idx_head_dim) * static_cast<float>(idx_heads));
+                for (int h = 0; h < idx_heads; ++h) {
+                    double dot = 0.0;
+                    for (int d = 0; d < dim; ++d) dot += static_cast<double>(bf16_to_float(wproj[static_cast<size_t>(h) * dim + d])) * attn_hc.x[d];
+                    index_weights[h] = static_cast<float>(dot) * weight_scale;
+                }
+                std::vector<float> scores(compressed_ready, 0.0f);
+                for (int c = 0; c < compressed_ready; ++c) {
+                    float score = 0.0f;
+                    for (int h = 0; h < idx_heads; ++h) {
+                        float dot = 0.0f;
+                        for (int d = 0; d < idx_head_dim; ++d) dot += index_q[static_cast<size_t>(h) * idx_head_dim + d] * index_kv[static_cast<size_t>(c) * idx_head_dim + d];
+                        score += std::max(0.0f, dot) * index_weights[h];
+                    }
+                    scores[c] = score;
+                }
+                std::vector<int> order(compressed_ready);
+                std::iota(order.begin(), order.end(), 0);
+                const int keep = std::min<int>(compressed_ready, std::max<uint64_t>(1, config.index_topk));
+                std::partial_sort(order.begin(), order.begin() + keep, order.end(), [&](int a, int b) { return scores[a] > scores[b]; });
+                for (int i = 0; i < keep; ++i) kv_indices.push_back(attn_dims.window_size + order[i]);
+            } else {
+                for (int c = 0; c < compressed_ready; ++c) {
+                    const int slot = attn_dims.window_size + c;
+                    if (slot < ctx.kv_cache_capacity_for_layer(li)) kv_indices.push_back(slot);
+                }
             }
             if (!kv_indices.empty()) check_cuda(cudaMemcpy(d_kv_indices, kv_indices.data(), kv_indices.size() * sizeof(int), cudaMemcpyHostToDevice), "copy kv indices");
         }
@@ -872,6 +964,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     cudaFree(d_attn_value);
     cudaFree(d_attn_mid);
     cudaFree(d_attn_out);
+    cudaFree(d_index_q);
+    cudaFree(d_indexer_kv);
     cudaFree(d_kv_indices);
     cudaFree(d_resid1);
     cudaFree(d_ffn_norm);

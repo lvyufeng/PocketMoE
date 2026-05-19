@@ -49,6 +49,11 @@ struct AttentionSmokeDims {
     int q_a_dim = 0;
     int q_dim = 0;
     int kv_dim = 0;
+    int heads = 0;
+    int head_dim = 0;
+    int groups = 0;
+    int group_dim = 0;
+    int group_rank = 0;
     int attn_mid = 0;
 };
 
@@ -68,6 +73,7 @@ bool run_single_token_attention_smoke(
     const uint8_t* d_wo_a_scale,
     const uint8_t* d_wo_b,
     const uint8_t* d_wo_b_scale,
+    const float* d_attn_sink,
     float* d_attn_norm,
     float* d_q_a,
     float* d_q_norm,
@@ -83,8 +89,14 @@ bool run_single_token_attention_smoke(
     if (!fp8_e4m3_e8m0_matvec_cuda(d_q_norm, d_wq_b, d_wq_b_scale, d_q, dims.q_dim, dims.q_a_dim)) return false;
     if (!fp8_e4m3_e8m0_matvec_cuda(d_attn_norm, d_wkv, d_wkv_scale, d_kv_a, dims.kv_dim, dims.dim)) return false;
     if (!rmsnorm_bf16_gamma_cuda(d_kv_a, d_kv_gamma, d_kv_norm, dims.kv_dim, 1e-6f)) return false;
-    if (!repeat_vector_cuda(d_kv_norm, d_attn_value, dims.kv_dim, dims.dim / dims.kv_dim)) return false;
-    if (!fp8_e4m3_e8m0_matvec_cuda(d_attn_value, d_wo_a, d_wo_a_scale, d_attn_mid, dims.attn_mid, dims.dim)) return false;
+    if (!single_token_sparse_attention_cuda(d_q, d_kv_norm, d_attn_sink, d_attn_value, dims.heads, dims.head_dim, 1.0f / std::sqrt(static_cast<float>(dims.head_dim)))) return false;
+    for (int g = 0; g < dims.groups; ++g) {
+        const float* group_x = d_attn_value + static_cast<size_t>(g) * dims.group_dim;
+        const uint8_t* group_w = d_wo_a + static_cast<size_t>(g) * dims.group_rank * dims.group_dim;
+        const uint8_t* group_s = d_wo_a_scale + static_cast<size_t>(g) * (dims.group_rank / 128) * (dims.group_dim / 128);
+        float* group_y = d_attn_mid + static_cast<size_t>(g) * dims.group_rank;
+        if (!fp8_e4m3_e8m0_matvec_cuda(group_x, group_w, group_s, group_y, dims.group_rank, dims.group_dim)) return false;
+    }
     if (!fp8_e4m3_e8m0_matvec_cuda(d_attn_mid, d_wo_b, d_wo_b_scale, d_attn_out, dims.dim, dims.attn_mid)) return false;
     return true;
 }
@@ -189,13 +201,18 @@ ForwardSmokeResult run_safetensors_token_forward(const std::string& ckpt_dir, in
     AttentionSmokeDims attn_dims;
     attn_dims.dim = dim;
     attn_dims.q_a_dim = static_cast<int>(config.q_lora_rank);
-    attn_dims.q_dim = static_cast<int>(config.n_heads * config.head_dim);
+    attn_dims.heads = static_cast<int>(config.n_heads);
+    attn_dims.head_dim = static_cast<int>(config.head_dim);
+    attn_dims.q_dim = attn_dims.heads * attn_dims.head_dim;
     attn_dims.kv_dim = static_cast<int>(config.kv_heads * config.head_dim);
-    attn_dims.attn_mid = static_cast<int>(config.o_lora_rank * config.o_groups);
-    if (attn_dims.q_a_dim <= 0 || attn_dims.q_dim <= 0 || attn_dims.kv_dim <= 0 || attn_dims.attn_mid <= 0) {
+    attn_dims.groups = static_cast<int>(config.o_groups);
+    attn_dims.group_rank = static_cast<int>(config.o_lora_rank);
+    attn_dims.attn_mid = attn_dims.group_rank * attn_dims.groups;
+    if (attn_dims.q_a_dim <= 0 || attn_dims.heads <= 0 || attn_dims.head_dim <= 0 || attn_dims.kv_dim <= 0 || attn_dims.groups <= 0 || attn_dims.group_rank <= 0) {
         throw std::runtime_error("invalid attention dimensions in config");
     }
-    if (dim % attn_dims.kv_dim != 0) throw std::runtime_error("attention value repeat requires dim divisible by kv dim");
+    if (attn_dims.q_dim % attn_dims.groups != 0) throw std::runtime_error("attention q dim must be divisible by output groups");
+    attn_dims.group_dim = attn_dims.q_dim / attn_dims.groups;
     const int inter = static_cast<int>(first_w1.pair.rows);
     const int head_rows = static_cast<int>(head->shape[0]);
 
@@ -213,6 +230,7 @@ ForwardSmokeResult run_safetensors_token_forward(const std::string& ckpt_dir, in
     uint8_t* d_wo_a_scale = nullptr;
     uint8_t* d_wo_b = nullptr;
     uint8_t* d_wo_b_scale = nullptr;
+    float* d_attn_sink = nullptr;
     uint16_t* d_ffn_gamma = nullptr;
     uint8_t* d_w1 = nullptr;
     uint8_t* d_s1 = nullptr;
@@ -255,6 +273,7 @@ ForwardSmokeResult run_safetensors_token_forward(const std::string& ckpt_dir, in
     check_cuda(cudaMalloc(&d_wo_a_scale, static_cast<size_t>(attn_dims.attn_mid / 128) * (dim / 128)), "cudaMalloc wo_a scale");
     check_cuda(cudaMalloc(&d_wo_b, static_cast<size_t>(dim) * attn_dims.attn_mid), "cudaMalloc wo_b");
     check_cuda(cudaMalloc(&d_wo_b_scale, static_cast<size_t>(dim / 128) * (attn_dims.attn_mid / 128)), "cudaMalloc wo_b scale");
+    check_cuda(cudaMalloc(&d_attn_sink, static_cast<size_t>(attn_dims.heads) * sizeof(float)), "cudaMalloc attn sink");
     check_cuda(cudaMalloc(&d_ffn_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc ffn gamma");
     check_cuda(cudaMalloc(&d_w1, first_w1.w->nbytes), "cudaMalloc w1");
     check_cuda(cudaMalloc(&d_s1, first_w1.s->nbytes), "cudaMalloc s1");
@@ -270,7 +289,7 @@ ForwardSmokeResult run_safetensors_token_forward(const std::string& ckpt_dir, in
     check_cuda(cudaMalloc(&d_q, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "cudaMalloc q");
     check_cuda(cudaMalloc(&d_kv_a, static_cast<size_t>(attn_dims.kv_dim) * sizeof(float)), "cudaMalloc kv_a");
     check_cuda(cudaMalloc(&d_kv_norm, static_cast<size_t>(attn_dims.kv_dim) * sizeof(float)), "cudaMalloc kv_norm");
-    check_cuda(cudaMalloc(&d_attn_value, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc attn value");
+    check_cuda(cudaMalloc(&d_attn_value, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "cudaMalloc attn value");
     check_cuda(cudaMalloc(&d_attn_mid, static_cast<size_t>(attn_dims.attn_mid) * sizeof(float)), "cudaMalloc attn mid");
     check_cuda(cudaMalloc(&d_attn_out, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc attn out");
     check_cuda(cudaMalloc(&d_resid1, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc resid1");
@@ -302,6 +321,7 @@ ForwardSmokeResult run_safetensors_token_forward(const std::string& ckpt_dir, in
         const auto* wkv = require_tensor(qkv_shard, prefix + "attn.wkv.weight");
         const auto* wkv_scale = require_tensor(qkv_shard, prefix + "attn.wkv.scale");
         const auto* kv_norm = require_tensor(qkv_shard, prefix + "attn.kv_norm.weight");
+        const auto* attn_sink = require_tensor(qkv_shard, prefix + "attn.attn_sink");
         const auto* wo_a = require_tensor(wo_a_shard, prefix + "attn.wo_a.weight");
         const auto* wo_a_scale = require_tensor(wo_a_shard, prefix + "attn.wo_a.scale");
         const auto* wo_b = require_tensor(wo_b_shard, prefix + "attn.wo_b.weight");
@@ -321,6 +341,7 @@ ForwardSmokeResult run_safetensors_token_forward(const std::string& ckpt_dir, in
         check_cuda(cudaMemcpy(d_wo_a_scale, wo_a_shard.tensor_data(*wo_a_scale), wo_a_scale->nbytes, cudaMemcpyHostToDevice), "copy wo_a scale");
         check_cuda(cudaMemcpy(d_wo_b, wo_b_shard.tensor_data(*wo_b), wo_b->nbytes, cudaMemcpyHostToDevice), "copy wo_b");
         check_cuda(cudaMemcpy(d_wo_b_scale, wo_b_shard.tensor_data(*wo_b_scale), wo_b_scale->nbytes, cudaMemcpyHostToDevice), "copy wo_b scale");
+        check_cuda(cudaMemcpy(d_attn_sink, qkv_shard.tensor_data(*attn_sink), attn_sink->nbytes, cudaMemcpyHostToDevice), "copy attn sink");
         check_cuda(cudaMemcpy(d_ffn_gamma, ffn_norm_shard.tensor_data(*ffn_norm), ffn_norm->nbytes, cudaMemcpyHostToDevice), "copy ffn gamma");
 
         if (!run_single_token_attention_smoke(
@@ -339,6 +360,7 @@ ForwardSmokeResult run_safetensors_token_forward(const std::string& ckpt_dir, in
                 d_wo_a_scale,
                 d_wo_b,
                 d_wo_b_scale,
+                d_attn_sink,
                 d_attn_norm,
                 d_q_a,
                 d_q_norm,
@@ -409,6 +431,7 @@ ForwardSmokeResult run_safetensors_token_forward(const std::string& ckpt_dir, in
     cudaFree(d_wo_a_scale);
     cudaFree(d_wo_b);
     cudaFree(d_wo_b_scale);
+    cudaFree(d_attn_sink);
     cudaFree(d_ffn_gamma);
     cudaFree(d_w1);
     cudaFree(d_s1);

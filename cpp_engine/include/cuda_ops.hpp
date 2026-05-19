@@ -84,4 +84,14 @@ bool repeat_vector_cuda(
     int repeats,
     void* stream = nullptr);
 
+bool single_token_sparse_attention_cuda(
+    const float* d_q,
+    const float* d_kv,
+    const float* d_attn_sink,
+    float* d_y,
+    int heads,
+    int head_dim,
+    float scale,
+    void* stream = nullptr);
+
 }  // namespace dsv4

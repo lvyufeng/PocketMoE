@@ -91,6 +91,51 @@ std::string scale_name_for(const std::string& weight) {
     return weight + ".scale";
 }
 
+void test_single_token_attention_kernel() {
+    constexpr int heads = 3;
+    constexpr int head_dim = 4;
+    const float scale = 0.5f;
+    std::vector<float> q = {
+        0.25f, -0.5f, 0.75f, 1.0f,
+        -1.0f, 0.5f, 0.25f, -0.75f,
+        0.125f, 0.25f, -0.375f, 0.5f,
+    };
+    std::vector<float> kv = {0.5f, -0.25f, 0.75f, 1.25f};
+    std::vector<float> sink = {0.0f, -0.5f, 0.25f};
+    std::vector<float> ref(q.size());
+    for (int h = 0; h < heads; ++h) {
+        float dot = 0.0f;
+        for (int i = 0; i < head_dim; ++i) dot += q[h * head_dim + i] * kv[i];
+        const float token_logit = dot * scale;
+        const float m = std::max(token_logit, sink[h]);
+        const float token_weight = std::exp(token_logit - m) / (std::exp(token_logit - m) + std::exp(sink[h] - m));
+        for (int i = 0; i < head_dim; ++i) ref[h * head_dim + i] = kv[i] * token_weight;
+    }
+
+    float* d_q = nullptr;
+    float* d_kv = nullptr;
+    float* d_sink = nullptr;
+    float* d_y = nullptr;
+    check_cuda(cudaMalloc(&d_q, q.size() * sizeof(float)), "cudaMalloc attn q");
+    check_cuda(cudaMalloc(&d_kv, kv.size() * sizeof(float)), "cudaMalloc attn kv");
+    check_cuda(cudaMalloc(&d_sink, sink.size() * sizeof(float)), "cudaMalloc attn sink");
+    check_cuda(cudaMalloc(&d_y, q.size() * sizeof(float)), "cudaMalloc attn y");
+    check_cuda(cudaMemcpy(d_q, q.data(), q.size() * sizeof(float), cudaMemcpyHostToDevice), "copy attn q");
+    check_cuda(cudaMemcpy(d_kv, kv.data(), kv.size() * sizeof(float), cudaMemcpyHostToDevice), "copy attn kv");
+    check_cuda(cudaMemcpy(d_sink, sink.data(), sink.size() * sizeof(float), cudaMemcpyHostToDevice), "copy attn sink");
+    if (!dsv4::single_token_sparse_attention_cuda(d_q, d_kv, d_sink, d_y, heads, head_dim, scale)) throw std::runtime_error("single token attention launch failed");
+    check_cuda(cudaDeviceSynchronize(), "sync single token attention");
+    std::vector<float> got(q.size());
+    check_cuda(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy attn y");
+    cudaFree(d_q);
+    cudaFree(d_kv);
+    cudaFree(d_sink);
+    cudaFree(d_y);
+    for (size_t i = 0; i < got.size(); ++i) {
+        if (std::fabs(got[i] - ref[i]) > 1e-6f) throw std::runtime_error("single token attention mismatch");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -99,6 +144,7 @@ int main(int argc, char** argv) {
             std::cout << "[SKIP] CUDA runtime is not available\n";
             return 0;
         }
+        test_single_token_attention_kernel();
         Args args = parse_args(argc, argv);
         if (args.ckpt.empty()) throw std::runtime_error("--ckpt is required");
         dsv4::SafeTensorsIndex index(args.ckpt);

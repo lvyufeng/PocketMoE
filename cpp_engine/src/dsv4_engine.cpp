@@ -45,6 +45,104 @@ struct RoutedExpert {
     float weight = 0.0f;
 };
 
+struct HcPreResult {
+    std::vector<float> x;
+    float post[4] = {};
+    float comb[16] = {};
+};
+
+float sigmoid(float x) {
+    return 1.0f / (1.0f + std::exp(-x));
+}
+
+HcPreResult hc_pre_cpu(const std::vector<float>& h4, const float* fn, const float* scale, const float* base, int dim) {
+    constexpr int hc = 4;
+    constexpr int mix = 24;
+    constexpr float eps = 1e-6f;
+    HcPreResult out;
+    out.x.assign(dim, 0.0f);
+    double sum_sq = 0.0;
+    for (float v : h4) sum_sq += static_cast<double>(v) * v;
+    const float rsqrt = 1.0f / std::sqrt(static_cast<float>(sum_sq / h4.size()) + eps);
+    float mixes[mix];
+    for (int r = 0; r < mix; ++r) {
+        double dot = 0.0;
+        const float* row = fn + static_cast<size_t>(r) * h4.size();
+        for (size_t i = 0; i < h4.size(); ++i) dot += static_cast<double>(row[i]) * h4[i];
+        mixes[r] = static_cast<float>(dot) * rsqrt;
+    }
+    float pre[hc];
+    for (int i = 0; i < hc; ++i) {
+        pre[i] = sigmoid(mixes[i] * scale[0] + base[i]) + eps;
+        out.post[i] = 2.0f * sigmoid(mixes[hc + i] * scale[1] + base[hc + i]);
+    }
+    for (int r = 0; r < hc; ++r) {
+        float row_max = -INFINITY;
+        for (int c = 0; c < hc; ++c) row_max = std::max(row_max, mixes[2 * hc + r * hc + c] * scale[2] + base[2 * hc + r * hc + c]);
+        float denom = 0.0f;
+        for (int c = 0; c < hc; ++c) {
+            float v = std::exp(mixes[2 * hc + r * hc + c] * scale[2] + base[2 * hc + r * hc + c] - row_max) + eps;
+            out.comb[r * hc + c] = v;
+            denom += v;
+        }
+        for (int c = 0; c < hc; ++c) out.comb[r * hc + c] /= denom;
+    }
+    for (int c = 0; c < hc; ++c) {
+        float denom = eps;
+        for (int r = 0; r < hc; ++r) denom += out.comb[r * hc + c];
+        for (int r = 0; r < hc; ++r) out.comb[r * hc + c] /= denom;
+    }
+    for (int iter = 1; iter < 20; ++iter) {
+        for (int r = 0; r < hc; ++r) {
+            float denom = eps;
+            for (int c = 0; c < hc; ++c) denom += out.comb[r * hc + c];
+            for (int c = 0; c < hc; ++c) out.comb[r * hc + c] /= denom;
+        }
+        for (int c = 0; c < hc; ++c) {
+            float denom = eps;
+            for (int r = 0; r < hc; ++r) denom += out.comb[r * hc + c];
+            for (int r = 0; r < hc; ++r) out.comb[r * hc + c] /= denom;
+        }
+    }
+    for (int m = 0; m < hc; ++m) {
+        for (int d = 0; d < dim; ++d) out.x[d] += pre[m] * h4[static_cast<size_t>(m) * dim + d];
+    }
+    return out;
+}
+
+std::vector<float> hc_post_cpu(const std::vector<float>& x, const std::vector<float>& residual, const HcPreResult& pre, int dim) {
+    constexpr int hc = 4;
+    std::vector<float> out(static_cast<size_t>(hc) * dim, 0.0f);
+    for (int m = 0; m < hc; ++m) {
+        for (int d = 0; d < dim; ++d) {
+            float v = pre.post[m] * x[d];
+            for (int j = 0; j < hc; ++j) v += pre.comb[m * hc + j] * residual[static_cast<size_t>(j) * dim + d];
+            out[static_cast<size_t>(m) * dim + d] = v;
+        }
+    }
+    return out;
+}
+
+std::vector<float> hc_head_cpu(const std::vector<float>& h4, const float* fn, const float* scale, const float* base, int dim) {
+    constexpr int hc = 4;
+    constexpr float eps = 1e-6f;
+    double sum_sq = 0.0;
+    for (float v : h4) sum_sq += static_cast<double>(v) * v;
+    const float rsqrt = 1.0f / std::sqrt(static_cast<float>(sum_sq / h4.size()) + eps);
+    float pre[hc];
+    for (int m = 0; m < hc; ++m) {
+        double dot = 0.0;
+        const float* row = fn + static_cast<size_t>(m) * h4.size();
+        for (size_t i = 0; i < h4.size(); ++i) dot += static_cast<double>(row[i]) * h4[i];
+        pre[m] = sigmoid(static_cast<float>(dot) * rsqrt * scale[0] + base[m]) + eps;
+    }
+    std::vector<float> out(dim, 0.0f);
+    for (int m = 0; m < hc; ++m) {
+        for (int d = 0; d < dim; ++d) out[d] += pre[m] * h4[static_cast<size_t>(m) * dim + d];
+    }
+    return out;
+}
+
 struct AttentionSmokeDims {
     int dim = 0;
     int q_a_dim = 0;
@@ -195,10 +293,14 @@ struct SafeForwardContext {
           config(ModelConfig::from_hf_config(dir)),
           embed_shard(index.shard_path(require_shard_name(index, "embed.weight"))),
           head_shard(index.shard_path(require_shard_name(index, "head.weight"))),
-          final_norm_shard(index.shard_path(require_shard_name(index, "norm.weight"))) {
+          final_norm_shard(index.shard_path(require_shard_name(index, "norm.weight"))),
+          hc_head_shard(index.shard_path(require_shard_name(index, "hc_head_fn"))) {
         embed = require_tensor(embed_shard, "embed.weight");
         head = require_tensor(head_shard, "head.weight");
         final_norm = require_tensor(final_norm_shard, "norm.weight");
+        hc_head_fn = require_tensor(hc_head_shard, "hc_head_fn");
+        hc_head_scale = require_tensor(hc_head_shard, "hc_head_scale");
+        hc_head_base = require_tensor(hc_head_shard, "hc_head_base");
     }
 
     ~SafeForwardContext() {
@@ -220,9 +322,13 @@ struct SafeForwardContext {
     SafeTensorsShard embed_shard;
     SafeTensorsShard head_shard;
     SafeTensorsShard final_norm_shard;
+    SafeTensorsShard hc_head_shard;
     const SafeTensorInfo* embed = nullptr;
     const SafeTensorInfo* head = nullptr;
     const SafeTensorInfo* final_norm = nullptr;
+    const SafeTensorInfo* hc_head_fn = nullptr;
+    const SafeTensorInfo* hc_head_scale = nullptr;
+    const SafeTensorInfo* hc_head_base = nullptr;
     int kv_cache_tokens = 0;
     std::unordered_map<int, float*> kv_cache;
 };
@@ -405,6 +511,10 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     check_cuda(cudaMemcpy(d_head, ctx.head_shard.tensor_data(*head), static_cast<size_t>(head_rows) * dim * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy head");
     check_cuda(cudaMemcpy(d_final_norm_gamma, ctx.final_norm_shard.tensor_data(*ctx.final_norm), ctx.final_norm->nbytes, cudaMemcpyHostToDevice), "copy final norm gamma");
     if (!bf16_row_to_float_cuda(d_embed, d_x, 0, dim)) throw std::runtime_error("embed launch failed");
+    std::vector<float> h4(static_cast<size_t>(4) * dim);
+    std::vector<float> host_x(dim);
+    check_cuda(cudaMemcpy(host_x.data(), d_x, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy embed host");
+    for (int m = 0; m < 4; ++m) std::copy(host_x.begin(), host_x.end(), h4.begin() + static_cast<size_t>(m) * dim);
 
     for (int li = 0; li < layer_count; ++li) {
         const std::string prefix = "layers." + std::to_string(li) + ".";
@@ -416,6 +526,12 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         SafeTensorsShard wo_a_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn.wo_a.weight")));
         SafeTensorsShard wo_b_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn.wo_b.weight")));
         SafeTensorsShard ffn_norm_shard(index.shard_path(*index.shard_for_tensor(prefix + "ffn_norm.weight")));
+        const auto* hc_attn_fn = require_tensor(qkv_shard, prefix + "hc_attn_fn");
+        const auto* hc_attn_scale = require_tensor(qkv_shard, prefix + "hc_attn_scale");
+        const auto* hc_attn_base = require_tensor(qkv_shard, prefix + "hc_attn_base");
+        const auto* hc_ffn_fn = require_tensor(qkv_shard, prefix + "hc_ffn_fn");
+        const auto* hc_ffn_scale = require_tensor(qkv_shard, prefix + "hc_ffn_scale");
+        const auto* hc_ffn_base = require_tensor(qkv_shard, prefix + "hc_ffn_base");
         const auto* attn_norm = require_tensor(attn_norm_shard, prefix + "attn_norm.weight");
         const auto* wq_a = require_tensor(qkv_shard, prefix + "attn.wq_a.weight");
         const auto* wq_a_scale = require_tensor(qkv_shard, prefix + "attn.wq_a.scale");
@@ -448,6 +564,14 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         check_cuda(cudaMemcpy(d_attn_sink, qkv_shard.tensor_data(*attn_sink), attn_sink->nbytes, cudaMemcpyHostToDevice), "copy attn sink");
         check_cuda(cudaMemcpy(d_ffn_gamma, ffn_norm_shard.tensor_data(*ffn_norm), ffn_norm->nbytes, cudaMemcpyHostToDevice), "copy ffn gamma");
 
+        const HcPreResult attn_hc = hc_pre_cpu(
+            h4,
+            reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_attn_fn)),
+            reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_attn_scale)),
+            reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_attn_base)),
+            dim);
+        check_cuda(cudaMemcpy(d_x, attn_hc.x.data(), static_cast<size_t>(dim) * sizeof(float), cudaMemcpyHostToDevice), "copy hc attn pre");
+
         if (!run_single_token_attention_smoke(
                 attn_dims,
                 d_x,
@@ -478,7 +602,15 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                 d_attn_out)) {
             throw std::runtime_error("single-token attention smoke launch failed");
         }
-        if (!vector_add_cuda(d_x, d_attn_out, d_resid1, dim)) throw std::runtime_error("resid1 launch failed");
+        check_cuda(cudaMemcpy(host_x.data(), d_attn_out, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy attn out host");
+        h4 = hc_post_cpu(host_x, h4, attn_hc, dim);
+        const HcPreResult ffn_hc = hc_pre_cpu(
+            h4,
+            reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_ffn_fn)),
+            reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_ffn_scale)),
+            reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_ffn_base)),
+            dim);
+        check_cuda(cudaMemcpy(d_resid1, ffn_hc.x.data(), static_cast<size_t>(dim) * sizeof(float), cudaMemcpyHostToDevice), "copy hc ffn pre");
         if (!rmsnorm_bf16_gamma_cuda(d_resid1, d_ffn_gamma, d_ffn_norm, dim, 1e-6f)) throw std::runtime_error("ffn norm launch failed");
         std::vector<float> ffn_norm_host(dim);
         check_cuda(cudaMemcpy(ffn_norm_host.data(), d_ffn_norm, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy ffn norm for gate");
@@ -521,10 +653,17 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             if (!fp8_e4m3_e8m0_matvec_cuda(d_hidden, d_w2, d_s2, d_resid2, dim, inter)) throw std::runtime_error("shared w2 launch failed");
             if (!vector_accum_cuda(d_resid2, d_moe, dim, 1.0f)) throw std::runtime_error("shared accum failed");
         }
-        if (!vector_add_cuda(d_resid1, d_moe, d_resid2, dim)) throw std::runtime_error("resid2 launch failed");
-        check_cuda(cudaMemcpy(d_x, d_resid2, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToDevice), "advance residual");
+        check_cuda(cudaMemcpy(host_x.data(), d_moe, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy moe host");
+        h4 = hc_post_cpu(host_x, h4, ffn_hc, dim);
     }
 
+    host_x = hc_head_cpu(
+        h4,
+        reinterpret_cast<const float*>(ctx.hc_head_shard.tensor_data(*ctx.hc_head_fn)),
+        reinterpret_cast<const float*>(ctx.hc_head_shard.tensor_data(*ctx.hc_head_scale)),
+        reinterpret_cast<const float*>(ctx.hc_head_shard.tensor_data(*ctx.hc_head_base)),
+        dim);
+    check_cuda(cudaMemcpy(d_x, host_x.data(), static_cast<size_t>(dim) * sizeof(float), cudaMemcpyHostToDevice), "copy hc head");
     if (!rmsnorm_bf16_gamma_cuda(d_x, d_final_norm_gamma, d_resid1, dim, 1e-6f)) throw std::runtime_error("final norm launch failed");
     if (!bf16_matvec_cuda(d_resid1, d_head, d_logits, head_rows, dim)) throw std::runtime_error("head launch failed");
     check_cuda(cudaDeviceSynchronize(), "sync kernels");

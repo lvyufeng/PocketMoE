@@ -43,6 +43,8 @@ int main(int argc, char** argv) {
         check_encode(tok, "123", {6895});
         auto bos = tok.encode_basic("hello", true);
         require(bos.size() == 2 && bos[0] == 0 && bos[1] == 33310, "bad add_bos encode");
+        require(tok.decode_tokens(tok.encode_basic("Hello world", true)) == "Hello world", "bad decode roundtrip");
+        require(tok.decode_tokens({55262}) == "我们必须", "bad byte-level decode");
         std::cout << "[PASS] tokenizer vocab=" << tok.vocab_size()
                   << " token107590=" << tok.decode_piece(107590) << "\n";
         return 0;

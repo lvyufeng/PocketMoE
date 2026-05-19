@@ -148,13 +148,17 @@ int main(int argc, char** argv) {
                         prompt_ids.push_back(args.forward_token);
                     }
                     auto results = dsv4::run_safetensors_generate_tokens(args.ckpt, prompt_ids, args.smoke_layers, args.max_new_tokens);
+                    std::vector<int> generated_ids;
+                    generated_ids.reserve(results.size());
                     for (size_t step = 0; step < results.size(); ++step) {
                         const dsv4::ForwardSmokeResult& result = results[step];
+                        generated_ids.push_back(result.token);
                         std::cout << "generate_step=" << step
                                   << " token=" << result.token
-                                  << " token_text=" << tokenizer.decode_piece(result.token)
+                                  << " token_text=" << tokenizer.decode_tokens({result.token})
                                   << " top_token=" << result.top_token
-                                  << " top_text=" << tokenizer.decode_piece(result.top_token)
+                                  << " top_text=" << tokenizer.decode_tokens({result.top_token})
+                                  << " decoded=" << tokenizer.decode_tokens(generated_ids)
                                   << " top_logit=" << result.top_logit
                                   << " checksum=" << result.checksum << "\n";
                     }

@@ -7,6 +7,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace dsv4 {
 namespace {
@@ -78,6 +79,17 @@ std::pair<std::string, std::string> split_merge(const std::string& merge) {
     return {merge.substr(0, pos), merge.substr(pos + 1)};
 }
 
+std::unordered_map<std::string, unsigned char> byte_decoder() {
+    std::unordered_map<std::string, unsigned char> out;
+    const auto alphabet = byte_alphabet();
+    for (size_t i = 0; i < alphabet.size(); ++i) out[alphabet[i]] = static_cast<unsigned char>(i);
+    return out;
+}
+
+bool starts_with_at(const std::string& s, size_t pos, const std::string& prefix) {
+    return pos + prefix.size() <= s.size() && s.compare(pos, prefix.size(), prefix) == 0;
+}
+
 }  // namespace
 
 Tokenizer::Tokenizer(const std::string& ckpt_dir) {
@@ -122,6 +134,28 @@ std::string Tokenizer::decode_piece(int id) const {
     s = replace_all(s, "▁", " ");
     s = replace_all(s, "Ċ", "\n");
     return s;
+}
+
+std::string Tokenizer::decode_tokens(const std::vector<int>& ids) const {
+    static const auto decoder = byte_decoder();
+    std::string out;
+    for (int id : ids) {
+        std::string piece = token(id);
+        if (piece.size() >= 2 && piece.front() == '<' && piece.back() == '>') continue;
+        for (size_t i = 0; i < piece.size();) {
+            bool matched = false;
+            for (const auto& [encoded, byte] : decoder) {
+                if (starts_with_at(piece, i, encoded)) {
+                    out.push_back(static_cast<char>(byte));
+                    i += encoded.size();
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) out.push_back(piece[i++]);
+        }
+    }
+    return out;
 }
 
 std::vector<int> Tokenizer::encode_basic(const std::string& text, bool add_bos) const {

@@ -16,6 +16,7 @@ struct Args {
     std::string inspect_tensor;
     bool dump_config = false;
     bool inspect = false;
+    bool smoke_forward = false;
 };
 
 bool path_exists(const std::string& path) {
@@ -42,6 +43,8 @@ Args parse_args(int argc, char** argv) {
             args.dump_config = true;
         } else if (arg == "--inspect") {
             args.inspect = true;
+        } else if (arg == "--smoke-forward") {
+            args.smoke_forward = true;
         } else if (arg == "--tokens" && i + 1 < argc) {
             ++i;
         } else if (arg == "--max-new-tokens" && i + 1 < argc) {
@@ -92,7 +95,15 @@ int main(int argc, char** argv) {
                 if (info == nullptr) throw std::runtime_error("tensor missing in shard header: " + args.inspect_tensor);
                 print_safe_tensor(*info, *shard_name);
             }
-            if (!args.dump_config && args.inspect_tensor.empty() && !args.inspect) {
+            if (args.smoke_forward) {
+                dsv4::ForwardSmokeResult result = dsv4::run_safetensors_min_layer_smoke(args.ckpt);
+                std::cout << "smoke_forward=1 token=" << result.token
+                          << " dim=" << result.dim
+                          << " inter=" << result.inter
+                          << " logits=" << result.logits
+                          << " checksum=" << result.checksum << "\n";
+            }
+            if (!args.dump_config && args.inspect_tensor.empty() && !args.inspect && !args.smoke_forward) {
                 std::cout << "inference_not_implemented=1\n";
             }
             return 0;

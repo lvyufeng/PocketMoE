@@ -45,6 +45,7 @@ struct ModelConfig {
     std::string architecture;
 
     static ModelConfig from_gguf(const GGUFFile& file);
+    static ModelConfig from_hf_config(const std::string& ckpt_dir);
     std::string to_string() const;
 };
 

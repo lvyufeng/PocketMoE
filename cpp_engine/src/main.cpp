@@ -1,17 +1,32 @@
 #include "cuda_ops.hpp"
 #include "dsv4_engine.hpp"
+#include "model_config.hpp"
+#include "safetensors_reader.hpp"
 
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <sys/stat.h>
 
 namespace {
 
 struct Args {
     std::string model;
+    std::string ckpt;
+    std::string inspect_tensor;
     bool dump_config = false;
     bool inspect = false;
 };
+
+bool path_exists(const std::string& path) {
+    struct stat st;
+    return ::stat(path.c_str(), &st) == 0;
+}
+
+bool is_dir(const std::string& path) {
+    struct stat st;
+    return ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
 
 Args parse_args(int argc, char** argv) {
     Args args;
@@ -19,6 +34,10 @@ Args parse_args(int argc, char** argv) {
         std::string arg = argv[i];
         if (arg == "--model" && i + 1 < argc) {
             args.model = argv[++i];
+        } else if (arg == "--ckpt" && i + 1 < argc) {
+            args.ckpt = argv[++i];
+        } else if (arg == "--inspect-tensor" && i + 1 < argc) {
+            args.inspect_tensor = argv[++i];
         } else if (arg == "--dump-config") {
             args.dump_config = true;
         } else if (arg == "--inspect") {
@@ -31,10 +50,23 @@ Args parse_args(int argc, char** argv) {
             throw std::runtime_error("unknown or incomplete argument: " + arg);
         }
     }
-    if (args.model.empty()) {
-        throw std::runtime_error("--model is required");
+    if (args.ckpt.empty() && !args.model.empty() && is_dir(args.model) && path_exists(args.model + "/model.safetensors.index.json")) {
+        args.ckpt = args.model;
+        args.model.clear();
+    }
+    if (args.model.empty() && args.ckpt.empty()) {
+        throw std::runtime_error("--model or --ckpt is required");
     }
     return args;
+}
+
+void print_safe_tensor(const dsv4::SafeTensorInfo& info, const std::string& shard) {
+    std::cout << info.name << " dtype=" << dsv4::safe_dtype_name(info.dtype) << " shape=[";
+    for (size_t i = 0; i < info.shape.size(); ++i) {
+        if (i) std::cout << ',';
+        std::cout << info.shape[i];
+    }
+    std::cout << "] begin=" << info.data_begin << " abs=" << info.absolute_begin << " bytes=" << info.nbytes << " shard=" << shard << '\n';
 }
 
 }  // namespace
@@ -42,9 +74,32 @@ Args parse_args(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         Args args = parse_args(argc, argv);
+        if (!args.ckpt.empty()) {
+            dsv4::SafeTensorsIndex index(args.ckpt);
+            std::cout << "dsv4_cpp_engine opened " << args.ckpt << "\n";
+            std::cout << "format=safetensors tensors=" << index.tensor_count()
+                      << " shards=" << index.shard_count()
+                      << " total_size=" << index.total_size()
+                      << " cuda=" << (dsv4::cuda_runtime_available() ? "yes" : "no") << "\n";
+            if (args.dump_config) {
+                std::cout << dsv4::ModelConfig::from_hf_config(args.ckpt).to_string();
+            }
+            if (!args.inspect_tensor.empty()) {
+                const std::string* shard_name = index.shard_for_tensor(args.inspect_tensor);
+                if (shard_name == nullptr) throw std::runtime_error("tensor not found: " + args.inspect_tensor);
+                dsv4::SafeTensorsShard shard(index.shard_path(*shard_name));
+                const auto* info = shard.find_tensor(args.inspect_tensor);
+                if (info == nullptr) throw std::runtime_error("tensor missing in shard header: " + args.inspect_tensor);
+                print_safe_tensor(*info, *shard_name);
+            }
+            if (!args.dump_config && args.inspect_tensor.empty() && !args.inspect) {
+                std::cout << "inference_not_implemented=1\n";
+            }
+            return 0;
+        }
         dsv4::Dsv4Engine engine(args.model);
         std::cout << "dsv4_cpp_engine opened " << args.model << "\n";
-        std::cout << "gguf_version=" << engine.gguf().version()
+        std::cout << "format=gguf gguf_version=" << engine.gguf().version()
                   << " tensors=" << engine.gguf().tensor_count()
                   << " metadata=" << engine.gguf().metadata_count()
                   << " alignment=" << engine.gguf().alignment()

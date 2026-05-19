@@ -31,6 +31,16 @@ struct SafeTensorInfo {
     uint64_t nbytes = 0;
 };
 
+struct SafeFp4TensorPair {
+    std::string weight_name;
+    std::string scale_name;
+    std::string shard_name;
+    uint64_t rows = 0;
+    uint64_t cols = 0;
+    uint64_t packed_cols = 0;
+    uint64_t scale_cols = 0;
+};
+
 class SafeTensorsIndex {
 public:
     explicit SafeTensorsIndex(const std::string& ckpt_dir);
@@ -89,5 +99,6 @@ std::string safe_dtype_name(SafeDType dtype);
 SafeDType safe_dtype_from_string(const std::string& dtype);
 uint64_t safe_dtype_size(SafeDType dtype);
 uint64_t safe_tensor_numel(const std::vector<uint64_t>& shape);
+SafeFp4TensorPair resolve_fp4_tensor_pair(const SafeTensorsIndex& index, const SafeTensorsShard& shard, const std::string& weight_name);
 
 }  // namespace dsv4

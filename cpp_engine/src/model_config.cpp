@@ -1,5 +1,9 @@
 #include "model_config.hpp"
 
+#include "json_lite.hpp"
+
+#include <cmath>
+#include <fstream>
 #include <sstream>
 
 namespace dsv4 {
@@ -22,6 +26,39 @@ double first_present_f64(const GGUFFile& file, std::initializer_list<std::string
         }
     }
     return 0.0;
+}
+
+std::string read_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("failed to open file: " + path);
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+uint64_t optional_u64(const JsonObject& obj, const std::string& key) {
+    const auto* value = object_get(obj, key);
+    return value == nullptr ? 0 : static_cast<uint64_t>(std::round(value->number()));
+}
+
+double optional_f64(const JsonObject& obj, const std::string& key) {
+    const auto* value = object_get(obj, key);
+    return value == nullptr ? 0.0 : value->number();
+}
+
+std::string optional_string(const JsonObject& obj, const std::string& key) {
+    const auto* value = object_get(obj, key);
+    return value == nullptr ? std::string() : value->string();
+}
+
+std::vector<uint64_t> optional_u64_array(const JsonObject& obj, const std::string& key) {
+    const auto* value = object_get(obj, key);
+    if (value == nullptr) return {};
+    std::vector<uint64_t> out;
+    for (const auto& item : value->array()) {
+        out.push_back(static_cast<uint64_t>(std::round(item.number())));
+    }
+    return out;
 }
 
 std::string join_u64(const std::vector<uint64_t>& xs) {
@@ -97,6 +134,57 @@ ModelConfig ModelConfig::from_gguf(const GGUFFile& file) {
     cfg.hc_sinkhorn_iters = first_present_u64(file, {prefix + ".hyper_connection.sinkhorn_iterations", "deepseek4.hyper_connection.sinkhorn_iterations"});
     cfg.compress_ratios = file.metadata_u64_array(prefix + ".attention.compress_ratios");
     cfg.swiglu_clamp_exp = file.metadata_f64_array(prefix + ".swiglu_clamp_exp");
+    if (cfg.head_dim == 0 && cfg.dim > 0 && cfg.n_heads > 0) {
+        cfg.head_dim = cfg.dim / cfg.n_heads;
+    }
+    if (cfg.value_dim == 0) {
+        cfg.value_dim = cfg.head_dim;
+    }
+    return cfg;
+}
+
+ModelConfig ModelConfig::from_hf_config(const std::string& ckpt_dir) {
+    ModelConfig cfg;
+    JsonValue root_value = parse_json(read_file(ckpt_dir + "/config.json"));
+    const JsonObject& obj = root_value.object();
+    cfg.architecture = optional_string(obj, "model_type");
+    cfg.vocab_size = optional_u64(obj, "vocab_size");
+    cfg.dim = optional_u64(obj, "hidden_size");
+    cfg.n_layers = optional_u64(obj, "num_hidden_layers");
+    cfg.n_heads = optional_u64(obj, "num_attention_heads");
+    cfg.kv_heads = optional_u64(obj, "num_key_value_heads");
+    cfg.head_dim = optional_u64(obj, "head_dim");
+    cfg.value_dim = optional_u64(obj, "v_head_dim");
+    cfg.q_lora_rank = optional_u64(obj, "q_lora_rank");
+    cfg.o_lora_rank = optional_u64(obj, "o_lora_rank");
+    cfg.o_groups = optional_u64(obj, "o_groups");
+    cfg.index_n_heads = optional_u64(obj, "index_n_heads");
+    cfg.index_head_dim = optional_u64(obj, "index_head_dim");
+    cfg.index_topk = optional_u64(obj, "index_topk");
+    cfg.n_routed_experts = optional_u64(obj, "n_routed_experts");
+    cfg.n_shared_experts = optional_u64(obj, "n_shared_experts");
+    cfg.n_activated_experts = optional_u64(obj, "num_experts_per_tok");
+    cfg.moe_inter_dim = optional_u64(obj, "moe_intermediate_size");
+    cfg.route_scale = optional_f64(obj, "routed_scaling_factor");
+    cfg.swiglu_limit = optional_f64(obj, "swiglu_limit");
+    cfg.context_length = optional_u64(obj, "max_position_embeddings");
+    cfg.rope_dim = optional_u64(obj, "qk_rope_head_dim");
+    cfg.rope_theta = optional_f64(obj, "rope_theta");
+    cfg.window_size = optional_u64(obj, "sliding_window");
+    cfg.compress_rope_theta = optional_f64(obj, "compress_rope_theta");
+    cfg.n_hash_layers = optional_u64(obj, "num_hash_layers");
+    cfg.hc_mult = optional_u64(obj, "hc_mult");
+    cfg.hc_sinkhorn_iters = optional_u64(obj, "hc_sinkhorn_iters");
+    cfg.compress_ratios = optional_u64_array(obj, "compress_ratios");
+    if (const auto* scaling = object_get(obj, "rope_scaling")) {
+        if (scaling->is_object()) {
+            const JsonObject& sc = scaling->object();
+            cfg.rope_factor = optional_f64(sc, "factor");
+            cfg.beta_fast = optional_f64(sc, "beta_fast");
+            cfg.beta_slow = optional_f64(sc, "beta_slow");
+            cfg.original_context_length = optional_u64(sc, "original_max_position_embeddings");
+        }
+    }
     if (cfg.head_dim == 0 && cfg.dim > 0 && cfg.n_heads > 0) {
         cfg.head_dim = cfg.dim / cfg.n_heads;
     }

@@ -207,4 +207,39 @@ uint64_t safe_tensor_numel(const std::vector<uint64_t>& shape) {
     return total;
 }
 
+SafeFp4TensorPair resolve_fp4_tensor_pair(const SafeTensorsIndex& index, const SafeTensorsShard& shard, const std::string& weight_name) {
+    const std::string suffix = ".weight";
+    const std::string scale_name =
+        weight_name.size() >= suffix.size() && weight_name.compare(weight_name.size() - suffix.size(), suffix.size(), suffix) == 0
+            ? weight_name.substr(0, weight_name.size() - suffix.size()) + ".scale"
+            : weight_name + ".scale";
+
+    const std::string* weight_shard = index.shard_for_tensor(weight_name);
+    if (weight_shard == nullptr) throw std::runtime_error("FP4 weight not found: " + weight_name);
+    const std::string* scale_shard = index.shard_for_tensor(scale_name);
+    if (scale_shard == nullptr) throw std::runtime_error("FP4 scale not found: " + scale_name);
+    if (*weight_shard != *scale_shard) throw std::runtime_error("FP4 weight and scale are in different shards: " + weight_name);
+
+    const SafeTensorInfo* weight = shard.find_tensor(weight_name);
+    const SafeTensorInfo* scale = shard.find_tensor(scale_name);
+    if (weight == nullptr) throw std::runtime_error("FP4 weight missing from shard header: " + weight_name);
+    if (scale == nullptr) throw std::runtime_error("FP4 scale missing from shard header: " + scale_name);
+    if (weight->dtype != SafeDType::I8 || weight->shape.size() != 2) throw std::runtime_error("FP4 weight must be 2D I8 packed bytes: " + weight_name);
+    if (scale->dtype != SafeDType::F8_E8M0 || scale->shape.size() != 2) throw std::runtime_error("FP4 scale must be 2D F8_E8M0: " + scale_name);
+
+    SafeFp4TensorPair pair;
+    pair.weight_name = weight_name;
+    pair.scale_name = scale_name;
+    pair.shard_name = *weight_shard;
+    pair.rows = weight->shape[0];
+    pair.packed_cols = weight->shape[1];
+    pair.cols = pair.packed_cols * 2;
+    pair.scale_cols = pair.cols / 32;
+    if ((pair.cols % 32) != 0) throw std::runtime_error("FP4 cols must be divisible by 32: " + weight_name);
+    if (scale->shape[0] != pair.rows || scale->shape[1] != pair.scale_cols) {
+        throw std::runtime_error("FP4 weight/scale shape mismatch: " + weight_name + " / " + scale_name);
+    }
+    return pair;
+}
+
 }  // namespace dsv4

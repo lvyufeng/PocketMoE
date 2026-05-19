@@ -167,25 +167,14 @@ int main(int argc, char** argv) {
             dsv4::SafeTensorsIndex index(args.ckpt);
             const std::string* weight_shard_name = index.shard_for_tensor(args.tensor);
             if (weight_shard_name == nullptr) throw std::runtime_error("tensor not found: " + args.tensor);
-            const std::string scale_name = scale_name_for(args.tensor);
-            const std::string* scale_shard_name = index.shard_for_tensor(scale_name);
-            if (scale_shard_name == nullptr) throw std::runtime_error("scale tensor not found: " + scale_name);
-            if (*weight_shard_name != *scale_shard_name) throw std::runtime_error("weight and scale are in different shards");
-
             dsv4::SafeTensorsShard shard(index.shard_path(*weight_shard_name));
-            const auto* weight_info = shard.find_tensor(args.tensor);
-            const auto* scale_info = shard.find_tensor(scale_name);
-            if (weight_info == nullptr || scale_info == nullptr) throw std::runtime_error("tensor missing from shard header");
-            if (weight_info->dtype != dsv4::SafeDType::I8 || weight_info->shape.size() != 2) throw std::runtime_error("expected 2D I8 packed FP4 weight");
-            if (scale_info->dtype != dsv4::SafeDType::F8_E8M0 || scale_info->shape.size() != 2) throw std::runtime_error("expected 2D F8_E8M0 scale");
-            const int tensor_rows = static_cast<int>(weight_info->shape[0]);
-            const int cols = static_cast<int>(weight_info->shape[1] * 2);
-            const int rows = std::min(args.rows, tensor_rows);
-            if (scale_info->shape[0] < static_cast<uint64_t>(rows) || scale_info->shape[1] != static_cast<uint64_t>(cols / 32)) {
-                throw std::runtime_error("weight/scale shape mismatch");
-            }
+            const dsv4::SafeFp4TensorPair pair = dsv4::resolve_fp4_tensor_pair(index, shard, args.tensor);
+            const auto* weight_info = shard.find_tensor(pair.weight_name);
+            const auto* scale_info = shard.find_tensor(pair.scale_name);
+            const int cols = static_cast<int>(pair.cols);
+            const int rows = std::min(args.rows, static_cast<int>(pair.rows));
             auto x = make_input(cols);
-            run_case(x, shard.tensor_data(*weight_info), shard.tensor_data(*scale_info), rows, cols, args.tensor);
+            run_case(x, shard.tensor_data(*weight_info), shard.tensor_data(*scale_info), rows, cols, pair.weight_name);
             return 0;
         }
 

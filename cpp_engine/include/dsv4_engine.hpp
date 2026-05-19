@@ -24,9 +24,11 @@ struct ForwardSmokeResult {
     int dim = 0;
     int inter = 0;
     int logits = 0;
+    int layers = 0;
     float checksum = 0.0f;
 };
 
 ForwardSmokeResult run_safetensors_min_layer_smoke(const std::string& ckpt_dir);
+ForwardSmokeResult run_safetensors_layer_loop_smoke(const std::string& ckpt_dir, int layer_count);
 
 }  // namespace dsv4

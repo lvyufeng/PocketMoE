@@ -14,6 +14,7 @@ struct Args {
     std::string model;
     std::string ckpt;
     std::string inspect_tensor;
+    int smoke_layers = 1;
     bool dump_config = false;
     bool inspect = false;
     bool smoke_forward = false;
@@ -45,6 +46,9 @@ Args parse_args(int argc, char** argv) {
             args.inspect = true;
         } else if (arg == "--smoke-forward") {
             args.smoke_forward = true;
+        } else if (arg == "--smoke-layers" && i + 1 < argc) {
+            args.smoke_forward = true;
+            args.smoke_layers = std::stoi(argv[++i]);
         } else if (arg == "--tokens" && i + 1 < argc) {
             ++i;
         } else if (arg == "--max-new-tokens" && i + 1 < argc) {
@@ -96,8 +100,9 @@ int main(int argc, char** argv) {
                 print_safe_tensor(*info, *shard_name);
             }
             if (args.smoke_forward) {
-                dsv4::ForwardSmokeResult result = dsv4::run_safetensors_min_layer_smoke(args.ckpt);
+                dsv4::ForwardSmokeResult result = dsv4::run_safetensors_layer_loop_smoke(args.ckpt, args.smoke_layers);
                 std::cout << "smoke_forward=1 token=" << result.token
+                          << " layers=" << result.layers
                           << " dim=" << result.dim
                           << " inter=" << result.inter
                           << " logits=" << result.logits

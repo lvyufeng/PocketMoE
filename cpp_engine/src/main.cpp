@@ -4,6 +4,7 @@
 #include "safetensors_reader.hpp"
 #include "tokenizer.hpp"
 
+#include <cuda_runtime.h>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -20,6 +21,9 @@ struct Args {
     int forward_token = -1;
     int position = 0;
     int max_new_tokens = 1;
+    int tp_world = 1;
+    int tp_rank = 0;
+    int device = -1;
     bool generate_token = false;
     bool dump_config = false;
     bool inspect = false;
@@ -71,6 +75,12 @@ Args parse_args(int argc, char** argv) {
             ++i;
         } else if (arg == "--max-new-tokens" && i + 1 < argc) {
             args.max_new_tokens = std::stoi(argv[++i]);
+        } else if (arg == "--tp-world" && i + 1 < argc) {
+            args.tp_world = std::stoi(argv[++i]);
+        } else if (arg == "--tp-rank" && i + 1 < argc) {
+            args.tp_rank = std::stoi(argv[++i]);
+        } else if (arg == "--device" && i + 1 < argc) {
+            args.device = std::stoi(argv[++i]);
         } else {
             throw std::runtime_error("unknown or incomplete argument: " + arg);
         }
@@ -79,6 +89,8 @@ Args parse_args(int argc, char** argv) {
         args.ckpt = args.model;
         args.model.clear();
     }
+    if (args.tp_world <= 0) throw std::runtime_error("--tp-world must be positive");
+    if (args.tp_rank < 0 || args.tp_rank >= args.tp_world) throw std::runtime_error("--tp-rank must be in [0, tp_world)");
     if (args.model.empty() && args.ckpt.empty()) {
         throw std::runtime_error("--model or --ckpt is required");
     }
@@ -99,6 +111,15 @@ void print_safe_tensor(const dsv4::SafeTensorInfo& info, const std::string& shar
 int main(int argc, char** argv) {
     try {
         Args args = parse_args(argc, argv);
+        if (args.device >= 0) {
+            if (cudaSetDevice(args.device) != cudaSuccess) throw std::runtime_error("failed to set CUDA device");
+        } else if (args.tp_world > 1) {
+            if (cudaSetDevice(args.tp_rank) != cudaSuccess) throw std::runtime_error("failed to set CUDA device for tp rank");
+        }
+        if (args.tp_world > 1) {
+            std::cout << "tp_world=" << args.tp_world << " tp_rank=" << args.tp_rank
+                      << " device=" << (args.device >= 0 ? args.device : args.tp_rank) << "\n";
+        }
         if (!args.ckpt.empty()) {
             dsv4::SafeTensorsIndex index(args.ckpt);
             std::cout << "dsv4_cpp_engine opened " << args.ckpt << "\n";

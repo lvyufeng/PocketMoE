@@ -4,6 +4,7 @@
 #include "model_config.hpp"
 
 #include <string>
+#include <vector>
 
 namespace dsv4 {
 
@@ -34,5 +35,6 @@ ForwardSmokeResult run_safetensors_min_layer_smoke(const std::string& ckpt_dir);
 ForwardSmokeResult run_safetensors_layer_loop_smoke(const std::string& ckpt_dir, int layer_count);
 ForwardSmokeResult run_safetensors_token_forward(const std::string& ckpt_dir, int token, int layer_count);
 ForwardSmokeResult run_safetensors_token_forward_at_position(const std::string& ckpt_dir, int token, int layer_count, int position);
+ForwardSmokeResult run_safetensors_prompt_forward(const std::string& ckpt_dir, const std::vector<int>& tokens, int layer_count);
 
 }  // namespace dsv4

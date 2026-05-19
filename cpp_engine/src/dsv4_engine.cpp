@@ -191,6 +191,15 @@ ForwardSmokeResult run_safetensors_token_forward(const std::string& ckpt_dir, in
     return run_safetensors_token_forward_at_position(ckpt_dir, token, layer_count, 0);
 }
 
+ForwardSmokeResult run_safetensors_prompt_forward(const std::string& ckpt_dir, const std::vector<int>& tokens, int layer_count) {
+    if (tokens.empty()) throw std::runtime_error("prompt has no tokens");
+    ForwardSmokeResult result;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        result = run_safetensors_token_forward_at_position(ckpt_dir, tokens[i], layer_count, static_cast<int>(i));
+    }
+    return result;
+}
+
 ForwardSmokeResult run_safetensors_token_forward_at_position(const std::string& ckpt_dir, int token, int layer_count, int position) {
     if (!cuda_runtime_available()) throw std::runtime_error("CUDA runtime is not available");
     SafeTensorsIndex index(ckpt_dir);

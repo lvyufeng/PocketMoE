@@ -128,6 +128,18 @@ int main(int argc, char** argv) {
                               << " last_token=" << args.forward_token
                               << " position=" << args.position
                               << " last_text=" << tokenizer.decode_piece(args.forward_token) << "\n";
+                    if (!args.generate_token) {
+                        dsv4::ForwardSmokeResult result = dsv4::run_safetensors_prompt_forward(args.ckpt, ids, args.smoke_layers);
+                        std::cout << "smoke_forward=1 token=" << result.token
+                                  << " layers=" << result.layers
+                                  << " dim=" << result.dim
+                                  << " inter=" << result.inter
+                                  << " logits=" << result.logits
+                                  << " top_token=" << result.top_token
+                                  << " top_logit=" << result.top_logit
+                                  << " checksum=" << result.checksum << "\n";
+                        return 0;
+                    }
                 }
                 if (args.generate_token) {
                     int token = args.forward_token;

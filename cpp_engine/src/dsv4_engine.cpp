@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cuda_runtime.h>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -29,6 +30,60 @@ struct Fp4Handle {
     const SafeTensorInfo* s = nullptr;
     SafeFp4TensorPair pair;
 };
+
+float bf16_to_float(uint16_t bits) {
+    uint32_t value = static_cast<uint32_t>(bits) << 16;
+    float out;
+    std::memcpy(&out, &value, sizeof(out));
+    return out;
+}
+
+int select_smoke_expert(
+    const SafeTensorsIndex& index,
+    const std::string& prefix,
+    int layer_id,
+    int token,
+    const std::vector<float>& ffn_norm,
+    uint64_t n_hash_layers,
+    uint64_t n_experts) {
+    const std::string tid_name = prefix + "ffn.gate.tid2eid";
+    if (static_cast<uint64_t>(layer_id) < n_hash_layers && index.shard_for_tensor(tid_name) != nullptr) {
+        SafeTensorsShard shard(index.shard_path(*index.shard_for_tensor(tid_name)));
+        const auto* info = require_tensor(shard, tid_name);
+        const auto* ids = reinterpret_cast<const int64_t*>(shard.tensor_data(*info));
+        return static_cast<int>(ids[static_cast<size_t>(token) * info->shape[1]]);
+    }
+
+    const std::string weight_name = prefix + "ffn.gate.weight";
+    SafeTensorsShard weight_shard(index.shard_path(*index.shard_for_tensor(weight_name)));
+    const auto* weight = require_tensor(weight_shard, weight_name);
+    const auto* w = reinterpret_cast<const uint16_t*>(weight_shard.tensor_data(*weight));
+    const SafeTensorInfo* bias = nullptr;
+    const float* b = nullptr;
+    const std::string bias_name = prefix + "ffn.gate.bias";
+    const std::string* bias_shard_name = index.shard_for_tensor(bias_name);
+    SafeTensorsShard bias_shard(index.shard_path(bias_shard_name == nullptr ? *index.shard_for_tensor(weight_name) : *bias_shard_name));
+    if (bias_shard_name != nullptr) {
+        bias = bias_shard.find_tensor(bias_name);
+        b = bias == nullptr ? nullptr : reinterpret_cast<const float*>(bias_shard.tensor_data(*bias));
+    }
+
+    int best = 0;
+    float best_score = -INFINITY;
+    const int experts = static_cast<int>(std::min<uint64_t>(n_experts, weight->shape[0]));
+    const int dim = static_cast<int>(weight->shape[1]);
+    for (int e = 0; e < experts; ++e) {
+        float dot = 0.0f;
+        for (int i = 0; i < dim; ++i) dot += ffn_norm[i] * bf16_to_float(w[static_cast<size_t>(e) * dim + i]);
+        const float original = std::sqrt(std::log1pf(std::exp(dot)));
+        const float score = original + (b == nullptr ? 0.0f : b[e]);
+        if (score > best_score) {
+            best_score = score;
+            best = e;
+        }
+    }
+    return best;
+}
 
 Fp4Handle open_fp4(const SafeTensorsIndex& index, const std::string& name) {
     const std::string* shard_name = index.shard_for_tensor(name);
@@ -131,25 +186,28 @@ ForwardSmokeResult run_safetensors_layer_loop_smoke(const std::string& ckpt_dir,
         const auto* wkv = require_tensor(wkv_shard, prefix + "attn.wkv.weight");
         const auto* wkv_scale = require_tensor(wkv_shard, prefix + "attn.wkv.scale");
         const auto* ffn_norm = require_tensor(ffn_norm_shard, prefix + "ffn_norm.weight");
-        Fp4Handle w1 = open_fp4(index, prefix + "ffn.experts.0.w1.weight");
-        Fp4Handle w2 = open_fp4(index, prefix + "ffn.experts.0.w2.weight");
-        Fp4Handle w3 = open_fp4(index, prefix + "ffn.experts.0.w3.weight");
 
         check_cuda(cudaMemcpy(d_attn_gamma, attn_norm_shard.tensor_data(*attn_norm), attn_norm->nbytes, cudaMemcpyHostToDevice), "copy attn gamma");
         check_cuda(cudaMemcpy(d_wkv, wkv_shard.tensor_data(*wkv), static_cast<size_t>(attn_rows) * dim, cudaMemcpyHostToDevice), "copy wkv");
         check_cuda(cudaMemcpy(d_wkv_scale, wkv_shard.tensor_data(*wkv_scale), static_cast<size_t>(attn_rows / 128) * (dim / 128), cudaMemcpyHostToDevice), "copy wkv scale");
         check_cuda(cudaMemcpy(d_ffn_gamma, ffn_norm_shard.tensor_data(*ffn_norm), ffn_norm->nbytes, cudaMemcpyHostToDevice), "copy ffn gamma");
-        check_cuda(cudaMemcpy(d_w1, w1.shard.tensor_data(*w1.w), w1.w->nbytes, cudaMemcpyHostToDevice), "copy w1");
-        check_cuda(cudaMemcpy(d_s1, w1.shard.tensor_data(*w1.s), w1.s->nbytes, cudaMemcpyHostToDevice), "copy s1");
-        check_cuda(cudaMemcpy(d_w2, w2.shard.tensor_data(*w2.w), w2.w->nbytes, cudaMemcpyHostToDevice), "copy w2");
-        check_cuda(cudaMemcpy(d_s2, w2.shard.tensor_data(*w2.s), w2.s->nbytes, cudaMemcpyHostToDevice), "copy s2");
-        check_cuda(cudaMemcpy(d_w3, w3.shard.tensor_data(*w3.w), w3.w->nbytes, cudaMemcpyHostToDevice), "copy w3");
-        check_cuda(cudaMemcpy(d_s3, w3.shard.tensor_data(*w3.s), w3.s->nbytes, cudaMemcpyHostToDevice), "copy s3");
 
         if (!rmsnorm_bf16_gamma_cuda(d_x, d_attn_gamma, d_attn_norm, dim, 1e-6f)) throw std::runtime_error("attn norm launch failed");
         if (!fp8_e4m3_e8m0_matvec_cuda(d_attn_norm, d_wkv, d_wkv_scale, d_attn_proj, attn_rows, dim)) throw std::runtime_error("wkv launch failed");
         if (!vector_add_cuda(d_x, d_x, d_resid1, dim)) throw std::runtime_error("resid1 launch failed");
         if (!rmsnorm_bf16_gamma_cuda(d_resid1, d_ffn_gamma, d_ffn_norm, dim, 1e-6f)) throw std::runtime_error("ffn norm launch failed");
+        std::vector<float> ffn_norm_host(dim);
+        check_cuda(cudaMemcpy(ffn_norm_host.data(), d_ffn_norm, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy ffn norm for gate");
+        const int expert_id = select_smoke_expert(index, prefix, li, token, ffn_norm_host, config.n_hash_layers, config.n_routed_experts);
+        Fp4Handle w1 = open_fp4(index, prefix + "ffn.experts." + std::to_string(expert_id) + ".w1.weight");
+        Fp4Handle w2 = open_fp4(index, prefix + "ffn.experts." + std::to_string(expert_id) + ".w2.weight");
+        Fp4Handle w3 = open_fp4(index, prefix + "ffn.experts." + std::to_string(expert_id) + ".w3.weight");
+        check_cuda(cudaMemcpy(d_w1, w1.shard.tensor_data(*w1.w), w1.w->nbytes, cudaMemcpyHostToDevice), "copy selected w1");
+        check_cuda(cudaMemcpy(d_s1, w1.shard.tensor_data(*w1.s), w1.s->nbytes, cudaMemcpyHostToDevice), "copy selected s1");
+        check_cuda(cudaMemcpy(d_w2, w2.shard.tensor_data(*w2.w), w2.w->nbytes, cudaMemcpyHostToDevice), "copy selected w2");
+        check_cuda(cudaMemcpy(d_s2, w2.shard.tensor_data(*w2.s), w2.s->nbytes, cudaMemcpyHostToDevice), "copy selected s2");
+        check_cuda(cudaMemcpy(d_w3, w3.shard.tensor_data(*w3.w), w3.w->nbytes, cudaMemcpyHostToDevice), "copy selected w3");
+        check_cuda(cudaMemcpy(d_s3, w3.shard.tensor_data(*w3.s), w3.s->nbytes, cudaMemcpyHostToDevice), "copy selected s3");
         if (!fp4_e2m1_e8m0_matvec_cuda(d_ffn_norm, d_w1, d_s1, d_gate, inter, dim)) throw std::runtime_error("w1 launch failed");
         if (!fp4_e2m1_e8m0_matvec_cuda(d_ffn_norm, d_w3, d_s3, d_up, inter, dim)) throw std::runtime_error("w3 launch failed");
         if (!silu_mul_cuda(d_gate, d_up, d_hidden, inter)) throw std::runtime_error("silu launch failed");

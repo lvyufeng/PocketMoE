@@ -63,4 +63,11 @@ bool bf16_matvec_cuda(
     int cols,
     void* stream = nullptr);
 
+bool vector_add_cuda(
+    const float* d_a,
+    const float* d_b,
+    float* d_y,
+    int cols,
+    void* stream = nullptr);
+
 }  // namespace dsv4

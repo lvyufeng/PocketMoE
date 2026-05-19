@@ -85,3 +85,7 @@ set_target_properties(test_moe_single_expert PROPERTIES RUNTIME_OUTPUT_DIRECTORY
 add_executable(test_embedding_head tests/test_embedding_head.cpp)
 target_link_libraries(test_embedding_head PRIVATE dsv4_cpp_core)
 set_target_properties(test_embedding_head PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_min_layer_smoke tests/test_min_layer_smoke.cpp)
+target_link_libraries(test_min_layer_smoke PRIVATE dsv4_cpp_core)
+set_target_properties(test_min_layer_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

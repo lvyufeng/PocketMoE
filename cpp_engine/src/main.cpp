@@ -16,6 +16,8 @@ struct Args {
     std::string inspect_tensor;
     int smoke_layers = 1;
     int forward_token = -1;
+    int max_new_tokens = 1;
+    bool generate_token = false;
     bool dump_config = false;
     bool inspect = false;
     bool smoke_forward = false;
@@ -53,10 +55,14 @@ Args parse_args(int argc, char** argv) {
         } else if (arg == "--forward-token" && i + 1 < argc) {
             args.smoke_forward = true;
             args.forward_token = std::stoi(argv[++i]);
+        } else if (arg == "--generate-token" && i + 1 < argc) {
+            args.smoke_forward = true;
+            args.generate_token = true;
+            args.forward_token = std::stoi(argv[++i]);
         } else if (arg == "--tokens" && i + 1 < argc) {
             ++i;
         } else if (arg == "--max-new-tokens" && i + 1 < argc) {
-            ++i;
+            args.max_new_tokens = std::stoi(argv[++i]);
         } else {
             throw std::runtime_error("unknown or incomplete argument: " + arg);
         }
@@ -104,17 +110,30 @@ int main(int argc, char** argv) {
                 print_safe_tensor(*info, *shard_name);
             }
             if (args.smoke_forward) {
-                dsv4::ForwardSmokeResult result = args.forward_token >= 0
-                    ? dsv4::run_safetensors_token_forward(args.ckpt, args.forward_token, args.smoke_layers)
-                    : dsv4::run_safetensors_layer_loop_smoke(args.ckpt, args.smoke_layers);
-                std::cout << "smoke_forward=1 token=" << result.token
-                          << " layers=" << result.layers
-                          << " dim=" << result.dim
-                          << " inter=" << result.inter
-                          << " logits=" << result.logits
-                          << " top_token=" << result.top_token
-                          << " top_logit=" << result.top_logit
-                          << " checksum=" << result.checksum << "\n";
+                if (args.generate_token) {
+                    int token = args.forward_token;
+                    for (int step = 0; step < args.max_new_tokens; ++step) {
+                        dsv4::ForwardSmokeResult result = dsv4::run_safetensors_token_forward(args.ckpt, token, args.smoke_layers);
+                        std::cout << "generate_step=" << step
+                                  << " token=" << result.token
+                                  << " top_token=" << result.top_token
+                                  << " top_logit=" << result.top_logit
+                                  << " checksum=" << result.checksum << "\n";
+                        token = result.top_token;
+                    }
+                } else {
+                    dsv4::ForwardSmokeResult result = args.forward_token >= 0
+                        ? dsv4::run_safetensors_token_forward(args.ckpt, args.forward_token, args.smoke_layers)
+                        : dsv4::run_safetensors_layer_loop_smoke(args.ckpt, args.smoke_layers);
+                    std::cout << "smoke_forward=1 token=" << result.token
+                              << " layers=" << result.layers
+                              << " dim=" << result.dim
+                              << " inter=" << result.inter
+                              << " logits=" << result.logits
+                              << " top_token=" << result.top_token
+                              << " top_logit=" << result.top_logit
+                              << " checksum=" << result.checksum << "\n";
+                }
             }
             if (!args.dump_config && args.inspect_tensor.empty() && !args.inspect && !args.smoke_forward) {
                 std::cout << "inference_not_implemented=1\n";

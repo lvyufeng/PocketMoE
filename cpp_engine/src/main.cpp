@@ -18,6 +18,7 @@ struct Args {
     std::string prompt;
     int smoke_layers = 1;
     int forward_token = -1;
+    int position = 0;
     int max_new_tokens = 1;
     bool generate_token = false;
     bool dump_config = false;
@@ -57,6 +58,8 @@ Args parse_args(int argc, char** argv) {
         } else if (arg == "--forward-token" && i + 1 < argc) {
             args.smoke_forward = true;
             args.forward_token = std::stoi(argv[++i]);
+        } else if (arg == "--position" && i + 1 < argc) {
+            args.position = std::stoi(argv[++i]);
         } else if (arg == "--generate-token" && i + 1 < argc) {
             args.smoke_forward = true;
             args.generate_token = true;
@@ -120,15 +123,17 @@ int main(int argc, char** argv) {
                     auto ids = tokenizer.encode_basic(args.prompt, true);
                     if (ids.empty()) throw std::runtime_error("prompt encoded to no tokens");
                     args.forward_token = ids.back();
+                    args.position = static_cast<int>(ids.size()) - 1;
                     std::cout << "prompt_tokens=" << ids.size()
                               << " last_token=" << args.forward_token
+                              << " position=" << args.position
                               << " last_text=" << tokenizer.decode_piece(args.forward_token) << "\n";
                 }
                 if (args.generate_token) {
                     int token = args.forward_token;
                     if (token < 0) throw std::runtime_error("--generate-token or --prompt is required for generation");
                     for (int step = 0; step < args.max_new_tokens; ++step) {
-                        dsv4::ForwardSmokeResult result = dsv4::run_safetensors_token_forward(args.ckpt, token, args.smoke_layers);
+                        dsv4::ForwardSmokeResult result = dsv4::run_safetensors_token_forward_at_position(args.ckpt, token, args.smoke_layers, args.position + step);
                         std::cout << "generate_step=" << step
                                   << " token=" << result.token
                                   << " token_text=" << tokenizer.decode_piece(result.token)

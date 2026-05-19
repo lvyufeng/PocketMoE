@@ -55,6 +55,9 @@ struct AttentionSmokeDims {
     int group_dim = 0;
     int group_rank = 0;
     int attn_mid = 0;
+    int rope_dim = 0;
+    int position = 0;
+    float rope_theta = 0.0f;
 };
 
 bool run_single_token_attention_smoke(
@@ -87,9 +90,12 @@ bool run_single_token_attention_smoke(
     if (!fp8_e4m3_e8m0_matvec_cuda(d_attn_norm, d_wq_a, d_wq_a_scale, d_q_a, dims.q_a_dim, dims.dim)) return false;
     if (!rmsnorm_bf16_gamma_cuda(d_q_a, d_q_gamma, d_q_norm, dims.q_a_dim, 1e-6f)) return false;
     if (!fp8_e4m3_e8m0_matvec_cuda(d_q_norm, d_wq_b, d_wq_b_scale, d_q, dims.q_dim, dims.q_a_dim)) return false;
+    if (!head_rmsnorm_rope_cuda(d_q, dims.heads, dims.head_dim, dims.rope_dim, dims.position, dims.rope_theta, false, 1e-6f)) return false;
     if (!fp8_e4m3_e8m0_matvec_cuda(d_attn_norm, d_wkv, d_wkv_scale, d_kv_a, dims.kv_dim, dims.dim)) return false;
     if (!rmsnorm_bf16_gamma_cuda(d_kv_a, d_kv_gamma, d_kv_norm, dims.kv_dim, 1e-6f)) return false;
+    if (!head_rmsnorm_rope_cuda(d_kv_norm, 1, dims.head_dim, dims.rope_dim, dims.position, dims.rope_theta, false, 0.0f)) return false;
     if (!single_token_sparse_attention_cuda(d_q, d_kv_norm, d_attn_sink, d_attn_value, dims.heads, dims.head_dim, 1.0f / std::sqrt(static_cast<float>(dims.head_dim)))) return false;
+    if (!head_rmsnorm_rope_cuda(d_attn_value, dims.heads, dims.head_dim, dims.rope_dim, dims.position, dims.rope_theta, true, 0.0f)) return false;
     for (int g = 0; g < dims.groups; ++g) {
         const float* group_x = d_attn_value + static_cast<size_t>(g) * dims.group_dim;
         const uint8_t* group_w = d_wo_a + static_cast<size_t>(g) * dims.group_rank * dims.group_dim;
@@ -182,6 +188,10 @@ ForwardSmokeResult run_safetensors_layer_loop_smoke(const std::string& ckpt_dir,
 }
 
 ForwardSmokeResult run_safetensors_token_forward(const std::string& ckpt_dir, int token, int layer_count) {
+    return run_safetensors_token_forward_at_position(ckpt_dir, token, layer_count, 0);
+}
+
+ForwardSmokeResult run_safetensors_token_forward_at_position(const std::string& ckpt_dir, int token, int layer_count, int position) {
     if (!cuda_runtime_available()) throw std::runtime_error("CUDA runtime is not available");
     SafeTensorsIndex index(ckpt_dir);
     ModelConfig config = ModelConfig::from_hf_config(ckpt_dir);
@@ -208,10 +218,14 @@ ForwardSmokeResult run_safetensors_token_forward(const std::string& ckpt_dir, in
     attn_dims.groups = static_cast<int>(config.o_groups);
     attn_dims.group_rank = static_cast<int>(config.o_lora_rank);
     attn_dims.attn_mid = attn_dims.group_rank * attn_dims.groups;
-    if (attn_dims.q_a_dim <= 0 || attn_dims.heads <= 0 || attn_dims.head_dim <= 0 || attn_dims.kv_dim <= 0 || attn_dims.groups <= 0 || attn_dims.group_rank <= 0) {
+    attn_dims.rope_dim = static_cast<int>(config.rope_dim);
+    attn_dims.position = position;
+    attn_dims.rope_theta = static_cast<float>(config.compress_rope_theta > 0.0 ? config.compress_rope_theta : config.rope_theta);
+    if (attn_dims.q_a_dim <= 0 || attn_dims.heads <= 0 || attn_dims.head_dim <= 0 || attn_dims.kv_dim <= 0 || attn_dims.groups <= 0 || attn_dims.group_rank <= 0 || attn_dims.rope_dim <= 0 || attn_dims.rope_theta <= 0.0f) {
         throw std::runtime_error("invalid attention dimensions in config");
     }
     if (attn_dims.q_dim % attn_dims.groups != 0) throw std::runtime_error("attention q dim must be divisible by output groups");
+    if (attn_dims.kv_dim != attn_dims.head_dim) throw std::runtime_error("single-token attention expects one KV head");
     attn_dims.group_dim = attn_dims.q_dim / attn_dims.groups;
     const int inter = static_cast<int>(first_w1.pair.rows);
     const int head_rows = static_cast<int>(head->shape[0]);

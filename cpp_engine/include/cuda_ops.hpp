@@ -94,4 +94,15 @@ bool single_token_sparse_attention_cuda(
     float scale,
     void* stream = nullptr);
 
+bool head_rmsnorm_rope_cuda(
+    float* d_x,
+    int heads,
+    int head_dim,
+    int rope_dim,
+    int position,
+    float theta,
+    bool inverse,
+    float eps,
+    void* stream = nullptr);
+
 }  // namespace dsv4

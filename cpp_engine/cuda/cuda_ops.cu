@@ -28,6 +28,66 @@ __global__ void repeat_vector_kernel(const float* x, float* y, int cols, int rep
     for (int i = threadIdx.x; i < total; i += blockDim.x) y[i] = x[i % cols];
 }
 
+__global__ void head_rmsnorm_rope_kernel(
+    float* x,
+    int head_dim,
+    int rope_dim,
+    int position,
+    float theta,
+    bool inverse,
+    float eps) {
+    const int head = blockIdx.x;
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        const float v = x[head * head_dim + i];
+        sum_sq += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum_sq;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float norm = rsqrtf(partial[0] / static_cast<float>(head_dim) + eps);
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) x[head * head_dim + i] *= norm;
+    __syncthreads();
+    const int rope_start = head_dim - rope_dim;
+    for (int pair = threadIdx.x * 2; pair < rope_dim; pair += blockDim.x * 2) {
+        const int offset = rope_start + pair;
+        const float angle = static_cast<float>(position) / powf(theta, static_cast<float>(pair) / static_cast<float>(rope_dim));
+        const float c = cosf(angle);
+        const float s = inverse ? -sinf(angle) : sinf(angle);
+        const size_t base = static_cast<size_t>(head) * head_dim + offset;
+        const float a = x[base];
+        const float b = x[base + 1];
+        x[base] = a * c - b * s;
+        x[base + 1] = a * s + b * c;
+    }
+}
+
+__global__ void rope_kernel(
+    float* x,
+    int head_dim,
+    int rope_dim,
+    int position,
+    float theta,
+    bool inverse) {
+    const int head = blockIdx.x;
+    const int rope_start = head_dim - rope_dim;
+    for (int pair = threadIdx.x * 2; pair < rope_dim; pair += blockDim.x * 2) {
+        const int offset = rope_start + pair;
+        const float angle = static_cast<float>(position) / powf(theta, static_cast<float>(pair) / static_cast<float>(rope_dim));
+        const float c = cosf(angle);
+        const float s = inverse ? -sinf(angle) : sinf(angle);
+        const size_t base = static_cast<size_t>(head) * head_dim + offset;
+        const float a = x[base];
+        const float b = x[base + 1];
+        x[base] = a * c - b * s;
+        x[base + 1] = a * s + b * c;
+    }
+}
+
 __global__ void single_token_sparse_attention_kernel(
     const float* q,
     const float* kv,
@@ -99,6 +159,26 @@ bool single_token_sparse_attention_cuda(
     if (d_q == nullptr || d_kv == nullptr || d_y == nullptr || heads <= 0 || head_dim <= 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     single_token_sparse_attention_kernel<<<heads, 256, 0, cuda_stream>>>(d_q, d_kv, d_attn_sink, d_y, head_dim, scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool head_rmsnorm_rope_cuda(
+    float* d_x,
+    int heads,
+    int head_dim,
+    int rope_dim,
+    int position,
+    float theta,
+    bool inverse,
+    float eps,
+    void* stream) {
+    if (d_x == nullptr || heads <= 0 || head_dim <= 0 || rope_dim < 0 || rope_dim > head_dim || (rope_dim % 2) != 0 || theta <= 0.0f) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    if (eps > 0.0f) {
+        head_rmsnorm_rope_kernel<<<heads, 256, 0, cuda_stream>>>(d_x, head_dim, rope_dim, position, theta, inverse, eps);
+    } else {
+        rope_kernel<<<heads, 256, 0, cuda_stream>>>(d_x, head_dim, rope_dim, position, theta, inverse);
+    }
     return cudaGetLastError() == cudaSuccess;
 }
 

@@ -91,6 +91,49 @@ std::string scale_name_for(const std::string& weight) {
     return weight + ".scale";
 }
 
+void test_head_rmsnorm_rope_kernel() {
+    constexpr int heads = 2;
+    constexpr int head_dim = 6;
+    constexpr int rope_dim = 4;
+    constexpr int position = 3;
+    constexpr float theta = 10000.0f;
+    constexpr float eps = 1e-6f;
+    std::vector<float> x = {
+        0.25f, -0.5f, 0.75f, 1.0f, -1.25f, 0.5f,
+        -0.125f, 0.375f, -0.625f, 0.875f, 1.125f, -1.5f,
+    };
+    std::vector<float> ref = x;
+    for (int h = 0; h < heads; ++h) {
+        float sum_sq = 0.0f;
+        for (int i = 0; i < head_dim; ++i) sum_sq += ref[h * head_dim + i] * ref[h * head_dim + i];
+        const float inv = 1.0f / std::sqrt(sum_sq / head_dim + eps);
+        for (int i = 0; i < head_dim; ++i) ref[h * head_dim + i] *= inv;
+        const int rope_start = head_dim - rope_dim;
+        for (int pair = 0; pair < rope_dim; pair += 2) {
+            const float angle = static_cast<float>(position) / std::pow(theta, static_cast<float>(pair) / rope_dim);
+            const float c = std::cos(angle);
+            const float s = std::sin(angle);
+            const int base = h * head_dim + rope_start + pair;
+            const float a = ref[base];
+            const float b = ref[base + 1];
+            ref[base] = a * c - b * s;
+            ref[base + 1] = a * s + b * c;
+        }
+    }
+
+    float* d_x = nullptr;
+    check_cuda(cudaMalloc(&d_x, x.size() * sizeof(float)), "cudaMalloc rope x");
+    check_cuda(cudaMemcpy(d_x, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice), "copy rope x");
+    if (!dsv4::head_rmsnorm_rope_cuda(d_x, heads, head_dim, rope_dim, position, theta, false, eps)) throw std::runtime_error("head rmsnorm rope launch failed");
+    check_cuda(cudaDeviceSynchronize(), "sync head rmsnorm rope");
+    std::vector<float> got(x.size());
+    check_cuda(cudaMemcpy(got.data(), d_x, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy rope x");
+    cudaFree(d_x);
+    for (size_t i = 0; i < got.size(); ++i) {
+        if (std::fabs(got[i] - ref[i]) > 1e-6f) throw std::runtime_error("head rmsnorm rope mismatch");
+    }
+}
+
 void test_single_token_attention_kernel() {
     constexpr int heads = 3;
     constexpr int head_dim = 4;
@@ -144,6 +187,7 @@ int main(int argc, char** argv) {
             std::cout << "[SKIP] CUDA runtime is not available\n";
             return 0;
         }
+        test_head_rmsnorm_rope_kernel();
         test_single_token_attention_kernel();
         Args args = parse_args(argc, argv);
         if (args.ckpt.empty()) throw std::runtime_error("--ckpt is required");

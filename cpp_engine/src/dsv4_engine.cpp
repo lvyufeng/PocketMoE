@@ -171,6 +171,38 @@ std::vector<float> hc_post_cpu(const std::vector<float>& x, const std::vector<fl
     return out;
 }
 
+std::vector<HcPreResult> hc_pre_rows_cpu(const std::vector<float>& h4_rows, const float* fn, const float* scale, const float* base, int tokens, int dim) {
+    std::vector<HcPreResult> out;
+    out.reserve(tokens);
+    const size_t row_stride = static_cast<size_t>(4) * dim;
+    for (int t = 0; t < tokens; ++t) {
+        std::vector<float> row(h4_rows.begin() + static_cast<size_t>(t) * row_stride, h4_rows.begin() + static_cast<size_t>(t + 1) * row_stride);
+        out.push_back(hc_pre_cpu(row, fn, scale, base, dim));
+    }
+    return out;
+}
+
+std::vector<float> hc_pre_x_rows_cpu(const std::vector<HcPreResult>& pre_rows, int dim) {
+    std::vector<float> out(static_cast<size_t>(pre_rows.size()) * dim);
+    for (size_t t = 0; t < pre_rows.size(); ++t) {
+        std::copy(pre_rows[t].x.begin(), pre_rows[t].x.end(), out.begin() + t * static_cast<size_t>(dim));
+    }
+    return out;
+}
+
+std::vector<float> hc_post_rows_cpu(const std::vector<float>& x_rows, const std::vector<float>& residual_rows, const std::vector<HcPreResult>& pre_rows, int dim) {
+    const int tokens = static_cast<int>(pre_rows.size());
+    const size_t h4_stride = static_cast<size_t>(4) * dim;
+    std::vector<float> out(static_cast<size_t>(tokens) * h4_stride);
+    for (int t = 0; t < tokens; ++t) {
+        std::vector<float> x(x_rows.begin() + static_cast<size_t>(t) * dim, x_rows.begin() + static_cast<size_t>(t + 1) * dim);
+        std::vector<float> residual(residual_rows.begin() + static_cast<size_t>(t) * h4_stride, residual_rows.begin() + static_cast<size_t>(t + 1) * h4_stride);
+        std::vector<float> row = hc_post_cpu(x, residual, pre_rows[static_cast<size_t>(t)], dim);
+        std::copy(row.begin(), row.end(), out.begin() + static_cast<size_t>(t) * h4_stride);
+    }
+    return out;
+}
+
 std::vector<float> hc_head_cpu(const std::vector<float>& h4, const float* fn, const float* scale, const float* base, int dim) {
     constexpr int hc = 4;
     constexpr float eps = 1e-6f;
@@ -1070,6 +1102,7 @@ struct SafeForwardContext {
 }  // namespace
 
 ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, int token, int layer_count, int position);
+ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, const std::vector<int>& tokens, int layer_count);
 
 Dsv4Engine::Dsv4Engine(const std::string& model_path) : gguf_(model_path), config_(ModelConfig::from_gguf(gguf_)) {}
 
@@ -1094,11 +1127,7 @@ ForwardSmokeResult run_safetensors_prompt_forward_with_options(const std::string
     SafeForwardContext ctx(ckpt_dir);
     ctx.options = options;
     ctx.kv_cache_tokens = static_cast<int>(std::min<size_t>(tokens.size(), 256));
-    ForwardSmokeResult result;
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        result = run_safetensors_token_forward_impl(ctx, tokens[i], layer_count, static_cast<int>(i));
-    }
-    return result;
+    return run_safetensors_prompt_prefill_impl(ctx, tokens, layer_count);
 }
 
 std::vector<ForwardSmokeResult> run_safetensors_generate_tokens(const std::string& ckpt_dir, const std::vector<int>& seed_tokens, int layer_count, int max_new_tokens) {
@@ -1116,10 +1145,7 @@ GenerateSmokeResult run_safetensors_generate_tokens_timed_with_options(const std
     const bool prepare_fp4_host = !options.skip_fp4_host_prepare && env_int_or_default("DSV4_CPP_PREPARE_FP4_HOST", 0) != 0;
     if (prepare_fp4_host) ctx.prepare_fp4_host_weights(layer_count, options.tp_world, options.tp_rank);
     const auto timed_t0 = Clock::now();
-    ForwardSmokeResult result;
-    for (size_t i = 0; i < seed_tokens.size(); ++i) {
-        result = run_safetensors_token_forward_impl(ctx, seed_tokens[i], layer_count, static_cast<int>(i));
-    }
+    ForwardSmokeResult result = run_safetensors_prompt_prefill_impl(ctx, seed_tokens, layer_count);
     std::vector<ForwardSmokeResult> out;
     out.reserve(static_cast<size_t>(max_new_tokens));
     int token = result.top_token;
@@ -1154,6 +1180,342 @@ GenerateSmokeResult run_safetensors_generate_tokens_timed_with_options(const std
 
 std::vector<ForwardSmokeResult> run_safetensors_generate_tokens_with_options(const std::string& ckpt_dir, const std::vector<int>& seed_tokens, int layer_count, int max_new_tokens, const ForwardSmokeOptions& options) {
     return run_safetensors_generate_tokens_timed_with_options(ckpt_dir, seed_tokens, layer_count, max_new_tokens, options).tokens;
+}
+
+ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, const std::vector<int>& tokens, int layer_count) {
+    if (!cuda_runtime_available()) throw std::runtime_error("CUDA runtime is not available");
+    if (tokens.empty()) throw std::runtime_error("prompt has no tokens");
+    SafeTensorsIndex& index = ctx.index;
+    ModelConfig& config = ctx.config;
+    if (layer_count <= 0) layer_count = 1;
+    if (config.n_layers > 0) layer_count = std::min(layer_count, static_cast<int>(config.n_layers));
+    const int token_count = static_cast<int>(tokens.size());
+    const int last_token = tokens.back();
+    const int tp_world = std::max(1, ctx.options.tp_world);
+    const int tp_rank = std::max(0, ctx.options.tp_rank);
+    if (tp_rank >= tp_world) throw std::runtime_error("invalid TP rank in prefill options");
+
+    const auto* embed = ctx.embed;
+    const auto* head = ctx.head;
+    Fp4View first_w1 = ctx.fp4_view("layers.0.ffn.experts.0.w1.weight");
+    const int dim = static_cast<int>(embed->shape[1]);
+    const int inter = static_cast<int>(first_w1.pair.rows);
+    const int route_count = static_cast<int>(std::min<uint64_t>(config.n_activated_experts, config.n_routed_experts));
+    const int experts_per_rank = tp_world > 1 ? static_cast<int>(config.n_routed_experts / tp_world) : static_cast<int>(config.n_routed_experts);
+    const int expert_start = tp_rank * experts_per_rank;
+    const int head_rows = static_cast<int>(head->shape[0]);
+    if (head_rows % tp_world != 0) throw std::runtime_error("head vocab rows must divide TP world");
+    const int local_head_rows = head_rows / tp_world;
+    const int local_head_start = tp_rank * local_head_rows;
+
+    std::vector<int> token_ids(tokens.begin(), tokens.end());
+    for (int token : token_ids) {
+        if (token < 0 || token >= static_cast<int>(embed->shape[0])) throw std::runtime_error("token id out of range");
+    }
+
+    int* d_token_ids = nullptr;
+    uint16_t* d_embed_matrix = nullptr;
+    float* d_x_rows = nullptr;
+    uint16_t* d_ffn_gamma = nullptr;
+    float* d_ffn_norm_rows = nullptr;
+    int64_t* d_route_indices = nullptr;
+    float* d_route_weights = nullptr;
+    int64_t* d_group_route_tokens = nullptr;
+    float* d_group_route_weights = nullptr;
+    int32_t* d_seg_starts = nullptr;
+    int32_t* d_counts = nullptr;
+    int32_t* d_offsets = nullptr;
+    int32_t* d_total_routes = nullptr;
+    uint16_t* d_attn_gamma = nullptr;
+    uint16_t* d_q_gamma = nullptr;
+    uint16_t* d_kv_gamma = nullptr;
+    float* d_attn_x = nullptr;
+    float* d_attn_norm = nullptr;
+    float* d_q_a = nullptr;
+    float* d_q_norm = nullptr;
+    float* d_q = nullptr;
+    float* d_kv_a = nullptr;
+    float* d_kv_norm = nullptr;
+    float* d_attn_value = nullptr;
+    float* d_attn_mid = nullptr;
+    float* d_attn_out = nullptr;
+    int* d_kv_indices = nullptr;
+    float* d_moe_rows = nullptr;
+    float* d_shared_gate = nullptr;
+    float* d_shared_up = nullptr;
+    float* d_shared_hidden = nullptr;
+    float* d_shared_out = nullptr;
+    uint16_t* d_head = nullptr;
+    uint16_t* d_final_norm_gamma = nullptr;
+    float* d_last_x = nullptr;
+    float* d_final_norm = nullptr;
+    float* d_logits = nullptr;
+
+    const size_t token_dim = static_cast<size_t>(token_count) * dim;
+    const size_t routes_cap = static_cast<size_t>(token_count) * route_count;
+    check_cuda(cudaMalloc(&d_token_ids, static_cast<size_t>(token_count) * sizeof(int)), "cudaMalloc token ids");
+    check_cuda(cudaMalloc(&d_embed_matrix, ctx.embed->nbytes), "cudaMalloc embed matrix");
+    check_cuda(cudaMalloc(&d_x_rows, token_dim * sizeof(float)), "cudaMalloc x rows");
+    check_cuda(cudaMalloc(&d_ffn_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc ffn gamma");
+    check_cuda(cudaMalloc(&d_ffn_norm_rows, token_dim * sizeof(float)), "cudaMalloc ffn norm rows");
+    check_cuda(cudaMalloc(&d_route_indices, routes_cap * sizeof(int64_t)), "cudaMalloc prefill route indices");
+    check_cuda(cudaMalloc(&d_route_weights, routes_cap * sizeof(float)), "cudaMalloc prefill route weights");
+    check_cuda(cudaMalloc(&d_group_route_tokens, routes_cap * sizeof(int64_t)), "cudaMalloc grouped route tokens");
+    check_cuda(cudaMalloc(&d_group_route_weights, routes_cap * sizeof(float)), "cudaMalloc grouped route weights");
+    check_cuda(cudaMalloc(&d_seg_starts, static_cast<size_t>(experts_per_rank + 1) * sizeof(int32_t)), "cudaMalloc seg starts");
+    check_cuda(cudaMalloc(&d_counts, static_cast<size_t>(experts_per_rank) * sizeof(int32_t)), "cudaMalloc route counts");
+    check_cuda(cudaMalloc(&d_offsets, static_cast<size_t>(experts_per_rank) * sizeof(int32_t)), "cudaMalloc route offsets");
+    check_cuda(cudaMalloc(&d_total_routes, sizeof(int32_t)), "cudaMalloc total routes");
+    check_cuda(cudaMalloc(&d_attn_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc prefill attn gamma");
+    AttentionSmokeDims attn_dims = make_attention_dims(config, dim, tp_world, 0);
+    check_cuda(cudaMalloc(&d_q_gamma, static_cast<size_t>(attn_dims.q_a_dim) * sizeof(uint16_t)), "cudaMalloc prefill q gamma");
+    check_cuda(cudaMalloc(&d_kv_gamma, static_cast<size_t>(attn_dims.kv_dim) * sizeof(uint16_t)), "cudaMalloc prefill kv gamma");
+    check_cuda(cudaMalloc(&d_attn_x, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc prefill attn x");
+    check_cuda(cudaMalloc(&d_attn_norm, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc prefill attn norm");
+    check_cuda(cudaMalloc(&d_q_a, static_cast<size_t>(attn_dims.q_a_dim) * sizeof(float)), "cudaMalloc prefill q_a");
+    check_cuda(cudaMalloc(&d_q_norm, static_cast<size_t>(attn_dims.q_a_dim) * sizeof(float)), "cudaMalloc prefill q_norm");
+    check_cuda(cudaMalloc(&d_q, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "cudaMalloc prefill q");
+    check_cuda(cudaMalloc(&d_kv_a, static_cast<size_t>(attn_dims.kv_dim) * sizeof(float)), "cudaMalloc prefill kv_a");
+    check_cuda(cudaMalloc(&d_kv_norm, static_cast<size_t>(attn_dims.kv_dim) * sizeof(float)), "cudaMalloc prefill kv_norm");
+    check_cuda(cudaMalloc(&d_attn_value, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "cudaMalloc prefill attn value");
+    check_cuda(cudaMalloc(&d_attn_mid, static_cast<size_t>(attn_dims.attn_mid) * sizeof(float)), "cudaMalloc prefill attn mid");
+    check_cuda(cudaMalloc(&d_attn_out, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc prefill attn out");
+    check_cuda(cudaMalloc(&d_kv_indices, 640 * sizeof(int)), "cudaMalloc prefill kv indices");
+    check_cuda(cudaMalloc(&d_moe_rows, token_dim * sizeof(float)), "cudaMalloc moe rows");
+    check_cuda(cudaMalloc(&d_shared_gate, static_cast<size_t>(token_count) * (inter / tp_world) * sizeof(float)), "cudaMalloc shared gate rows");
+    check_cuda(cudaMalloc(&d_shared_up, static_cast<size_t>(token_count) * (inter / tp_world) * sizeof(float)), "cudaMalloc shared up rows");
+    check_cuda(cudaMalloc(&d_shared_hidden, static_cast<size_t>(token_count) * (inter / tp_world) * sizeof(float)), "cudaMalloc shared hidden rows");
+    check_cuda(cudaMalloc(&d_shared_out, token_dim * sizeof(float)), "cudaMalloc shared out rows");
+    check_cuda(cudaMalloc(&d_head, static_cast<size_t>(local_head_rows) * dim * sizeof(uint16_t)), "cudaMalloc head");
+    check_cuda(cudaMalloc(&d_final_norm_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc final norm gamma");
+    check_cuda(cudaMalloc(&d_last_x, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc last x");
+    check_cuda(cudaMalloc(&d_final_norm, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc final norm");
+    check_cuda(cudaMalloc(&d_logits, static_cast<size_t>(local_head_rows) * sizeof(float)), "cudaMalloc logits");
+
+    check_cuda(cudaMemcpy(d_token_ids, token_ids.data(), static_cast<size_t>(token_count) * sizeof(int), cudaMemcpyHostToDevice), "copy token ids");
+    check_cuda(cudaMemcpy(d_embed_matrix, ctx.embed_shard.tensor_data(*embed), ctx.embed->nbytes, cudaMemcpyHostToDevice), "copy embed matrix");
+    check_cuda(cudaMemcpy(d_head, reinterpret_cast<const uint16_t*>(ctx.head_shard.tensor_data(*head)) + static_cast<size_t>(local_head_start) * dim, static_cast<size_t>(local_head_rows) * dim * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy head");
+    check_cuda(cudaMemcpy(d_final_norm_gamma, ctx.final_norm_shard.tensor_data(*ctx.final_norm), ctx.final_norm->nbytes, cudaMemcpyHostToDevice), "copy final norm gamma");
+    if (!bf16_rows_to_float_cuda(d_embed_matrix, d_token_ids, d_x_rows, token_count, dim)) throw std::runtime_error("embed rows launch failed");
+
+    std::vector<float> h4_rows(static_cast<size_t>(token_count) * 4 * dim);
+    {
+        std::vector<float> host_x(token_dim);
+        check_cuda(cudaMemcpy(host_x.data(), d_x_rows, token_dim * sizeof(float), cudaMemcpyDeviceToHost), "copy prefill embed rows host");
+        for (int t = 0; t < token_count; ++t) {
+            for (int m = 0; m < 4; ++m) {
+                std::copy(host_x.begin() + static_cast<size_t>(t) * dim, host_x.begin() + static_cast<size_t>(t + 1) * dim, h4_rows.begin() + (static_cast<size_t>(t) * 4 + m) * dim);
+            }
+        }
+    }
+
+    for (int li = 0; li < layer_count; ++li) {
+        const std::string prefix = "layers." + std::to_string(li) + ".";
+        SafeTensorsShard& attn_norm_shard = ctx.shard_for_tensor(prefix + "attn_norm.weight");
+        SafeTensorsShard& qkv_shard = ctx.shard_for_tensor(prefix + "attn.wq_a.weight");
+        SafeTensorsShard& ffn_norm_shard = ctx.shard_for_tensor(prefix + "ffn_norm.weight");
+        const auto* hc_attn_fn = require_tensor(qkv_shard, prefix + "hc_attn_fn");
+        const auto* hc_attn_scale = require_tensor(qkv_shard, prefix + "hc_attn_scale");
+        const auto* hc_attn_base = require_tensor(qkv_shard, prefix + "hc_attn_base");
+        const auto* hc_ffn_fn = require_tensor(qkv_shard, prefix + "hc_ffn_fn");
+        const auto* hc_ffn_scale = require_tensor(qkv_shard, prefix + "hc_ffn_scale");
+        const auto* hc_ffn_base = require_tensor(qkv_shard, prefix + "hc_ffn_base");
+        const auto* attn_norm = require_tensor(attn_norm_shard, prefix + "attn_norm.weight");
+        const auto* q_norm = require_tensor(qkv_shard, prefix + "attn.q_norm.weight");
+        const auto* kv_norm = require_tensor(qkv_shard, prefix + "attn.kv_norm.weight");
+        const auto* ffn_norm = require_tensor(ffn_norm_shard, prefix + "ffn_norm.weight");
+        DeviceAttentionCache& attn_cache = ctx.attention_device_cache(li, tp_world, tp_rank, attn_dims);
+        check_cuda(cudaMemcpy(d_attn_gamma, attn_norm_shard.tensor_data(*attn_norm), attn_norm->nbytes, cudaMemcpyHostToDevice), "copy prefill attn gamma");
+        check_cuda(cudaMemcpy(d_q_gamma, qkv_shard.tensor_data(*q_norm), q_norm->nbytes, cudaMemcpyHostToDevice), "copy prefill q gamma");
+        check_cuda(cudaMemcpy(d_kv_gamma, qkv_shard.tensor_data(*kv_norm), kv_norm->nbytes, cudaMemcpyHostToDevice), "copy prefill kv gamma");
+        uint64_t layer_compress_ratio = static_cast<size_t>(li) < ctx.config.compress_ratios.size() ? ctx.config.compress_ratios[static_cast<size_t>(li)] : 0;
+        attn_dims.rope_theta = static_cast<float>(layer_compress_ratio == 0 ? config.rope_theta : config.compress_rope_theta);
+        if (attn_dims.rope_theta <= 0.0f) throw std::runtime_error("invalid layer rope_theta");
+        float* d_layer_kv_cache = ctx.kv_cache_tokens > 0 ? ctx.kv_cache_for_layer(li, attn_dims.head_dim) : nullptr;
+
+        std::vector<HcPreResult> attn_pre = hc_pre_rows_cpu(h4_rows, reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_attn_fn)), reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_attn_scale)), reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_attn_base)), token_count, dim);
+        std::vector<float> attn_x_rows = hc_pre_x_rows_cpu(attn_pre, dim);
+        std::vector<float> attn_out_rows(token_dim);
+        for (int t = 0; t < token_count; ++t) {
+            attn_dims.position = t;
+            attn_dims.cache_write_slot = t % attn_dims.window_size;
+            const int window_len = std::min(t + 1, attn_dims.window_size);
+            const int layer_cache_len = d_layer_kv_cache == nullptr ? 0 : std::min(ctx.kv_cache_capacity_for_layer(li), window_len);
+            check_cuda(cudaMemcpy(d_attn_x, attn_x_rows.data() + static_cast<size_t>(t) * dim, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyHostToDevice), "copy prefill attn token x");
+            if (!run_single_token_attention_smoke(
+                    attn_dims,
+                    d_attn_x,
+                    d_attn_gamma,
+                    attn_cache.wq_a,
+                    attn_cache.wq_a_scale,
+                    d_q_gamma,
+                    attn_cache.wq_b,
+                    attn_cache.wq_b_scale,
+                    attn_cache.wkv,
+                    attn_cache.wkv_scale,
+                    d_kv_gamma,
+                    attn_cache.wo_a,
+                    attn_cache.wo_a_scale,
+                    attn_cache.wo_b,
+                    attn_cache.wo_b_scale,
+                    attn_cache.attn_sink,
+                    d_layer_kv_cache,
+                    nullptr,
+                    0,
+                    layer_cache_len,
+                    d_attn_norm,
+                    d_q_a,
+                    d_q_norm,
+                    d_q,
+                    d_kv_a,
+                    d_kv_norm,
+                    d_attn_value,
+                    d_attn_mid,
+                    d_attn_out)) {
+                throw std::runtime_error("prefill attention launch failed");
+            }
+#ifdef DSV4_HAVE_NCCL
+            if (ctx.options.tp_world > 1) {
+                if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP prefill attention all-reduce requires --nccl-id-path");
+                nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_attn_out, dim);
+            }
+#endif
+            check_cuda(cudaMemcpy(attn_out_rows.data() + static_cast<size_t>(t) * dim, d_attn_out, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy prefill attn out token");
+        }
+        h4_rows = hc_post_rows_cpu(attn_out_rows, h4_rows, attn_pre, dim);
+        round_vector_to_bf16(h4_rows);
+
+        std::vector<HcPreResult> ffn_pre = hc_pre_rows_cpu(h4_rows, reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_ffn_fn)), reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_ffn_scale)), reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_ffn_base)), token_count, dim);
+        std::vector<float> ffn_x_rows = hc_pre_x_rows_cpu(ffn_pre, dim);
+        check_cuda(cudaMemcpy(d_x_rows, ffn_x_rows.data(), token_dim * sizeof(float), cudaMemcpyHostToDevice), "copy prefill ffn x rows");
+        check_cuda(cudaMemcpy(d_ffn_gamma, ffn_norm_shard.tensor_data(*ffn_norm), ffn_norm->nbytes, cudaMemcpyHostToDevice), "copy prefill ffn gamma");
+        if (!rmsnorm_bf16_gamma_rows_cuda(d_x_rows, d_ffn_gamma, d_ffn_norm_rows, token_count, dim, 1e-6f)) throw std::runtime_error("prefill ffn norm rows launch failed");
+
+        if (static_cast<uint64_t>(li) < config.n_hash_layers && index.shard_for_tensor(prefix + "ffn.gate.tid2eid") != nullptr) {
+            std::vector<float> ffn_norm_host(token_dim);
+            check_cuda(cudaMemcpy(ffn_norm_host.data(), d_ffn_norm_rows, token_dim * sizeof(float), cudaMemcpyDeviceToHost), "copy prefill ffn norm for hash gate");
+            SafeTensorsShard& gate_shard = ctx.shard_for_tensor(prefix + "ffn.gate.tid2eid");
+            const auto* tid2eid = require_tensor(gate_shard, prefix + "ffn.gate.tid2eid");
+            const auto* ids = reinterpret_cast<const int64_t*>(gate_shard.tensor_data(*tid2eid));
+            SafeTensorsShard& gate_weight_shard = ctx.shard_for_tensor(prefix + "ffn.gate.weight");
+            const auto* gate_weight = require_tensor(gate_weight_shard, prefix + "ffn.gate.weight");
+            const auto* gate_w = reinterpret_cast<const uint16_t*>(gate_weight_shard.tensor_data(*gate_weight));
+            const int gate_dim = static_cast<int>(gate_weight->shape[1]);
+            std::vector<int64_t> h_indices(routes_cap);
+            std::vector<float> h_weights(routes_cap);
+            for (int t = 0; t < token_count; ++t) {
+                float denom = 0.0f;
+                for (int k = 0; k < route_count; ++k) {
+                    const int64_t e = ids[static_cast<size_t>(tokens[static_cast<size_t>(t)]) * config.n_activated_experts + k];
+                    h_indices[static_cast<size_t>(t) * route_count + k] = e;
+                    float dot = 0.0f;
+                    const float* norm_row = ffn_norm_host.data() + static_cast<size_t>(t) * dim;
+                    for (int d = 0; d < gate_dim; ++d) dot += norm_row[d] * bf16_to_float(gate_w[static_cast<size_t>(e) * gate_dim + d]);
+                    const float original = std::sqrt(std::log1pf(std::exp(dot)));
+                    h_weights[static_cast<size_t>(t) * route_count + k] = original;
+                    denom += original;
+                }
+                if (denom == 0.0f) denom = 1.0f;
+                for (int k = 0; k < route_count; ++k) h_weights[static_cast<size_t>(t) * route_count + k] = h_weights[static_cast<size_t>(t) * route_count + k] / denom * static_cast<float>(config.route_scale);
+            }
+            check_cuda(cudaMemcpy(d_route_indices, h_indices.data(), routes_cap * sizeof(int64_t), cudaMemcpyHostToDevice), "copy hash route indices rows");
+            check_cuda(cudaMemcpy(d_route_weights, h_weights.data(), routes_cap * sizeof(float), cudaMemcpyHostToDevice), "copy hash route weights rows");
+        } else {
+            DeviceGateCache& gate = ctx.gate_device_cache(li);
+            if (!gate_topk_bf16_rows_cuda(d_ffn_norm_rows, gate.weight, gate.bias, d_route_indices, d_route_weights, token_count, gate.experts, gate.dim, route_count, static_cast<float>(config.route_scale))) throw std::runtime_error("prefill gate topk rows launch failed");
+        }
+
+        if (!moe_group_routes_cuda(d_route_indices, d_route_weights, d_group_route_tokens, d_group_route_weights, d_seg_starts, d_counts, d_offsets, d_total_routes, token_count, route_count, expert_start, experts_per_rank)) throw std::runtime_error("prefill group routes launch failed");
+        int32_t total_routes = 0;
+        std::vector<int32_t> h_counts(experts_per_rank);
+        check_cuda(cudaMemcpy(&total_routes, d_total_routes, sizeof(int32_t), cudaMemcpyDeviceToHost), "copy total routes");
+        check_cuda(cudaMemcpy(h_counts.data(), d_counts, h_counts.size() * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy route counts");
+        int max_count = 0;
+        for (int32_t c : h_counts) max_count = std::max(max_count, static_cast<int>(c));
+        check_cuda(cudaMemset(d_moe_rows, 0, token_dim * sizeof(float)), "zero prefill moe rows");
+        if (total_routes > 0 && max_count > 0) {
+            DeviceFp4ExpertCache sample;
+            Fp4View sample_w1 = ctx.fp4_view(prefix + "ffn.experts." + std::to_string(expert_start) + ".w1.weight");
+            Fp4View sample_w2 = ctx.fp4_view(prefix + "ffn.experts." + std::to_string(expert_start) + ".w2.weight");
+            Fp4View sample_w3 = ctx.fp4_view(prefix + "ffn.experts." + std::to_string(expert_start) + ".w3.weight");
+            sample.w1_bytes = sample_w1.w->nbytes;
+            sample.s1_bytes = sample_w1.s->nbytes;
+            sample.w2_bytes = sample_w2.w->nbytes;
+            sample.s2_bytes = sample_w2.s->nbytes;
+            sample.w3_bytes = sample_w3.w->nbytes;
+            sample.s3_bytes = sample_w3.s->nbytes;
+            DeviceFp4ActiveArena& arena = ctx.active_fp4_arena(li, tp_world, tp_rank, experts_per_rank, sample);
+            for (int local = 0; local < experts_per_rank; ++local) {
+                if (h_counts[static_cast<size_t>(local)] == 0) continue;
+                if (arena.staged_local.insert(local).second) {
+                    Fp4View w1 = ctx.fp4_view(prefix + "ffn.experts." + std::to_string(expert_start + local) + ".w1.weight");
+                    Fp4View w2 = ctx.fp4_view(prefix + "ffn.experts." + std::to_string(expert_start + local) + ".w2.weight");
+                    Fp4View w3 = ctx.fp4_view(prefix + "ffn.experts." + std::to_string(expert_start + local) + ".w3.weight");
+                    HostFp4ExpertSlot& slot = ctx.host_fp4_slot(li, expert_start + local, w1, w2, w3);
+                    check_cuda(cudaMemcpyAsync(arena.w1 + static_cast<size_t>(local) * arena.w1_bytes, slot.h_w1q, arena.w1_bytes, cudaMemcpyHostToDevice), "stage prefill w1");
+                    check_cuda(cudaMemcpyAsync(arena.s1 + static_cast<size_t>(local) * arena.s1_bytes, slot.h_w1s, arena.s1_bytes, cudaMemcpyHostToDevice), "stage prefill s1");
+                    check_cuda(cudaMemcpyAsync(arena.w2 + static_cast<size_t>(local) * arena.w2_bytes, slot.h_w2q, arena.w2_bytes, cudaMemcpyHostToDevice), "stage prefill w2");
+                    check_cuda(cudaMemcpyAsync(arena.s2 + static_cast<size_t>(local) * arena.s2_bytes, slot.h_w2s, arena.s2_bytes, cudaMemcpyHostToDevice), "stage prefill s2");
+                    check_cuda(cudaMemcpyAsync(arena.w3 + static_cast<size_t>(local) * arena.w3_bytes, slot.h_w3q, arena.w3_bytes, cudaMemcpyHostToDevice), "stage prefill w3");
+                    check_cuda(cudaMemcpyAsync(arena.s3 + static_cast<size_t>(local) * arena.s3_bytes, slot.h_w3s, arena.s3_bytes, cudaMemcpyHostToDevice), "stage prefill s3");
+                }
+            }
+            if (!moe_prefill_fp4_grouped_cuda(d_ffn_norm_rows, d_group_route_tokens, d_group_route_weights, d_seg_starts, arena.w1, arena.s1, arena.w2, arena.s2, arena.w3, arena.s3, d_moe_rows, token_count, total_routes, experts_per_rank, max_count, dim, inter, static_cast<float>(config.swiglu_limit))) throw std::runtime_error("prefill grouped fp4 moe launch failed");
+        }
+#ifdef DSV4_HAVE_NCCL
+        if (ctx.options.tp_world > 1) {
+            if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP prefill MoE all-reduce requires --nccl-id-path");
+            nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_moe_rows, static_cast<int>(token_dim));
+        }
+#endif
+        {
+            DeviceSharedCache& shared = ctx.shared_device_cache(li, tp_world, tp_rank, dim);
+            const int local_shared_inter = inter / tp_world;
+            if (!fp8_e4m3_e8m0_matmul_cuda(d_ffn_norm_rows, shared.w1, shared.s1, d_shared_gate, token_count, local_shared_inter, dim)) throw std::runtime_error("prefill shared w1 launch failed");
+            if (!fp8_e4m3_e8m0_matmul_cuda(d_ffn_norm_rows, shared.w3, shared.s3, d_shared_up, token_count, local_shared_inter, dim)) throw std::runtime_error("prefill shared w3 launch failed");
+            if (!silu_mul_rows_cuda(d_shared_gate, d_shared_up, d_shared_hidden, token_count, local_shared_inter)) throw std::runtime_error("prefill shared silu launch failed");
+            if (!fp8_e4m3_e8m0_matmul_cuda(d_shared_hidden, shared.w2, shared.s2, d_shared_out, token_count, dim, local_shared_inter)) throw std::runtime_error("prefill shared w2 launch failed");
+#ifdef DSV4_HAVE_NCCL
+            if (ctx.options.tp_world > 1) {
+                if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP prefill shared expert all-reduce requires --nccl-id-path");
+                nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_shared_out, static_cast<int>(token_dim));
+            }
+#endif
+            if (!vector_accum_rows_cuda(d_shared_out, d_moe_rows, token_count, dim, 1.0f)) throw std::runtime_error("prefill shared accum failed");
+        }
+        std::vector<float> moe_rows(token_dim);
+        check_cuda(cudaMemcpy(moe_rows.data(), d_moe_rows, token_dim * sizeof(float), cudaMemcpyDeviceToHost), "copy prefill moe rows host");
+        h4_rows = hc_post_rows_cpu(moe_rows, h4_rows, ffn_pre, dim);
+        round_vector_to_bf16(h4_rows);
+    }
+
+    std::vector<float> last_h4(4 * static_cast<size_t>(dim));
+    std::copy(h4_rows.begin() + static_cast<size_t>(token_count - 1) * 4 * dim, h4_rows.begin() + static_cast<size_t>(token_count) * 4 * dim, last_h4.begin());
+    std::vector<float> host_x = hc_head_cpu(last_h4, reinterpret_cast<const float*>(ctx.hc_head_shard.tensor_data(*ctx.hc_head_fn)), reinterpret_cast<const float*>(ctx.hc_head_shard.tensor_data(*ctx.hc_head_scale)), reinterpret_cast<const float*>(ctx.hc_head_shard.tensor_data(*ctx.hc_head_base)), dim);
+    check_cuda(cudaMemcpy(d_last_x, host_x.data(), static_cast<size_t>(dim) * sizeof(float), cudaMemcpyHostToDevice), "copy prefill hc head");
+    if (!rmsnorm_bf16_gamma_cuda(d_last_x, d_final_norm_gamma, d_final_norm, dim, 1e-6f)) throw std::runtime_error("prefill final norm launch failed");
+    if (!bf16_matvec_cuda(d_final_norm, d_head, d_logits, local_head_rows, dim)) throw std::runtime_error("prefill head launch failed");
+    check_cuda(cudaDeviceSynchronize(), "sync prefill kernels");
+    std::vector<float> logits(local_head_rows);
+    check_cuda(cudaMemcpy(logits.data(), d_logits, logits.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy prefill logits");
+    float checksum = 0.0f;
+    int top_token = local_head_start;
+    float top_logit = -INFINITY;
+    for (int i = 0; i < local_head_rows; ++i) {
+        const float v = logits[i];
+        checksum += v;
+        if (v > top_logit) {
+            top_logit = v;
+            top_token = local_head_start + i;
+        }
+    }
+
+    cudaFree(d_token_ids); cudaFree(d_embed_matrix); cudaFree(d_x_rows); cudaFree(d_ffn_gamma); cudaFree(d_ffn_norm_rows);
+    cudaFree(d_route_indices); cudaFree(d_route_weights); cudaFree(d_group_route_tokens); cudaFree(d_group_route_weights); cudaFree(d_seg_starts); cudaFree(d_counts); cudaFree(d_offsets); cudaFree(d_total_routes);
+    cudaFree(d_attn_gamma); cudaFree(d_q_gamma); cudaFree(d_kv_gamma); cudaFree(d_attn_x); cudaFree(d_attn_norm); cudaFree(d_q_a); cudaFree(d_q_norm); cudaFree(d_q); cudaFree(d_kv_a); cudaFree(d_kv_norm); cudaFree(d_attn_value); cudaFree(d_attn_mid); cudaFree(d_attn_out); cudaFree(d_kv_indices);
+    cudaFree(d_moe_rows); cudaFree(d_shared_gate); cudaFree(d_shared_up); cudaFree(d_shared_hidden); cudaFree(d_shared_out);
+    cudaFree(d_head); cudaFree(d_final_norm_gamma); cudaFree(d_last_x); cudaFree(d_final_norm); cudaFree(d_logits);
+    return ForwardSmokeResult{last_token, dim, inter, head_rows, layer_count, top_token, top_logit, checksum};
 }
 
 ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, int token, int layer_count, int position) {

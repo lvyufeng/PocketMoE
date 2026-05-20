@@ -18,12 +18,15 @@ __global__ void rmsnorm_bf16_gamma_kernel(
     float* __restrict__ y,
     int cols,
     float eps) {
+    const int row = blockIdx.x;
     extern __shared__ float scratch[];
     const int tid = threadIdx.x;
+    const float* row_x = x + static_cast<size_t>(row) * cols;
+    float* row_y = y + static_cast<size_t>(row) * cols;
 
     float sum_sq = 0.0f;
     for (int c = tid; c < cols; c += blockDim.x) {
-        const float v = x[c];
+        const float v = row_x[c];
         sum_sq += v * v;
     }
     scratch[tid] = sum_sq;
@@ -35,7 +38,7 @@ __global__ void rmsnorm_bf16_gamma_kernel(
     const float inv = rsqrtf(scratch[0] / static_cast<float>(cols) + eps);
 
     for (int c = tid; c < cols; c += blockDim.x) {
-        y[c] = x[c] * inv * bf16_to_float(gamma[c]);
+        row_y[c] = row_x[c] * inv * bf16_to_float(gamma[c]);
     }
 }
 
@@ -53,6 +56,22 @@ bool rmsnorm_bf16_gamma_cuda(
     const int threads = 256;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     rmsnorm_bf16_gamma_kernel<<<1, threads, threads * sizeof(float), cuda_stream>>>(d_x, d_gamma_bf16, d_y, cols, eps);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool rmsnorm_bf16_gamma_rows_cuda(
+    const float* d_x,
+    const uint16_t* d_gamma_bf16,
+    float* d_y,
+    int rows,
+    int cols,
+    float eps,
+    void* stream) {
+    if (d_x == nullptr || d_gamma_bf16 == nullptr || d_y == nullptr) return false;
+    if (rows <= 0 || cols <= 0) return false;
+    const int threads = 256;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    rmsnorm_bf16_gamma_kernel<<<rows, threads, threads * sizeof(float), cuda_stream>>>(d_x, d_gamma_bf16, d_y, cols, eps);
     return cudaGetLastError() == cudaSuccess;
 }
 

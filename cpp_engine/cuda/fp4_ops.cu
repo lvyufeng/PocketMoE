@@ -72,6 +72,60 @@ __global__ void quantize_float_row_kernel(
     }
 }
 
+__global__ void moe_route_count_kernel(
+    const int64_t* __restrict__ indices,
+    int32_t* __restrict__ counts,
+    int tokens,
+    int topk,
+    int experts_start_idx,
+    int n_local_experts) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = tokens * topk;
+    if (idx >= total) return;
+    const int expert = static_cast<int>(indices[idx]);
+    const int local = expert - experts_start_idx;
+    if (local >= 0 && local < n_local_experts) atomicAdd(counts + local, 1);
+}
+
+__global__ void moe_route_prefix_kernel(
+    const int32_t* __restrict__ counts,
+    int32_t* __restrict__ seg_starts,
+    int32_t* __restrict__ offsets,
+    int32_t* __restrict__ total_routes,
+    int n_local_experts) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    int32_t total = 0;
+    seg_starts[0] = 0;
+    for (int e = 0; e < n_local_experts; ++e) {
+        offsets[e] = total;
+        total += counts[e];
+        seg_starts[e + 1] = total;
+    }
+    total_routes[0] = total;
+}
+
+__global__ void moe_route_fill_kernel(
+    const int64_t* __restrict__ indices,
+    const float* __restrict__ weights,
+    int32_t* __restrict__ offsets,
+    int64_t* __restrict__ route_tokens,
+    float* __restrict__ route_weights,
+    int tokens,
+    int topk,
+    int experts_start_idx,
+    int n_local_experts) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = tokens * topk;
+    if (idx >= total) return;
+    const int expert = static_cast<int>(indices[idx]);
+    const int local = expert - experts_start_idx;
+    if (local < 0 || local >= n_local_experts) return;
+    const int token = idx / topk;
+    const int out = atomicAdd(offsets + local, 1);
+    route_tokens[out] = static_cast<int64_t>(token);
+    route_weights[out] = weights[idx];
+}
+
 __global__ void gather_routes_float_kernel(
     const float* __restrict__ x,
     const int64_t* __restrict__ route_tokens,
@@ -576,6 +630,32 @@ bool fp4_e2m1_e8m0_matvec_cuda(
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     fp4_e2m1_e8m0_matvec_kernel<<<rows, threads, threads * sizeof(float), cuda_stream>>>(
         d_x, d_weight, d_scale, d_y, rows, cols, packed_cols, scale_cols);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool moe_group_routes_cuda(
+    const int64_t* d_indices,
+    const float* d_weights,
+    int64_t* d_route_tokens,
+    float* d_route_weights,
+    int32_t* d_seg_starts,
+    int32_t* d_counts,
+    int32_t* d_offsets,
+    int32_t* d_total_routes,
+    int tokens,
+    int topk,
+    int experts_start_idx,
+    int n_local_experts,
+    void* stream) {
+    if (d_indices == nullptr || d_weights == nullptr || d_route_tokens == nullptr || d_route_weights == nullptr || d_seg_starts == nullptr || d_counts == nullptr || d_offsets == nullptr || d_total_routes == nullptr) return false;
+    if (tokens <= 0 || topk <= 0 || n_local_experts <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    const int threads = 256;
+    const int blocks = ceil_div_int(tokens * topk, threads);
+    cudaMemsetAsync(d_counts, 0, static_cast<size_t>(n_local_experts) * sizeof(int32_t), cuda_stream);
+    moe_route_count_kernel<<<blocks, threads, 0, cuda_stream>>>(d_indices, d_counts, tokens, topk, experts_start_idx, n_local_experts);
+    moe_route_prefix_kernel<<<1, 1, 0, cuda_stream>>>(d_counts, d_seg_starts, d_offsets, d_total_routes, n_local_experts);
+    moe_route_fill_kernel<<<blocks, threads, 0, cuda_stream>>>(d_indices, d_weights, d_offsets, d_route_tokens, d_route_weights, tokens, topk, experts_start_idx, n_local_experts);
     return cudaGetLastError() == cudaSuccess;
 }
 

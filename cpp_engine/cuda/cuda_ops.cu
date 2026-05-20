@@ -8,10 +8,14 @@ namespace dsv4 {
 namespace {
 
 __global__ void silu_mul_kernel(const float* gate, const float* up, float* y, int cols) {
+    const int row = blockIdx.x;
+    const float* row_gate = gate + static_cast<size_t>(row) * cols;
+    const float* row_up = up + static_cast<size_t>(row) * cols;
+    float* row_y = y + static_cast<size_t>(row) * cols;
     for (int c = threadIdx.x; c < cols; c += blockDim.x) {
-        const float g = gate[c];
+        const float g = row_gate[c];
         const float s = g / (1.0f + expf(-g));
-        y[c] = s * up[c];
+        row_y[c] = s * row_up[c];
     }
 }
 
@@ -29,7 +33,10 @@ __global__ void vector_add_kernel(const float* a, const float* b, float* y, int 
 }
 
 __global__ void vector_accum_kernel(const float* x, float* y, int cols, float scale) {
-    for (int c = threadIdx.x; c < cols; c += blockDim.x) y[c] += x[c] * scale;
+    const int row = blockIdx.x;
+    const float* row_x = x + static_cast<size_t>(row) * cols;
+    float* row_y = y + static_cast<size_t>(row) * cols;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) row_y[c] += row_x[c] * scale;
 }
 
 __global__ void repeat_vector_kernel(const float* x, float* y, int cols, int repeats) {
@@ -325,6 +332,13 @@ bool silu_mul_cuda(const float* d_gate, const float* d_up, float* d_y, int cols,
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool silu_mul_rows_cuda(const float* d_gate, const float* d_up, float* d_y, int rows, int cols, void* stream) {
+    if (d_gate == nullptr || d_up == nullptr || d_y == nullptr || rows <= 0 || cols <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    silu_mul_kernel<<<rows, 256, 0, cuda_stream>>>(d_gate, d_up, d_y, cols);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool silu_mul_clamped_cuda(const float* d_gate, const float* d_up, float* d_y, int cols, float limit, void* stream) {
     if (d_gate == nullptr || d_up == nullptr || d_y == nullptr || cols <= 0 || limit <= 0.0f) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
@@ -343,6 +357,13 @@ bool vector_accum_cuda(const float* d_x, float* d_y, int cols, float scale, void
     if (d_x == nullptr || d_y == nullptr || cols <= 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     vector_accum_kernel<<<1, 256, 0, cuda_stream>>>(d_x, d_y, cols, scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool vector_accum_rows_cuda(const float* d_x, float* d_y, int rows, int cols, float scale, void* stream) {
+    if (d_x == nullptr || d_y == nullptr || rows <= 0 || cols <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    vector_accum_kernel<<<rows, 256, 0, cuda_stream>>>(d_x, d_y, cols, scale);
     return cudaGetLastError() == cudaSuccess;
 }
 

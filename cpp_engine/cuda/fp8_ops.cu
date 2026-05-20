@@ -33,15 +33,18 @@ __global__ void fp8_e4m3_e8m0_matvec_kernel(
     int cols,
     int scale_cols) {
     const int row = blockIdx.x;
+    const int batch = blockIdx.y;
     if (row >= rows) return;
     const int row_block = row / kFp8BlockSize;
+    const float* batch_x = x + static_cast<size_t>(batch) * cols;
+    float* batch_y = y + static_cast<size_t>(batch) * rows;
 
     float sum = 0.0f;
     for (int col = threadIdx.x; col < cols; col += blockDim.x) {
         const int col_block = col / kFp8BlockSize;
         const uint8_t code = weight[static_cast<size_t>(row) * cols + col];
         const float s = fp8_e8m0_value(scale[static_cast<size_t>(row_block) * scale_cols + col_block]);
-        sum += fp8_e4m3_value(code) * s * x[col];
+        sum += fp8_e4m3_value(code) * s * batch_x[col];
     }
 
     extern __shared__ float scratch[];
@@ -52,7 +55,7 @@ __global__ void fp8_e4m3_e8m0_matvec_kernel(
         if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
         __syncthreads();
     }
-    if (threadIdx.x == 0) y[row] = scratch[0];
+    if (threadIdx.x == 0) batch_y[row] = scratch[0];
 }
 
 }  // namespace
@@ -71,7 +74,27 @@ bool fp8_e4m3_e8m0_matvec_cuda(
     const int threads = 256;
     const int scale_cols = cols / kFp8BlockSize;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    fp8_e4m3_e8m0_matvec_kernel<<<rows, threads, threads * sizeof(float), cuda_stream>>>(
+    fp8_e4m3_e8m0_matvec_kernel<<<dim3(rows, 1), threads, threads * sizeof(float), cuda_stream>>>(
+        d_x, d_weight, d_scale, d_y, rows, cols, scale_cols);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool fp8_e4m3_e8m0_matmul_cuda(
+    const float* d_x,
+    const uint8_t* d_weight,
+    const uint8_t* d_scale,
+    float* d_y,
+    int batch,
+    int rows,
+    int cols,
+    void* stream) {
+    if (d_x == nullptr || d_weight == nullptr || d_scale == nullptr || d_y == nullptr) return false;
+    if (batch <= 0 || rows <= 0 || cols <= 0) return false;
+    if ((rows % kFp8BlockSize) != 0 || (cols % kFp8BlockSize) != 0) return false;
+    const int threads = 256;
+    const int scale_cols = cols / kFp8BlockSize;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    fp8_e4m3_e8m0_matvec_kernel<<<dim3(rows, batch), threads, threads * sizeof(float), cuda_stream>>>(
         d_x, d_weight, d_scale, d_y, rows, cols, scale_cols);
     return cudaGetLastError() == cudaSuccess;
 }

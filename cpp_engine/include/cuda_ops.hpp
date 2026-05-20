@@ -43,6 +43,21 @@ bool moe_single_token_fp4_cuda(
     float swiglu_limit,
     void* stream = nullptr);
 
+bool moe_group_routes_cuda(
+    const int64_t* d_indices,
+    const float* d_weights,
+    int64_t* d_route_tokens,
+    float* d_route_weights,
+    int32_t* d_seg_starts,
+    int32_t* d_counts,
+    int32_t* d_offsets,
+    int32_t* d_total_routes,
+    int tokens,
+    int topk,
+    int experts_start_idx,
+    int n_local_experts,
+    void* stream = nullptr);
+
 bool moe_prefill_fp4_grouped_cuda(
     const float* d_x,
     const int64_t* d_route_tokens,
@@ -73,6 +88,16 @@ bool fp8_e4m3_e8m0_matvec_cuda(
     int cols,
     void* stream = nullptr);
 
+bool fp8_e4m3_e8m0_matmul_cuda(
+    const float* d_x,
+    const uint8_t* d_weight,
+    const uint8_t* d_scale,
+    float* d_y,
+    int batch,
+    int rows,
+    int cols,
+    void* stream = nullptr);
+
 bool rmsnorm_bf16_gamma_cuda(
     const float* d_x,
     const uint16_t* d_gamma_bf16,
@@ -81,10 +106,27 @@ bool rmsnorm_bf16_gamma_cuda(
     float eps,
     void* stream = nullptr);
 
+bool rmsnorm_bf16_gamma_rows_cuda(
+    const float* d_x,
+    const uint16_t* d_gamma_bf16,
+    float* d_y,
+    int rows,
+    int cols,
+    float eps,
+    void* stream = nullptr);
+
 bool silu_mul_cuda(
     const float* d_gate,
     const float* d_up,
     float* d_y,
+    int cols,
+    void* stream = nullptr);
+
+bool silu_mul_rows_cuda(
+    const float* d_gate,
+    const float* d_up,
+    float* d_y,
+    int rows,
     int cols,
     void* stream = nullptr);
 
@@ -100,6 +142,14 @@ bool bf16_row_to_float_cuda(
     const uint16_t* d_matrix_bf16,
     float* d_y,
     int row,
+    int cols,
+    void* stream = nullptr);
+
+bool bf16_rows_to_float_cuda(
+    const uint16_t* d_matrix_bf16,
+    const int* d_rows,
+    float* d_y,
+    int rows,
     int cols,
     void* stream = nullptr);
 
@@ -137,6 +187,19 @@ bool gate_topk_bf16_cuda_with_buffers(
     float route_scale,
     void* stream = nullptr);
 
+bool gate_topk_bf16_rows_cuda(
+    const float* d_x,
+    const uint16_t* d_w_bf16,
+    const float* d_bias,
+    int64_t* d_indices,
+    float* d_weights,
+    int tokens,
+    int experts,
+    int cols,
+    int topk,
+    float route_scale,
+    void* stream = nullptr);
+
 bool vector_add_cuda(
     const float* d_a,
     const float* d_b,
@@ -147,6 +210,14 @@ bool vector_add_cuda(
 bool vector_accum_cuda(
     const float* d_x,
     float* d_y,
+    int cols,
+    float scale,
+    void* stream = nullptr);
+
+bool vector_accum_rows_cuda(
+    const float* d_x,
+    float* d_y,
+    int rows,
     int cols,
     float scale,
     void* stream = nullptr);

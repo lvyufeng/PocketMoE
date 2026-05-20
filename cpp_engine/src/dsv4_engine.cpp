@@ -459,6 +459,15 @@ struct DeviceFp4ActiveArena {
     size_t s3_bytes = 0;
 };
 
+struct DeviceGateCache {
+    uint16_t* weight = nullptr;
+    float* bias = nullptr;
+    float* original = nullptr;
+    float* scored = nullptr;
+    int experts = 0;
+    int dim = 0;
+};
+
 struct SafeForwardContext {
     explicit SafeForwardContext(const std::string& dir)
         : ckpt_dir(dir),
@@ -516,6 +525,12 @@ struct SafeForwardContext {
             cudaFree(c.w3);
             cudaFree(c.s3);
         }
+        for (auto& [_, c] : gate_cache) {
+            cudaFree(c.weight);
+            cudaFree(c.bias);
+            cudaFree(c.original);
+            cudaFree(c.scored);
+        }
     }
 
     SafeTensorsShard& shard_for_tensor(const std::string& tensor) {
@@ -538,6 +553,34 @@ struct SafeForwardContext {
         view.s = shard.find_tensor(view.pair.scale_name);
         if (view.w == nullptr || view.s == nullptr) throw std::runtime_error("missing FP4 tensor pair: " + name);
         return view;
+    }
+
+    DeviceGateCache& gate_device_cache(int layer_id) {
+        const std::string key = std::to_string(layer_id);
+        auto it = gate_cache.find(key);
+        if (it != gate_cache.end()) return it->second;
+        const std::string prefix = "layers." + std::to_string(layer_id) + ".";
+        SafeTensorsShard& weight_shard = shard_for_tensor(prefix + "ffn.gate.weight");
+        const auto* weight = require_tensor(weight_shard, prefix + "ffn.gate.weight");
+        DeviceGateCache c;
+        c.experts = static_cast<int>(weight->shape[0]);
+        c.dim = static_cast<int>(weight->shape[1]);
+        check_cuda(cudaMalloc(&c.weight, weight->nbytes), "cudaMalloc gate weight");
+        check_cuda(cudaMemcpy(c.weight, weight_shard.tensor_data(*weight), weight->nbytes, cudaMemcpyHostToDevice), "copy gate weight");
+        check_cuda(cudaMalloc(&c.original, static_cast<size_t>(c.experts) * sizeof(float)), "cudaMalloc gate original");
+        check_cuda(cudaMalloc(&c.scored, static_cast<size_t>(c.experts) * sizeof(float)), "cudaMalloc gate scored");
+        const std::string bias_name = prefix + "ffn.gate.bias";
+        const std::string* bias_shard_name = index.shard_for_tensor(bias_name);
+        if (bias_shard_name != nullptr) {
+            SafeTensorsShard& bias_shard = shard_for_tensor(bias_name);
+            const auto* bias = bias_shard.find_tensor(bias_name);
+            if (bias != nullptr) {
+                check_cuda(cudaMalloc(&c.bias, bias->nbytes), "cudaMalloc gate bias");
+                check_cuda(cudaMemcpy(c.bias, bias_shard.tensor_data(*bias), bias->nbytes, cudaMemcpyHostToDevice), "copy gate bias");
+            }
+        }
+        auto inserted = gate_cache.emplace(key, c);
+        return inserted.first->second;
     }
 
     DeviceAttentionCache& attention_device_cache(int layer_id, int tp_world, int tp_rank, const AttentionSmokeDims& dims) {
@@ -769,6 +812,7 @@ struct SafeForwardContext {
     std::unordered_map<std::string, DeviceSharedCache> shared_cache;
     std::unordered_map<std::string, DeviceFp4ExpertCache> expert_cache;
     std::unordered_map<std::string, DeviceFp4ActiveArena> active_arena_cache;
+    std::unordered_map<std::string, DeviceGateCache> gate_cache;
     std::unordered_map<int, float*> kv_cache;
     std::unordered_map<int, float*> indexer_kv_cache;
     std::unordered_map<int, std::vector<float>> compressor_kv_state;
@@ -1279,10 +1323,30 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         if (debug_forward) print_summary("layer=" + std::to_string(li) + ".ffn_hc_pre", ffn_hc.x);
         check_cuda(cudaMemcpy(d_resid1, ffn_hc.x.data(), static_cast<size_t>(dim) * sizeof(float), cudaMemcpyHostToDevice), "copy hc ffn pre");
         if (!rmsnorm_bf16_gamma_cuda(d_resid1, d_ffn_gamma, d_ffn_norm, dim, 1e-6f)) throw std::runtime_error("ffn norm launch failed");
-        std::vector<float> ffn_norm_host(dim);
-        check_cuda(cudaMemcpy(ffn_norm_host.data(), d_ffn_norm, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy ffn norm for gate");
-        const auto routed = select_smoke_experts(
-            index, prefix, li, token, ffn_norm_host, config.n_hash_layers, config.n_routed_experts, config.n_activated_experts, static_cast<float>(config.route_scale));
+        const int route_count = static_cast<int>(std::min<uint64_t>(config.n_activated_experts, config.n_routed_experts));
+        std::vector<RoutedExpert> routed;
+        std::vector<int64_t> selected_route_ids;
+        std::vector<float> selected_route_weights;
+        if (static_cast<uint64_t>(li) < config.n_hash_layers && index.shard_for_tensor(prefix + "ffn.gate.tid2eid") != nullptr) {
+            std::vector<float> ffn_norm_host(dim);
+            check_cuda(cudaMemcpy(ffn_norm_host.data(), d_ffn_norm, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy ffn norm for hash gate");
+            const auto selected = select_smoke_experts(index, prefix, li, token, ffn_norm_host, config.n_hash_layers, config.n_routed_experts, config.n_activated_experts, static_cast<float>(config.route_scale));
+            selected_route_ids.reserve(selected.size());
+            selected_route_weights.reserve(selected.size());
+            for (const RoutedExpert& route : selected) {
+                selected_route_ids.push_back(route.id);
+                selected_route_weights.push_back(route.weight);
+            }
+        } else {
+            DeviceGateCache& gate = ctx.gate_device_cache(li);
+            if (!gate_topk_bf16_cuda_with_buffers(d_ffn_norm, gate.weight, gate.bias, gate.original, gate.scored, d_route_indices, d_route_weights, gate.experts, gate.dim, route_count, static_cast<float>(config.route_scale))) throw std::runtime_error("gate topk launch failed");
+            selected_route_ids.resize(route_count);
+            selected_route_weights.resize(route_count);
+            check_cuda(cudaMemcpy(selected_route_ids.data(), d_route_indices, selected_route_ids.size() * sizeof(int64_t), cudaMemcpyDeviceToHost), "copy gate route ids");
+            check_cuda(cudaMemcpy(selected_route_weights.data(), d_route_weights, selected_route_weights.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy gate route weights");
+        }
+        routed.reserve(selected_route_ids.size());
+        for (size_t ri = 0; ri < selected_route_ids.size(); ++ri) routed.push_back(RoutedExpert{static_cast<int>(selected_route_ids[ri]), selected_route_weights[ri]});
         route_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
         check_cuda(cudaMemset(d_moe, 0, static_cast<size_t>(dim) * sizeof(float)), "zero moe");

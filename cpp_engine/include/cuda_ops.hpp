@@ -90,6 +90,32 @@ bool bf16_matvec_cuda(
     int cols,
     void* stream = nullptr);
 
+bool gate_topk_bf16_cuda(
+    const float* d_x,
+    const uint16_t* d_w_bf16,
+    const float* d_bias,
+    int64_t* d_indices,
+    float* d_weights,
+    int experts,
+    int cols,
+    int topk,
+    float route_scale,
+    void* stream = nullptr);
+
+bool gate_topk_bf16_cuda_with_buffers(
+    const float* d_x,
+    const uint16_t* d_w_bf16,
+    const float* d_bias,
+    float* d_original,
+    float* d_scored,
+    int64_t* d_indices,
+    float* d_weights,
+    int experts,
+    int cols,
+    int topk,
+    float route_scale,
+    void* stream = nullptr);
+
 bool vector_add_cuda(
     const float* d_a,
     const float* d_b,

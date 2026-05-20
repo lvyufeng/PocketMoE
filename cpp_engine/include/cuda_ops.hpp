@@ -24,6 +24,25 @@ bool fp4_e2m1_e8m0_matvec_cuda(
     int cols,
     void* stream = nullptr);
 
+bool moe_single_token_fp4_cuda(
+    const float* d_x,
+    const int64_t* d_indices,
+    const float* d_weights,
+    const uint8_t* d_w1q,
+    const uint8_t* d_w1s,
+    const uint8_t* d_w2q,
+    const uint8_t* d_w2s,
+    const uint8_t* d_w3q,
+    const uint8_t* d_w3s,
+    float* d_y,
+    int topk,
+    int experts_start_idx,
+    int n_local_experts,
+    int dim,
+    int inter_dim,
+    float swiglu_limit,
+    void* stream = nullptr);
+
 bool fp8_e4m3_e8m0_matvec_cuda(
     const float* d_x,
     const uint8_t* d_weight,

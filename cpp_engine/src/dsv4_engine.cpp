@@ -14,7 +14,9 @@
 #include <stdexcept>
 #include <chrono>
 #include <string>
+#include <list>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <vector>
 
@@ -443,6 +445,32 @@ struct DeviceFp4ExpertCache {
     size_t s3_bytes = 0;
 };
 
+int env_int_or_default(const char* name, int fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') return fallback;
+    try {
+        return std::stoi(value);
+    } catch (...) {
+        return fallback;
+    }
+}
+
+struct ActiveArenaDeviceBuffers {
+    uint8_t* w1 = nullptr;
+    uint8_t* s1 = nullptr;
+    uint8_t* w2 = nullptr;
+    uint8_t* s2 = nullptr;
+    uint8_t* w3 = nullptr;
+    uint8_t* s3 = nullptr;
+    int capacity = 0;
+    size_t w1_bytes = 0;
+    size_t s1_bytes = 0;
+    size_t w2_bytes = 0;
+    size_t s2_bytes = 0;
+    size_t w3_bytes = 0;
+    size_t s3_bytes = 0;
+};
+
 struct DeviceFp4ActiveArena {
     uint8_t* w1 = nullptr;
     uint8_t* s1 = nullptr;
@@ -457,6 +485,22 @@ struct DeviceFp4ActiveArena {
     size_t s2_bytes = 0;
     size_t w3_bytes = 0;
     size_t s3_bytes = 0;
+    std::unordered_set<int> staged_local;
+};
+
+struct HostFp4ExpertSlot {
+    uint8_t* h_w1q = nullptr;
+    uint8_t* h_w1s = nullptr;
+    uint8_t* h_w2q = nullptr;
+    uint8_t* h_w2s = nullptr;
+    uint8_t* h_w3q = nullptr;
+    uint8_t* h_w3s = nullptr;
+    size_t w1q_bytes = 0;
+    size_t w1s_bytes = 0;
+    size_t w2q_bytes = 0;
+    size_t w2s_bytes = 0;
+    size_t w3q_bytes = 0;
+    size_t w3s_bytes = 0;
 };
 
 struct DeviceGateCache {
@@ -518,12 +562,29 @@ struct SafeForwardContext {
             cudaFree(c.s3);
         }
         for (auto& [_, c] : active_arena_cache) {
-            cudaFree(c.w1);
-            cudaFree(c.s1);
-            cudaFree(c.w2);
-            cudaFree(c.s2);
-            cudaFree(c.w3);
-            cudaFree(c.s3);
+            if (c.w1 != nullptr) cudaFree(c.w1);
+            if (c.s1 != nullptr) cudaFree(c.s1);
+            if (c.w2 != nullptr) cudaFree(c.w2);
+            if (c.s2 != nullptr) cudaFree(c.s2);
+            if (c.w3 != nullptr) cudaFree(c.w3);
+            if (c.s3 != nullptr) cudaFree(c.s3);
+        }
+        for (auto& blk : active_arena_device_freelist) {
+            if (blk.w1 != nullptr) cudaFree(blk.w1);
+            if (blk.s1 != nullptr) cudaFree(blk.s1);
+            if (blk.w2 != nullptr) cudaFree(blk.w2);
+            if (blk.s2 != nullptr) cudaFree(blk.s2);
+            if (blk.w3 != nullptr) cudaFree(blk.w3);
+            if (blk.s3 != nullptr) cudaFree(blk.s3);
+        }
+        active_arena_device_freelist.clear();
+        for (auto& [_, c] : host_fp4_slot_cache) {
+            if (c.h_w1q != nullptr) cudaFreeHost(c.h_w1q);
+            if (c.h_w1s != nullptr) cudaFreeHost(c.h_w1s);
+            if (c.h_w2q != nullptr) cudaFreeHost(c.h_w2q);
+            if (c.h_w2s != nullptr) cudaFreeHost(c.h_w2s);
+            if (c.h_w3q != nullptr) cudaFreeHost(c.h_w3q);
+            if (c.h_w3s != nullptr) cudaFreeHost(c.h_w3s);
         }
         for (auto& [_, c] : gate_cache) {
             cudaFree(c.weight);
@@ -671,10 +732,125 @@ struct SafeForwardContext {
         return inserted.first->second;
     }
 
+    void release_active_arena_device(DeviceFp4ActiveArena& arena) {
+        if (arena.w1 == nullptr) return;
+        ActiveArenaDeviceBuffers blk;
+        blk.w1 = arena.w1;
+        blk.s1 = arena.s1;
+        blk.w2 = arena.w2;
+        blk.s2 = arena.s2;
+        blk.w3 = arena.w3;
+        blk.s3 = arena.s3;
+        blk.capacity = arena.capacity;
+        blk.w1_bytes = arena.w1_bytes;
+        blk.s1_bytes = arena.s1_bytes;
+        blk.w2_bytes = arena.w2_bytes;
+        blk.s2_bytes = arena.s2_bytes;
+        blk.w3_bytes = arena.w3_bytes;
+        blk.s3_bytes = arena.s3_bytes;
+        active_arena_device_freelist.push_back(blk);
+        arena.w1 = arena.s1 = arena.w2 = arena.s2 = arena.w3 = arena.s3 = nullptr;
+        arena.staged_local.clear();
+    }
+
+    bool try_pop_active_arena_freelist(DeviceFp4ActiveArena& arena) {
+        for (auto it = active_arena_device_freelist.begin(); it != active_arena_device_freelist.end(); ++it) {
+            if (it->capacity == arena.capacity && it->w1_bytes == arena.w1_bytes && it->s1_bytes == arena.s1_bytes && it->w2_bytes == arena.w2_bytes && it->s2_bytes == arena.s2_bytes && it->w3_bytes == arena.w3_bytes && it->s3_bytes == arena.s3_bytes) {
+                arena.w1 = it->w1;
+                arena.s1 = it->s1;
+                arena.w2 = it->w2;
+                arena.s2 = it->s2;
+                arena.w3 = it->w3;
+                arena.s3 = it->s3;
+                arena.staged_local.clear();
+                active_arena_device_freelist.erase(it);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void touch_active_arena(const std::string& key) {
+        auto it = active_arena_lru_pos.find(key);
+        if (it != active_arena_lru_pos.end()) active_arena_lru.erase(it->second);
+        active_arena_lru.push_back(key);
+        active_arena_lru_pos[key] = std::prev(active_arena_lru.end());
+        const int cap = active_arena_max_layers;
+        while (cap > 0 && static_cast<int>(active_arena_lru.size()) > cap) {
+            const std::string evict = active_arena_lru.front();
+            active_arena_lru.pop_front();
+            active_arena_lru_pos.erase(evict);
+            auto victim = active_arena_cache.find(evict);
+            if (victim != active_arena_cache.end()) release_active_arena_device(victim->second);
+        }
+    }
+
+    HostFp4ExpertSlot& host_fp4_slot(int layer_id, int expert_id, const Fp4View& w1, const Fp4View& w2, const Fp4View& w3) {
+        const std::string key = std::to_string(layer_id) + ":" + std::to_string(expert_id);
+        auto it = host_fp4_slot_cache.find(key);
+        if (it != host_fp4_slot_cache.end()) return it->second;
+        HostFp4ExpertSlot slot;
+        slot.w1q_bytes = w1.w->nbytes;
+        slot.w1s_bytes = w1.s->nbytes;
+        slot.w2q_bytes = w2.w->nbytes;
+        slot.w2s_bytes = w2.s->nbytes;
+        slot.w3q_bytes = w3.w->nbytes;
+        slot.w3s_bytes = w3.s->nbytes;
+        check_cuda(cudaMallocHost(reinterpret_cast<void**>(&slot.h_w1q), slot.w1q_bytes), "cudaMallocHost fp4 expert w1");
+        check_cuda(cudaMallocHost(reinterpret_cast<void**>(&slot.h_w1s), slot.w1s_bytes), "cudaMallocHost fp4 expert s1");
+        check_cuda(cudaMallocHost(reinterpret_cast<void**>(&slot.h_w2q), slot.w2q_bytes), "cudaMallocHost fp4 expert w2");
+        check_cuda(cudaMallocHost(reinterpret_cast<void**>(&slot.h_w2s), slot.w2s_bytes), "cudaMallocHost fp4 expert s2");
+        check_cuda(cudaMallocHost(reinterpret_cast<void**>(&slot.h_w3q), slot.w3q_bytes), "cudaMallocHost fp4 expert w3");
+        check_cuda(cudaMallocHost(reinterpret_cast<void**>(&slot.h_w3s), slot.w3s_bytes), "cudaMallocHost fp4 expert s3");
+        std::memcpy(slot.h_w1q, w1.shard->tensor_data(*w1.w), slot.w1q_bytes);
+        std::memcpy(slot.h_w1s, w1.shard->tensor_data(*w1.s), slot.w1s_bytes);
+        std::memcpy(slot.h_w2q, w2.shard->tensor_data(*w2.w), slot.w2q_bytes);
+        std::memcpy(slot.h_w2s, w2.shard->tensor_data(*w2.s), slot.w2s_bytes);
+        std::memcpy(slot.h_w3q, w3.shard->tensor_data(*w3.w), slot.w3q_bytes);
+        std::memcpy(slot.h_w3s, w3.shard->tensor_data(*w3.s), slot.w3s_bytes);
+        auto inserted = host_fp4_slot_cache.emplace(key, slot);
+        return inserted.first->second;
+    }
+
+    int active_arena_cache_limit(int tp_world) const {
+        if (active_arena_max_layers > 0) return active_arena_max_layers;
+        return tp_world > 1 ? 3 : 1;
+    }
+
+    void evict_active_arena_if_needed(const std::string& incoming_key, int tp_world) {
+        const int cap = active_arena_cache_limit(tp_world);
+        while (cap > 0 && static_cast<int>(active_arena_lru.size()) >= cap) {
+            const std::string evict = active_arena_lru.front();
+            if (evict == incoming_key) break;
+            active_arena_lru.pop_front();
+            active_arena_lru_pos.erase(evict);
+            auto victim = active_arena_cache.find(evict);
+            if (victim != active_arena_cache.end()) release_active_arena_device(victim->second);
+        }
+    }
+
     DeviceFp4ActiveArena& active_fp4_arena(int layer_id, int tp_world, int tp_rank, int capacity, const DeviceFp4ExpertCache& sample) {
         const std::string key = std::to_string(layer_id) + ":" + std::to_string(tp_world) + ":" + std::to_string(tp_rank) + ":" + std::to_string(capacity);
         auto it = active_arena_cache.find(key);
-        if (it != active_arena_cache.end()) return it->second;
+        if (it != active_arena_cache.end()) {
+            DeviceFp4ActiveArena& arena = it->second;
+            if (arena.w1 == nullptr) {
+                if (!try_pop_active_arena_freelist(arena)) {
+                    evict_active_arena_if_needed(key, tp_world);
+                    if (!try_pop_active_arena_freelist(arena)) {
+                        check_cuda(cudaMalloc(&arena.w1, static_cast<size_t>(arena.capacity) * arena.w1_bytes), "cudaMalloc active arena w1");
+                        check_cuda(cudaMalloc(&arena.s1, static_cast<size_t>(arena.capacity) * arena.s1_bytes), "cudaMalloc active arena s1");
+                        check_cuda(cudaMalloc(&arena.w2, static_cast<size_t>(arena.capacity) * arena.w2_bytes), "cudaMalloc active arena w2");
+                        check_cuda(cudaMalloc(&arena.s2, static_cast<size_t>(arena.capacity) * arena.s2_bytes), "cudaMalloc active arena s2");
+                        check_cuda(cudaMalloc(&arena.w3, static_cast<size_t>(arena.capacity) * arena.w3_bytes), "cudaMalloc active arena w3");
+                        check_cuda(cudaMalloc(&arena.s3, static_cast<size_t>(arena.capacity) * arena.s3_bytes), "cudaMalloc active arena s3");
+                    }
+                    arena.staged_local.clear();
+                }
+            }
+            touch_active_arena(key);
+            return arena;
+        }
         DeviceFp4ActiveArena arena;
         arena.capacity = capacity;
         arena.w1_bytes = sample.w1_bytes;
@@ -683,13 +859,19 @@ struct SafeForwardContext {
         arena.s2_bytes = sample.s2_bytes;
         arena.w3_bytes = sample.w3_bytes;
         arena.s3_bytes = sample.s3_bytes;
-        check_cuda(cudaMalloc(&arena.w1, static_cast<size_t>(capacity) * arena.w1_bytes), "cudaMalloc active arena w1");
-        check_cuda(cudaMalloc(&arena.s1, static_cast<size_t>(capacity) * arena.s1_bytes), "cudaMalloc active arena s1");
-        check_cuda(cudaMalloc(&arena.w2, static_cast<size_t>(capacity) * arena.w2_bytes), "cudaMalloc active arena w2");
-        check_cuda(cudaMalloc(&arena.s2, static_cast<size_t>(capacity) * arena.s2_bytes), "cudaMalloc active arena s2");
-        check_cuda(cudaMalloc(&arena.w3, static_cast<size_t>(capacity) * arena.w3_bytes), "cudaMalloc active arena w3");
-        check_cuda(cudaMalloc(&arena.s3, static_cast<size_t>(capacity) * arena.s3_bytes), "cudaMalloc active arena s3");
+        if (!try_pop_active_arena_freelist(arena)) {
+            evict_active_arena_if_needed(key, tp_world);
+            if (!try_pop_active_arena_freelist(arena)) {
+                check_cuda(cudaMalloc(&arena.w1, static_cast<size_t>(capacity) * arena.w1_bytes), "cudaMalloc active arena w1");
+                check_cuda(cudaMalloc(&arena.s1, static_cast<size_t>(capacity) * arena.s1_bytes), "cudaMalloc active arena s1");
+                check_cuda(cudaMalloc(&arena.w2, static_cast<size_t>(capacity) * arena.w2_bytes), "cudaMalloc active arena w2");
+                check_cuda(cudaMalloc(&arena.s2, static_cast<size_t>(capacity) * arena.s2_bytes), "cudaMalloc active arena s2");
+                check_cuda(cudaMalloc(&arena.w3, static_cast<size_t>(capacity) * arena.w3_bytes), "cudaMalloc active arena w3");
+                check_cuda(cudaMalloc(&arena.s3, static_cast<size_t>(capacity) * arena.s3_bytes), "cudaMalloc active arena s3");
+            }
+        }
         auto inserted = active_arena_cache.emplace(key, arena);
+        touch_active_arena(key);
         return inserted.first->second;
     }
 
@@ -812,6 +994,11 @@ struct SafeForwardContext {
     std::unordered_map<std::string, DeviceSharedCache> shared_cache;
     std::unordered_map<std::string, DeviceFp4ExpertCache> expert_cache;
     std::unordered_map<std::string, DeviceFp4ActiveArena> active_arena_cache;
+    std::unordered_map<std::string, HostFp4ExpertSlot> host_fp4_slot_cache;
+    std::list<std::string> active_arena_lru;
+    std::vector<ActiveArenaDeviceBuffers> active_arena_device_freelist;
+    std::unordered_map<std::string, std::list<std::string>::iterator> active_arena_lru_pos;
+    int active_arena_max_layers = env_int_or_default("DEEPSEEK_GPU_PREFILL_MOE_MAX_CACHED_LAYERS", 0);
     std::unordered_map<std::string, DeviceGateCache> gate_cache;
     std::unordered_map<int, float*> kv_cache;
     std::unordered_map<int, float*> indexer_kv_cache;
@@ -1363,10 +1550,12 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         active_w1.reserve(routed.size());
         active_w2.reserve(routed.size());
         active_w3.reserve(routed.size());
+        std::vector<int> active_local_ids;
         for (const RoutedExpert& route : routed) {
             if (ctx.options.tp_world > 1 && (route.id < expert_start || route.id >= expert_end)) continue;
-            route_indices.push_back(static_cast<int64_t>(active_w1.size()));
+            route_indices.push_back(route.id);
             route_weights.push_back(route.weight);
+            active_local_ids.push_back(route.id - expert_start);
             active_w1.push_back(ctx.fp4_view(prefix + "ffn.experts." + std::to_string(route.id) + ".w1.weight"));
             active_w2.push_back(ctx.fp4_view(prefix + "ffn.experts." + std::to_string(route.id) + ".w2.weight"));
             active_w3.push_back(ctx.fp4_view(prefix + "ffn.experts." + std::to_string(route.id) + ".w3.weight"));
@@ -1379,18 +1568,22 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             sample.s2_bytes = active_w2.front().s->nbytes;
             sample.w3_bytes = active_w3.front().w->nbytes;
             sample.s3_bytes = active_w3.front().s->nbytes;
-            DeviceFp4ActiveArena& arena = ctx.active_fp4_arena(li, tp_world, tp_rank, static_cast<int>(config.n_activated_experts), sample);
+            DeviceFp4ActiveArena& arena = ctx.active_fp4_arena(li, tp_world, tp_rank, experts_per_rank, sample);
             for (size_t ri = 0; ri < active_w1.size(); ++ri) {
-                check_cuda(cudaMemcpy(arena.w1 + ri * arena.w1_bytes, active_w1[ri].shard->tensor_data(*active_w1[ri].w), arena.w1_bytes, cudaMemcpyHostToDevice), "stage active w1");
-                check_cuda(cudaMemcpy(arena.s1 + ri * arena.s1_bytes, active_w1[ri].shard->tensor_data(*active_w1[ri].s), arena.s1_bytes, cudaMemcpyHostToDevice), "stage active s1");
-                check_cuda(cudaMemcpy(arena.w2 + ri * arena.w2_bytes, active_w2[ri].shard->tensor_data(*active_w2[ri].w), arena.w2_bytes, cudaMemcpyHostToDevice), "stage active w2");
-                check_cuda(cudaMemcpy(arena.s2 + ri * arena.s2_bytes, active_w2[ri].shard->tensor_data(*active_w2[ri].s), arena.s2_bytes, cudaMemcpyHostToDevice), "stage active s2");
-                check_cuda(cudaMemcpy(arena.w3 + ri * arena.w3_bytes, active_w3[ri].shard->tensor_data(*active_w3[ri].w), arena.w3_bytes, cudaMemcpyHostToDevice), "stage active w3");
-                check_cuda(cudaMemcpy(arena.s3 + ri * arena.s3_bytes, active_w3[ri].shard->tensor_data(*active_w3[ri].s), arena.s3_bytes, cudaMemcpyHostToDevice), "stage active s3");
+                const int local = active_local_ids[ri];
+                if (arena.staged_local.insert(local).second) {
+                    HostFp4ExpertSlot& slot = ctx.host_fp4_slot(li, expert_start + local, active_w1[ri], active_w2[ri], active_w3[ri]);
+                    check_cuda(cudaMemcpyAsync(arena.w1 + static_cast<size_t>(local) * arena.w1_bytes, slot.h_w1q, arena.w1_bytes, cudaMemcpyHostToDevice), "stage active w1");
+                    check_cuda(cudaMemcpyAsync(arena.s1 + static_cast<size_t>(local) * arena.s1_bytes, slot.h_w1s, arena.s1_bytes, cudaMemcpyHostToDevice), "stage active s1");
+                    check_cuda(cudaMemcpyAsync(arena.w2 + static_cast<size_t>(local) * arena.w2_bytes, slot.h_w2q, arena.w2_bytes, cudaMemcpyHostToDevice), "stage active w2");
+                    check_cuda(cudaMemcpyAsync(arena.s2 + static_cast<size_t>(local) * arena.s2_bytes, slot.h_w2s, arena.s2_bytes, cudaMemcpyHostToDevice), "stage active s2");
+                    check_cuda(cudaMemcpyAsync(arena.w3 + static_cast<size_t>(local) * arena.w3_bytes, slot.h_w3q, arena.w3_bytes, cudaMemcpyHostToDevice), "stage active w3");
+                    check_cuda(cudaMemcpyAsync(arena.s3 + static_cast<size_t>(local) * arena.s3_bytes, slot.h_w3s, arena.s3_bytes, cudaMemcpyHostToDevice), "stage active s3");
+                }
             }
             check_cuda(cudaMemcpy(d_route_indices, route_indices.data(), route_indices.size() * sizeof(int64_t), cudaMemcpyHostToDevice), "copy active route indices");
             check_cuda(cudaMemcpy(d_route_weights, route_weights.data(), route_weights.size() * sizeof(float), cudaMemcpyHostToDevice), "copy active route weights");
-            if (!moe_single_token_fp4_cuda(d_ffn_norm, d_route_indices, d_route_weights, arena.w1, arena.s1, arena.w2, arena.s2, arena.w3, arena.s3, d_resid2, static_cast<int>(active_w1.size()), 0, static_cast<int>(active_w1.size()), dim, inter, static_cast<float>(config.swiglu_limit))) {
+            if (!moe_single_token_fp4_cuda(d_ffn_norm, d_route_indices, d_route_weights, arena.w1, arena.s1, arena.w2, arena.s2, arena.w3, arena.s3, d_resid2, static_cast<int>(route_indices.size()), expert_start, experts_per_rank, dim, inter, static_cast<float>(config.swiglu_limit))) {
                 throw std::runtime_error("active fp4 moe launch failed");
             }
             if (!vector_accum_cuda(d_resid2, d_moe, dim, 1.0f)) throw std::runtime_error("moe accum failed");

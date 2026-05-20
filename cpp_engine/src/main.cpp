@@ -6,6 +6,7 @@
 #include "tp_comm.hpp"
 
 #include <cuda_runtime.h>
+#include <chrono>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -27,6 +28,7 @@ struct Args {
     int device = -1;
     std::string nccl_id_path;
     bool generate_token = false;
+    bool resident_bench = false;
     bool dump_config = false;
     bool inspect = false;
     bool smoke_forward = false;
@@ -70,6 +72,10 @@ Args parse_args(int argc, char** argv) {
             args.smoke_forward = true;
             args.generate_token = true;
             args.forward_token = std::stoi(argv[++i]);
+        } else if (arg == "--resident-bench") {
+            args.smoke_forward = true;
+            args.generate_token = true;
+            args.resident_bench = true;
         } else if (arg == "--prompt" && i + 1 < argc) {
             args.smoke_forward = true;
             args.prompt = argv[++i];
@@ -196,7 +202,14 @@ int main(int argc, char** argv) {
                         if (args.forward_token < 0) throw std::runtime_error("--generate-token or --prompt is required for generation");
                         prompt_ids.push_back(args.forward_token);
                     }
-                    auto results = dsv4::run_safetensors_generate_tokens(args.ckpt, prompt_ids, args.smoke_layers, args.max_new_tokens);
+                    dsv4::ForwardSmokeOptions opts;
+                    opts.tp_world = args.tp_world;
+                    opts.tp_rank = args.tp_rank;
+                    opts.device = args.device >= 0 ? args.device : args.tp_rank;
+                    opts.nccl_id_path = args.nccl_id_path;
+                    const auto t0 = std::chrono::steady_clock::now();
+                    auto results = dsv4::run_safetensors_generate_tokens_with_options(args.ckpt, prompt_ids, args.smoke_layers, args.max_new_tokens, opts);
+                    const auto t1 = std::chrono::steady_clock::now();
                     std::vector<int> generated_ids;
                     generated_ids.reserve(results.size());
                     for (size_t step = 0; step < results.size(); ++step) {
@@ -210,6 +223,17 @@ int main(int argc, char** argv) {
                                   << " decoded=" << tokenizer.decode_tokens(generated_ids)
                                   << " top_logit=" << result.top_logit
                                   << " checksum=" << result.checksum << "\n";
+                    }
+                    if (args.resident_bench) {
+                        const double wall = std::chrono::duration<double>(t1 - t0).count();
+                        const double tokens = static_cast<double>(prompt_ids.size() + results.size());
+                        const double tps = wall > 0.0 ? tokens / wall : 0.0;
+                        std::cout << "resident_bench=1 prompt_tokens=" << prompt_ids.size()
+                                  << " generated_tokens=" << results.size()
+                                  << " wall=" << wall
+                                  << " tokens_per_s=" << tps
+                                  << " tp_world=" << args.tp_world
+                                  << " tp_rank=" << args.tp_rank << "\n";
                     }
                 } else {
                     dsv4::ForwardSmokeResult result = args.forward_token >= 0

@@ -753,9 +753,14 @@ ForwardSmokeResult run_safetensors_prompt_forward_with_options(const std::string
 }
 
 std::vector<ForwardSmokeResult> run_safetensors_generate_tokens(const std::string& ckpt_dir, const std::vector<int>& seed_tokens, int layer_count, int max_new_tokens) {
+    return run_safetensors_generate_tokens_with_options(ckpt_dir, seed_tokens, layer_count, max_new_tokens, ForwardSmokeOptions{});
+}
+
+std::vector<ForwardSmokeResult> run_safetensors_generate_tokens_with_options(const std::string& ckpt_dir, const std::vector<int>& seed_tokens, int layer_count, int max_new_tokens, const ForwardSmokeOptions& options) {
     if (seed_tokens.empty()) throw std::runtime_error("generation seed has no tokens");
     if (max_new_tokens <= 0) return {};
     SafeForwardContext ctx(ckpt_dir);
+    ctx.options = options;
     ctx.kv_cache_tokens = static_cast<int>(std::min<size_t>(seed_tokens.size() + static_cast<size_t>(max_new_tokens), 256));
     ForwardSmokeResult result;
     for (size_t i = 0; i < seed_tokens.size(); ++i) {
@@ -764,11 +769,31 @@ std::vector<ForwardSmokeResult> run_safetensors_generate_tokens(const std::strin
     std::vector<ForwardSmokeResult> out;
     out.reserve(static_cast<size_t>(max_new_tokens));
     int token = result.top_token;
+#ifdef DSV4_HAVE_NCCL
+    if (options.tp_world > 1 && !options.nccl_id_path.empty()) {
+        TpTopResult global = nccl_global_top1(options.tp_world, options.tp_rank, options.device, options.nccl_id_path.c_str(), result.top_token, result.top_logit);
+        token = global.token;
+        result.top_token = global.token;
+        result.top_logit = global.logit;
+    }
+#endif
+    ForwardSmokeResult generated = result;
+    generated.token = token;
+    out.push_back(generated);
     int position = static_cast<int>(seed_tokens.size());
-    for (int step = 0; step < max_new_tokens; ++step) {
-        result = run_safetensors_token_forward_impl(ctx, token, layer_count, position + step);
-        out.push_back(result);
+    for (int step = 1; step < max_new_tokens; ++step) {
+        result = run_safetensors_token_forward_impl(ctx, token, layer_count, position + step - 1);
+#ifdef DSV4_HAVE_NCCL
+        if (options.tp_world > 1 && !options.nccl_id_path.empty()) {
+            TpTopResult global = nccl_global_top1(options.tp_world, options.tp_rank, options.device, options.nccl_id_path.c_str(), result.top_token, result.top_logit);
+            result.top_token = global.token;
+            result.top_logit = global.logit;
+        }
+#endif
         token = result.top_token;
+        generated = result;
+        generated.token = token;
+        out.push_back(generated);
     }
     return out;
 }

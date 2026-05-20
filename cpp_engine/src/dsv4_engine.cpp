@@ -57,6 +57,26 @@ void round_vector_to_bf16(std::vector<float>& values) {
     for (float& v : values) v = round_to_bf16(v);
 }
 
+std::vector<uint8_t> slice_rows_u8(const uint8_t* src, int row_start, int rows, int cols) {
+    std::vector<uint8_t> out(static_cast<size_t>(rows) * cols);
+    std::memcpy(out.data(), src + static_cast<size_t>(row_start) * cols, out.size());
+    return out;
+}
+
+std::vector<float> slice_rows_f32(const float* src, int row_start, int rows) {
+    std::vector<float> out(rows);
+    std::memcpy(out.data(), src + row_start, static_cast<size_t>(rows) * sizeof(float));
+    return out;
+}
+
+std::vector<uint8_t> slice_cols_u8(const uint8_t* src, int rows, int cols, int col_start, int col_count) {
+    std::vector<uint8_t> out(static_cast<size_t>(rows) * col_count);
+    for (int r = 0; r < rows; ++r) {
+        std::memcpy(out.data() + static_cast<size_t>(r) * col_count, src + static_cast<size_t>(r) * cols + col_start, static_cast<size_t>(col_count));
+    }
+    return out;
+}
+
 struct RoutedExpert {
     int id = 0;
     float weight = 0.0f;
@@ -539,15 +559,21 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     Fp4Handle first_w3 = open_fp4(index, "layers.0.ffn.experts.0.w3.weight");
 
     if (token < 0 || token >= static_cast<int>(embed->shape[0])) throw std::runtime_error("token id out of range");
+    const int tp_world = std::max(1, ctx.options.tp_world);
+    const int tp_rank = std::max(0, ctx.options.tp_rank);
+    if (tp_rank >= tp_world) throw std::runtime_error("invalid TP rank in forward options");
     const int dim = static_cast<int>(embed->shape[1]);
     AttentionSmokeDims attn_dims;
     attn_dims.dim = dim;
     attn_dims.q_a_dim = static_cast<int>(config.q_lora_rank);
-    attn_dims.heads = static_cast<int>(config.n_heads);
+    const int global_heads = static_cast<int>(config.n_heads);
+    const int global_groups = static_cast<int>(config.o_groups);
+    if ((global_heads % tp_world) != 0 || (global_groups % tp_world) != 0) throw std::runtime_error("attention heads/groups must divide TP world");
+    attn_dims.heads = global_heads / tp_world;
     attn_dims.head_dim = static_cast<int>(config.head_dim);
     attn_dims.q_dim = attn_dims.heads * attn_dims.head_dim;
     attn_dims.kv_dim = static_cast<int>(config.kv_heads * config.head_dim);
-    attn_dims.groups = static_cast<int>(config.o_groups);
+    attn_dims.groups = global_groups / tp_world;
     attn_dims.group_rank = static_cast<int>(config.o_lora_rank);
     attn_dims.attn_mid = attn_dims.group_rank * attn_dims.groups;
     attn_dims.rope_dim = static_cast<int>(config.rope_dim);
@@ -561,9 +587,6 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     attn_dims.group_dim = attn_dims.q_dim / attn_dims.groups;
     const int inter = static_cast<int>(first_w1.pair.rows);
     const int head_rows = static_cast<int>(head->shape[0]);
-    const int tp_world = std::max(1, ctx.options.tp_world);
-    const int tp_rank = std::max(0, ctx.options.tp_rank);
-    if (tp_rank >= tp_world) throw std::runtime_error("invalid TP rank in forward options");
     if (head_rows % tp_world != 0) throw std::runtime_error("head vocab rows must divide TP world");
     const int local_head_rows = head_rows / tp_world;
     const int local_head_start = tp_rank * local_head_rows;
@@ -719,16 +742,27 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         check_cuda(cudaMemcpy(d_wq_a, qkv_shard.tensor_data(*wq_a), wq_a->nbytes, cudaMemcpyHostToDevice), "copy wq_a");
         check_cuda(cudaMemcpy(d_wq_a_scale, qkv_shard.tensor_data(*wq_a_scale), wq_a_scale->nbytes, cudaMemcpyHostToDevice), "copy wq_a scale");
         check_cuda(cudaMemcpy(d_q_gamma, qkv_shard.tensor_data(*q_norm), q_norm->nbytes, cudaMemcpyHostToDevice), "copy q norm");
-        check_cuda(cudaMemcpy(d_wq_b, qkv_shard.tensor_data(*wq_b), wq_b->nbytes, cudaMemcpyHostToDevice), "copy wq_b");
-        check_cuda(cudaMemcpy(d_wq_b_scale, qkv_shard.tensor_data(*wq_b_scale), wq_b_scale->nbytes, cudaMemcpyHostToDevice), "copy wq_b scale");
+        const int local_head_start = tp_rank * attn_dims.heads;
+        const int q_row_start = local_head_start * attn_dims.head_dim;
+        auto wq_b_local = slice_rows_u8(reinterpret_cast<const uint8_t*>(qkv_shard.tensor_data(*wq_b)), q_row_start, attn_dims.q_dim, attn_dims.q_a_dim);
+        auto wq_b_scale_local = slice_rows_u8(reinterpret_cast<const uint8_t*>(qkv_shard.tensor_data(*wq_b_scale)), q_row_start / 128, attn_dims.q_dim / 128, attn_dims.q_a_dim / 128);
+        check_cuda(cudaMemcpy(d_wq_b, wq_b_local.data(), wq_b_local.size(), cudaMemcpyHostToDevice), "copy wq_b");
+        check_cuda(cudaMemcpy(d_wq_b_scale, wq_b_scale_local.data(), wq_b_scale_local.size(), cudaMemcpyHostToDevice), "copy wq_b scale");
         check_cuda(cudaMemcpy(d_wkv, qkv_shard.tensor_data(*wkv), wkv->nbytes, cudaMemcpyHostToDevice), "copy wkv");
         check_cuda(cudaMemcpy(d_wkv_scale, qkv_shard.tensor_data(*wkv_scale), wkv_scale->nbytes, cudaMemcpyHostToDevice), "copy wkv scale");
         check_cuda(cudaMemcpy(d_kv_gamma, qkv_shard.tensor_data(*kv_norm), kv_norm->nbytes, cudaMemcpyHostToDevice), "copy kv norm");
-        check_cuda(cudaMemcpy(d_wo_a, wo_a_shard.tensor_data(*wo_a), wo_a->nbytes, cudaMemcpyHostToDevice), "copy wo_a");
-        check_cuda(cudaMemcpy(d_wo_a_scale, wo_a_shard.tensor_data(*wo_a_scale), wo_a_scale->nbytes, cudaMemcpyHostToDevice), "copy wo_a scale");
-        check_cuda(cudaMemcpy(d_wo_b, wo_b_shard.tensor_data(*wo_b), wo_b->nbytes, cudaMemcpyHostToDevice), "copy wo_b");
-        check_cuda(cudaMemcpy(d_wo_b_scale, wo_b_shard.tensor_data(*wo_b_scale), wo_b_scale->nbytes, cudaMemcpyHostToDevice), "copy wo_b scale");
-        check_cuda(cudaMemcpy(d_attn_sink, qkv_shard.tensor_data(*attn_sink), attn_sink->nbytes, cudaMemcpyHostToDevice), "copy attn sink");
+        const int local_group_start = tp_rank * attn_dims.groups;
+        const int wo_a_row_start = local_group_start * attn_dims.group_rank;
+        auto wo_a_local = slice_rows_u8(reinterpret_cast<const uint8_t*>(wo_a_shard.tensor_data(*wo_a)), wo_a_row_start, attn_dims.attn_mid, dim);
+        auto wo_a_scale_local = slice_rows_u8(reinterpret_cast<const uint8_t*>(wo_a_shard.tensor_data(*wo_a_scale)), wo_a_row_start / 128, attn_dims.attn_mid / 128, dim / 128);
+        auto wo_b_local = slice_cols_u8(reinterpret_cast<const uint8_t*>(wo_b_shard.tensor_data(*wo_b)), dim, static_cast<int>(config.o_lora_rank * config.o_groups), wo_a_row_start, attn_dims.attn_mid);
+        auto wo_b_scale_local = slice_cols_u8(reinterpret_cast<const uint8_t*>(wo_b_shard.tensor_data(*wo_b_scale)), dim / 128, static_cast<int>((config.o_lora_rank * config.o_groups) / 128), wo_a_row_start / 128, attn_dims.attn_mid / 128);
+        auto attn_sink_local = slice_rows_f32(reinterpret_cast<const float*>(qkv_shard.tensor_data(*attn_sink)), local_head_start, attn_dims.heads);
+        check_cuda(cudaMemcpy(d_wo_a, wo_a_local.data(), wo_a_local.size(), cudaMemcpyHostToDevice), "copy wo_a");
+        check_cuda(cudaMemcpy(d_wo_a_scale, wo_a_scale_local.data(), wo_a_scale_local.size(), cudaMemcpyHostToDevice), "copy wo_a scale");
+        check_cuda(cudaMemcpy(d_wo_b, wo_b_local.data(), wo_b_local.size(), cudaMemcpyHostToDevice), "copy wo_b");
+        check_cuda(cudaMemcpy(d_wo_b_scale, wo_b_scale_local.data(), wo_b_scale_local.size(), cudaMemcpyHostToDevice), "copy wo_b scale");
+        check_cuda(cudaMemcpy(d_attn_sink, attn_sink_local.data(), attn_sink_local.size() * sizeof(float), cudaMemcpyHostToDevice), "copy attn sink");
         check_cuda(cudaMemcpy(d_ffn_gamma, ffn_norm_shard.tensor_data(*ffn_norm), ffn_norm->nbytes, cudaMemcpyHostToDevice), "copy ffn gamma");
 
         const HcPreResult attn_hc = hc_pre_cpu(
@@ -914,6 +948,13 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                 d_attn_out)) {
             throw std::runtime_error("single-token attention smoke launch failed");
         }
+#ifdef DSV4_HAVE_NCCL
+        if (ctx.options.tp_world > 1) {
+            if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP attention all-reduce requires --nccl-id-path");
+            const std::string attn_id_path = ctx.options.nccl_id_path + ".attn." + std::to_string(position) + "." + std::to_string(li);
+            nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, attn_id_path.c_str(), d_attn_out, dim);
+        }
+#endif
         check_cuda(cudaMemcpy(host_x.data(), d_attn_out, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy attn out host");
         if (debug_forward) print_summary("layer=" + std::to_string(li) + ".attn_out", host_x);
         h4 = hc_post_cpu(host_x, h4, attn_hc, dim);

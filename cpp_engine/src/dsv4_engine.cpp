@@ -1009,16 +1009,33 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             const auto* s2 = require_tensor(shared_shard, prefix + "ffn.shared_experts.w2.scale");
             const auto* w3 = require_tensor(shared_shard, prefix + "ffn.shared_experts.w3.weight");
             const auto* s3 = require_tensor(shared_shard, prefix + "ffn.shared_experts.w3.scale");
-            check_cuda(cudaMemcpy(d_w1, shared_shard.tensor_data(*w1), w1->nbytes, cudaMemcpyHostToDevice), "copy shared w1");
-            check_cuda(cudaMemcpy(d_s1, shared_shard.tensor_data(*s1), s1->nbytes, cudaMemcpyHostToDevice), "copy shared s1");
-            check_cuda(cudaMemcpy(d_w2, shared_shard.tensor_data(*w2), w2->nbytes, cudaMemcpyHostToDevice), "copy shared w2");
-            check_cuda(cudaMemcpy(d_s2, shared_shard.tensor_data(*s2), s2->nbytes, cudaMemcpyHostToDevice), "copy shared s2");
-            check_cuda(cudaMemcpy(d_w3, shared_shard.tensor_data(*w3), w3->nbytes, cudaMemcpyHostToDevice), "copy shared w3");
-            check_cuda(cudaMemcpy(d_s3, shared_shard.tensor_data(*s3), s3->nbytes, cudaMemcpyHostToDevice), "copy shared s3");
-            if (!fp8_e4m3_e8m0_matvec_cuda(d_ffn_norm, d_w1, d_s1, d_gate, inter, dim)) throw std::runtime_error("shared w1 launch failed");
-            if (!fp8_e4m3_e8m0_matvec_cuda(d_ffn_norm, d_w3, d_s3, d_up, inter, dim)) throw std::runtime_error("shared w3 launch failed");
-            if (!silu_mul_cuda(d_gate, d_up, d_hidden, inter)) throw std::runtime_error("shared silu launch failed");
-            if (!fp8_e4m3_e8m0_matvec_cuda(d_hidden, d_w2, d_s2, d_resid2, dim, inter)) throw std::runtime_error("shared w2 launch failed");
+            const int shared_inter = static_cast<int>(w1->shape[0]);
+            if ((shared_inter % tp_world) != 0) throw std::runtime_error("shared expert inter dim must divide TP world");
+            const int local_shared_inter = shared_inter / tp_world;
+            const int shared_row_start = tp_rank * local_shared_inter;
+            auto shared_w1 = slice_rows_u8(reinterpret_cast<const uint8_t*>(shared_shard.tensor_data(*w1)), shared_row_start, local_shared_inter, dim);
+            auto shared_s1 = slice_rows_u8(reinterpret_cast<const uint8_t*>(shared_shard.tensor_data(*s1)), shared_row_start / 128, local_shared_inter / 128, dim / 128);
+            auto shared_w3 = slice_rows_u8(reinterpret_cast<const uint8_t*>(shared_shard.tensor_data(*w3)), shared_row_start, local_shared_inter, dim);
+            auto shared_s3 = slice_rows_u8(reinterpret_cast<const uint8_t*>(shared_shard.tensor_data(*s3)), shared_row_start / 128, local_shared_inter / 128, dim / 128);
+            auto shared_w2 = slice_cols_u8(reinterpret_cast<const uint8_t*>(shared_shard.tensor_data(*w2)), dim, shared_inter, shared_row_start, local_shared_inter);
+            auto shared_s2 = slice_cols_u8(reinterpret_cast<const uint8_t*>(shared_shard.tensor_data(*s2)), dim / 128, shared_inter / 128, shared_row_start / 128, local_shared_inter / 128);
+            check_cuda(cudaMemcpy(d_w1, shared_w1.data(), shared_w1.size(), cudaMemcpyHostToDevice), "copy shared w1");
+            check_cuda(cudaMemcpy(d_s1, shared_s1.data(), shared_s1.size(), cudaMemcpyHostToDevice), "copy shared s1");
+            check_cuda(cudaMemcpy(d_w2, shared_w2.data(), shared_w2.size(), cudaMemcpyHostToDevice), "copy shared w2");
+            check_cuda(cudaMemcpy(d_s2, shared_s2.data(), shared_s2.size(), cudaMemcpyHostToDevice), "copy shared s2");
+            check_cuda(cudaMemcpy(d_w3, shared_w3.data(), shared_w3.size(), cudaMemcpyHostToDevice), "copy shared w3");
+            check_cuda(cudaMemcpy(d_s3, shared_s3.data(), shared_s3.size(), cudaMemcpyHostToDevice), "copy shared s3");
+            if (!fp8_e4m3_e8m0_matvec_cuda(d_ffn_norm, d_w1, d_s1, d_gate, local_shared_inter, dim)) throw std::runtime_error("shared w1 launch failed");
+            if (!fp8_e4m3_e8m0_matvec_cuda(d_ffn_norm, d_w3, d_s3, d_up, local_shared_inter, dim)) throw std::runtime_error("shared w3 launch failed");
+            if (!silu_mul_cuda(d_gate, d_up, d_hidden, local_shared_inter)) throw std::runtime_error("shared silu launch failed");
+            if (!fp8_e4m3_e8m0_matvec_cuda(d_hidden, d_w2, d_s2, d_resid2, dim, local_shared_inter)) throw std::runtime_error("shared w2 launch failed");
+#ifdef DSV4_HAVE_NCCL
+            if (ctx.options.tp_world > 1) {
+                if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP shared expert all-reduce requires --nccl-id-path");
+                const std::string shared_id_path = ctx.options.nccl_id_path + ".shared." + std::to_string(position) + "." + std::to_string(li);
+                nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, shared_id_path.c_str(), d_resid2, dim);
+            }
+#endif
             if (!vector_accum_cuda(d_resid2, d_moe, dim, 1.0f)) throw std::runtime_error("shared accum failed");
         }
         check_cuda(cudaMemcpy(host_x.data(), d_moe, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy moe host");

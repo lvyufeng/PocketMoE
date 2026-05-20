@@ -862,6 +862,9 @@ struct SafeForwardContext {
         const int expert_start = rank * experts_per_rank;
         const int expert_end = world > 1 ? expert_start + experts_per_rank : static_cast<int>(config.n_routed_experts);
         for (int li = 0; li < layer_count; ++li) {
+            if (env_int_or_default("DSV4_CPP_PREPARE_PROGRESS", 1) != 0 && tp_rank == 0) {
+                std::cerr << "CPP_PREPARE_FP4_HOST layer=" << li << "/" << layer_count << " experts=" << expert_start << "-" << expert_end << "\n";
+            }
             const std::string prefix = "layers." + std::to_string(li) + ".ffn.experts.";
             for (int expert_id = expert_start; expert_id < expert_end; ++expert_id) {
                 Fp4View w1 = fp4_view(prefix + std::to_string(expert_id) + ".w1.weight");

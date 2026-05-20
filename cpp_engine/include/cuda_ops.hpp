@@ -43,6 +43,27 @@ bool moe_single_token_fp4_cuda(
     float swiglu_limit,
     void* stream = nullptr);
 
+bool moe_prefill_fp4_grouped_cuda(
+    const float* d_x,
+    const int64_t* d_route_tokens,
+    const float* d_route_weights,
+    const int32_t* d_seg_starts,
+    const uint8_t* d_w1q,
+    const uint8_t* d_w1s,
+    const uint8_t* d_w2q,
+    const uint8_t* d_w2s,
+    const uint8_t* d_w3q,
+    const uint8_t* d_w3s,
+    float* d_y,
+    int tokens,
+    int routes,
+    int n_local_experts,
+    int max_count,
+    int dim,
+    int inter_dim,
+    float swiglu_limit,
+    void* stream = nullptr);
+
 bool fp8_e4m3_e8m0_matvec_cuda(
     const float* d_x,
     const uint8_t* d_weight,

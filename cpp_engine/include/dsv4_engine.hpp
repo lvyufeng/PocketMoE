@@ -34,6 +34,10 @@ struct ForwardSmokeResult {
 struct GenerateSmokeResult {
     std::vector<ForwardSmokeResult> tokens;
     double wall_seconds = 0.0;
+    double prefill_seconds = 0.0;
+    double decode_seconds = 0.0;
+    int prompt_tokens = 0;
+    int decode_tokens = 0;
 };
 
 struct ForwardSmokeOptions {

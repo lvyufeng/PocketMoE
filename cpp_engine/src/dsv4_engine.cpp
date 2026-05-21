@@ -68,6 +68,38 @@ void round_vector_to_bf16(std::vector<float>& values) {
     for (float& v : values) v = round_to_bf16(v);
 }
 
+#ifdef DSV4_HAVE_NCCL
+struct BF16AllReduceScratch {
+    uint16_t* d_bf16 = nullptr;
+    int capacity = 0;
+    ~BF16AllReduceScratch() {
+        if (d_bf16 != nullptr) cudaFree(d_bf16);
+    }
+    void ensure(int count) {
+        if (count <= capacity) return;
+        if (d_bf16 != nullptr) cudaFree(d_bf16);
+        d_bf16 = nullptr;
+        cudaError_t err = cudaMalloc(&d_bf16, static_cast<size_t>(count) * sizeof(uint16_t));
+        if (err != cudaSuccess) throw std::runtime_error(std::string("cudaMalloc bf16 all-reduce scratch: ") + cudaGetErrorString(err));
+        capacity = count;
+    }
+};
+
+void all_reduce_sum_fp32_via_bf16_inplace(
+    int world,
+    int rank,
+    int device,
+    const char* id_path,
+    float* d_values,
+    int count,
+    BF16AllReduceScratch& scratch) {
+    scratch.ensure(count);
+    if (!fp32_to_bf16_cuda(d_values, scratch.d_bf16, count)) throw std::runtime_error("fp32_to_bf16 launch failed");
+    nccl_all_reduce_sum_bf16_inplace(world, rank, device, id_path, scratch.d_bf16, count);
+    if (!bf16_to_fp32_cuda(scratch.d_bf16, d_values, count)) throw std::runtime_error("bf16_to_fp32 launch failed");
+}
+#endif
+
 std::vector<uint8_t> slice_rows_u8(const uint8_t* src, int row_start, int rows, int cols) {
     std::vector<uint8_t> out(static_cast<size_t>(rows) * cols);
     std::memcpy(out.data(), src + static_cast<size_t>(row_start) * cols, out.size());
@@ -293,6 +325,7 @@ struct AttentionSmokeDims {
     int window_size = 128;
     int cache_write_slot = 0;
     float rope_theta = 0.0f;
+    const float* d_inv_freqs = nullptr;
 };
 
 AttentionSmokeDims make_attention_dims(const ModelConfig& config, int dim, int tp_world, int position) {
@@ -353,10 +386,18 @@ bool run_single_token_attention_smoke(
     if (!fp8_e4m3_e8m0_matvec_cuda(d_attn_norm, d_wq_a, d_wq_a_scale, d_q_a, dims.q_a_dim, dims.dim)) return false;
     if (!rmsnorm_bf16_gamma_cuda(d_q_a, d_q_gamma, d_q_norm, dims.q_a_dim, 1e-6f)) return false;
     if (!fp8_e4m3_e8m0_matvec_cuda(d_q_norm, d_wq_b, d_wq_b_scale, d_q, dims.q_dim, dims.q_a_dim)) return false;
-    if (!head_rmsnorm_rope_cuda(d_q, dims.heads, dims.head_dim, dims.rope_dim, dims.position, dims.rope_theta, false, 1e-6f)) return false;
+    if (dims.d_inv_freqs != nullptr) {
+        if (!head_rmsnorm_rope_freqs_cuda(d_q, dims.d_inv_freqs, dims.heads, dims.head_dim, dims.rope_dim, dims.position, false, 1e-6f)) return false;
+    } else {
+        if (!head_rmsnorm_rope_cuda(d_q, dims.heads, dims.head_dim, dims.rope_dim, dims.position, dims.rope_theta, false, 1e-6f)) return false;
+    }
     if (!fp8_e4m3_e8m0_matvec_cuda(d_attn_norm, d_wkv, d_wkv_scale, d_kv_a, dims.kv_dim, dims.dim)) return false;
     if (!rmsnorm_bf16_gamma_cuda(d_kv_a, d_kv_gamma, d_kv_norm, dims.kv_dim, 1e-6f)) return false;
-    if (!head_rmsnorm_rope_cuda(d_kv_norm, 1, dims.head_dim, dims.rope_dim, dims.position, dims.rope_theta, false, 0.0f)) return false;
+    if (dims.d_inv_freqs != nullptr) {
+        if (!head_rmsnorm_rope_freqs_cuda(d_kv_norm, dims.d_inv_freqs, 1, dims.head_dim, dims.rope_dim, dims.position, false, 0.0f)) return false;
+    } else {
+        if (!head_rmsnorm_rope_cuda(d_kv_norm, 1, dims.head_dim, dims.rope_dim, dims.position, dims.rope_theta, false, 0.0f)) return false;
+    }
     if (!fp8_act_quant_dequant_cuda(d_kv_norm, dims.head_dim - dims.rope_dim, 64)) return false;
     if (d_kv_cache != nullptr) {
         if (cudaMemcpy(d_kv_cache + static_cast<size_t>(dims.cache_write_slot) * dims.head_dim, d_kv_norm, static_cast<size_t>(dims.head_dim) * sizeof(float), cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
@@ -364,7 +405,11 @@ bool run_single_token_attention_smoke(
             if (!indexed_cached_single_token_attention_cuda(d_q, d_kv_cache, d_kv_indices, d_attn_sink, d_attn_value, dims.heads, dims.head_dim, index_count, 1.0f / std::sqrt(static_cast<float>(dims.head_dim)))) return false;
         } else if (!cached_single_token_attention_cuda(d_q, d_kv_cache, d_attn_sink, d_attn_value, dims.heads, dims.head_dim, cache_len, 1.0f / std::sqrt(static_cast<float>(dims.head_dim)))) return false;
     } else if (!single_token_sparse_attention_cuda(d_q, d_kv_norm, d_attn_sink, d_attn_value, dims.heads, dims.head_dim, 1.0f / std::sqrt(static_cast<float>(dims.head_dim)))) return false;
-    if (!head_rmsnorm_rope_cuda(d_attn_value, dims.heads, dims.head_dim, dims.rope_dim, dims.position, dims.rope_theta, true, 0.0f)) return false;
+    if (dims.d_inv_freqs != nullptr) {
+        if (!head_rmsnorm_rope_freqs_cuda(d_attn_value, dims.d_inv_freqs, dims.heads, dims.head_dim, dims.rope_dim, dims.position, true, 0.0f)) return false;
+    } else {
+        if (!head_rmsnorm_rope_cuda(d_attn_value, dims.heads, dims.head_dim, dims.rope_dim, dims.position, dims.rope_theta, true, 0.0f)) return false;
+    }
     for (int g = 0; g < dims.groups; ++g) {
         const float* group_x = d_attn_value + static_cast<size_t>(g) * dims.group_dim;
         const uint8_t* group_w = d_wo_a + static_cast<size_t>(g) * dims.group_rank * dims.group_dim;
@@ -463,7 +508,40 @@ const std::string& require_shard_name(const SafeTensorsIndex& index, const std::
     return *shard;
 }
 
+struct DeviceCompressorCache {
+    uint16_t* wkv = nullptr;
+    uint16_t* wgate = nullptr;
+    float* ape = nullptr;
+    uint16_t* norm = nullptr;
+    int cols = 0;
+    int dim = 0;
+};
+
+struct DeviceCompressorState {
+    float* kv = nullptr;
+    float* score = nullptr;
+    int slots = 0;
+    int cols = 0;
+};
+
+struct DeviceMoeDecodeWorkspace {
+    MoeSingleTokenFp4Workspace fp4;
+};
+
+struct DeviceHcCache {
+    float* attn_fn = nullptr;
+    float* attn_scale = nullptr;
+    float* attn_base = nullptr;
+    float* ffn_fn = nullptr;
+    float* ffn_scale = nullptr;
+    float* ffn_base = nullptr;
+};
+
 struct DeviceAttentionCache {
+    uint16_t* attn_norm = nullptr;
+    uint16_t* q_norm = nullptr;
+    uint16_t* kv_norm = nullptr;
+    uint16_t* ffn_norm = nullptr;
     uint8_t* wq_a = nullptr;
     uint8_t* wq_a_scale = nullptr;
     uint8_t* wq_b = nullptr;
@@ -559,13 +637,21 @@ struct HostFp4ExpertSlot {
     size_t w3s_bytes = 0;
 };
 
+struct DeviceIndexerCache {
+    uint8_t* wq_b = nullptr;
+    uint8_t* wq_b_scale = nullptr;
+    uint16_t* weights_proj = nullptr;
+};
+
 struct DeviceGateCache {
     uint16_t* weight = nullptr;
     float* bias = nullptr;
+    int64_t* tid2eid = nullptr;
     float* original = nullptr;
     float* scored = nullptr;
     int experts = 0;
     int dim = 0;
+    int hash_topk = 0;
 };
 
 struct SafeForwardContext {
@@ -588,7 +674,13 @@ struct SafeForwardContext {
     ~SafeForwardContext() {
         for (auto& [_, ptr] : kv_cache) cudaFree(ptr);
         for (auto& [_, ptr] : indexer_kv_cache) cudaFree(ptr);
+        for (auto& [_, ptr] : rope_inv_freqs_compress) cudaFree(ptr);
+        for (auto& [_, ptr] : rope_inv_freqs_plain) cudaFree(ptr);
         for (auto& [_, c] : attention_cache) {
+            cudaFree(c.attn_norm);
+            cudaFree(c.q_norm);
+            cudaFree(c.kv_norm);
+            cudaFree(c.ffn_norm);
             cudaFree(c.wq_a);
             cudaFree(c.wq_a_scale);
             cudaFree(c.wq_b);
@@ -645,8 +737,51 @@ struct SafeForwardContext {
         for (auto& [_, c] : gate_cache) {
             cudaFree(c.weight);
             cudaFree(c.bias);
+            cudaFree(c.tid2eid);
             cudaFree(c.original);
             cudaFree(c.scored);
+        }
+        for (auto& [_, c] : compressor_cache) {
+            cudaFree(c.wkv);
+            cudaFree(c.wgate);
+            cudaFree(c.ape);
+            cudaFree(c.norm);
+        }
+        for (auto& [_, c] : hc_cache) {
+            cudaFree(c.attn_fn);
+            cudaFree(c.attn_scale);
+            cudaFree(c.attn_base);
+            cudaFree(c.ffn_fn);
+            cudaFree(c.ffn_scale);
+            cudaFree(c.ffn_base);
+        }
+        for (auto& [_, w] : moe_decode_workspace_cache) {
+            cudaFree(w.fp4.d_x_q);
+            cudaFree(w.fp4.d_x_scale);
+            cudaFree(w.fp4.d_gate);
+            cudaFree(w.fp4.d_up);
+            cudaFree(w.fp4.d_hidden_q);
+            cudaFree(w.fp4.d_hidden_scale);
+            cudaFree(w.fp4.d_route_y);
+        }
+        for (auto& [_, c] : indexer_compressor_cache) {
+            cudaFree(c.wkv);
+            cudaFree(c.wgate);
+            cudaFree(c.ape);
+            cudaFree(c.norm);
+        }
+        for (auto& [_, s] : compressor_device_state) {
+            cudaFree(s.kv);
+            cudaFree(s.score);
+        }
+        for (auto& [_, s] : indexer_compressor_device_state) {
+            cudaFree(s.kv);
+            cudaFree(s.score);
+        }
+        for (auto& [_, c] : indexer_cache) {
+            cudaFree(c.wq_b);
+            cudaFree(c.wq_b_scale);
+            cudaFree(c.weights_proj);
         }
     }
 
@@ -686,6 +821,14 @@ struct SafeForwardContext {
         check_cuda(cudaMemcpy(c.weight, weight_shard.tensor_data(*weight), weight->nbytes, cudaMemcpyHostToDevice), "copy gate weight");
         check_cuda(cudaMalloc(&c.original, static_cast<size_t>(c.experts) * sizeof(float)), "cudaMalloc gate original");
         check_cuda(cudaMalloc(&c.scored, static_cast<size_t>(c.experts) * sizeof(float)), "cudaMalloc gate scored");
+        const std::string tid_name = prefix + "ffn.gate.tid2eid";
+        if (index.shard_for_tensor(tid_name) != nullptr) {
+            SafeTensorsShard& tid_shard = shard_for_tensor(tid_name);
+            const auto* tid = require_tensor(tid_shard, tid_name);
+            c.hash_topk = static_cast<int>(tid->shape[1]);
+            check_cuda(cudaMalloc(&c.tid2eid, tid->nbytes), "cudaMalloc gate tid2eid");
+            check_cuda(cudaMemcpy(c.tid2eid, tid_shard.tensor_data(*tid), tid->nbytes, cudaMemcpyHostToDevice), "copy gate tid2eid");
+        }
         const std::string bias_name = prefix + "ffn.gate.bias";
         const std::string* bias_shard_name = index.shard_for_tensor(bias_name);
         if (bias_shard_name != nullptr) {
@@ -705,9 +848,15 @@ struct SafeForwardContext {
         auto it = attention_cache.find(key);
         if (it != attention_cache.end()) return it->second;
         const std::string prefix = "layers." + std::to_string(layer_id) + ".";
+        SafeTensorsShard& attn_norm_shard = shard_for_tensor(prefix + "attn_norm.weight");
+        SafeTensorsShard& ffn_norm_shard = shard_for_tensor(prefix + "ffn_norm.weight");
         SafeTensorsShard& qkv_shard = shard_for_tensor(prefix + "attn.wq_a.weight");
         SafeTensorsShard& wo_a_shard = shard_for_tensor(prefix + "attn.wo_a.weight");
         SafeTensorsShard& wo_b_shard = shard_for_tensor(prefix + "attn.wo_b.weight");
+        const auto* attn_norm = require_tensor(attn_norm_shard, prefix + "attn_norm.weight");
+        const auto* q_norm = require_tensor(qkv_shard, prefix + "attn.q_norm.weight");
+        const auto* kv_norm = require_tensor(qkv_shard, prefix + "attn.kv_norm.weight");
+        const auto* ffn_norm = require_tensor(ffn_norm_shard, prefix + "ffn_norm.weight");
         const auto* wq_a = require_tensor(qkv_shard, prefix + "attn.wq_a.weight");
         const auto* wq_a_scale = require_tensor(qkv_shard, prefix + "attn.wq_a.scale");
         const auto* wq_b = require_tensor(qkv_shard, prefix + "attn.wq_b.weight");
@@ -720,6 +869,14 @@ struct SafeForwardContext {
         const auto* wo_b = require_tensor(wo_b_shard, prefix + "attn.wo_b.weight");
         const auto* wo_b_scale = require_tensor(wo_b_shard, prefix + "attn.wo_b.scale");
         DeviceAttentionCache c;
+        check_cuda(cudaMalloc(&c.attn_norm, attn_norm->nbytes), "cudaMalloc cached attn norm");
+        check_cuda(cudaMalloc(&c.q_norm, q_norm->nbytes), "cudaMalloc cached q norm");
+        check_cuda(cudaMalloc(&c.kv_norm, kv_norm->nbytes), "cudaMalloc cached kv norm");
+        check_cuda(cudaMalloc(&c.ffn_norm, ffn_norm->nbytes), "cudaMalloc cached ffn norm");
+        check_cuda(cudaMemcpy(c.attn_norm, attn_norm_shard.tensor_data(*attn_norm), attn_norm->nbytes, cudaMemcpyHostToDevice), "copy cached attn norm");
+        check_cuda(cudaMemcpy(c.q_norm, qkv_shard.tensor_data(*q_norm), q_norm->nbytes, cudaMemcpyHostToDevice), "copy cached q norm");
+        check_cuda(cudaMemcpy(c.kv_norm, qkv_shard.tensor_data(*kv_norm), kv_norm->nbytes, cudaMemcpyHostToDevice), "copy cached kv norm");
+        check_cuda(cudaMemcpy(c.ffn_norm, ffn_norm_shard.tensor_data(*ffn_norm), ffn_norm->nbytes, cudaMemcpyHostToDevice), "copy cached ffn norm");
         check_cuda(cudaMalloc(&c.wq_a, wq_a->nbytes), "cudaMalloc cached wq_a");
         check_cuda(cudaMalloc(&c.wq_a_scale, wq_a_scale->nbytes), "cudaMalloc cached wq_a scale");
         check_cuda(cudaMemcpy(c.wq_a, qkv_shard.tensor_data(*wq_a), wq_a->nbytes, cudaMemcpyHostToDevice), "copy cached wq_a");
@@ -754,6 +911,76 @@ struct SafeForwardContext {
         check_cuda(cudaMemcpy(c.wo_b_scale, wo_b_scale_local.data(), wo_b_scale_local.size(), cudaMemcpyHostToDevice), "copy cached wo_b scale");
         check_cuda(cudaMemcpy(c.attn_sink, attn_sink_local.data(), attn_sink_local.size() * sizeof(float), cudaMemcpyHostToDevice), "copy cached attn sink");
         auto inserted = attention_cache.emplace(key, c);
+        return inserted.first->second;
+    }
+    DeviceCompressorCache& compressor_device_cache(int layer_id) {
+        const std::string key = std::to_string(layer_id);
+        auto it = compressor_cache.find(key);
+        if (it != compressor_cache.end()) return it->second;
+        const std::string prefix = "layers." + std::to_string(layer_id) + ".";
+        SafeTensorsShard& comp_shard = shard_for_tensor(prefix + "attn.compressor.wkv.weight");
+        const auto* wkv = require_tensor(comp_shard, prefix + "attn.compressor.wkv.weight");
+        const auto* wgate = require_tensor(comp_shard, prefix + "attn.compressor.wgate.weight");
+        const auto* ape = require_tensor(comp_shard, prefix + "attn.compressor.ape");
+        const auto* norm = require_tensor(comp_shard, prefix + "attn.compressor.norm.weight");
+        DeviceCompressorCache c;
+        c.cols = static_cast<int>(wkv->shape[0]);
+        c.dim = static_cast<int>(wkv->shape[1]);
+        check_cuda(cudaMalloc(&c.wkv, wkv->nbytes), "cudaMalloc cached compressor wkv");
+        check_cuda(cudaMalloc(&c.wgate, wgate->nbytes), "cudaMalloc cached compressor wgate");
+        check_cuda(cudaMalloc(&c.ape, ape->nbytes), "cudaMalloc cached compressor ape");
+        check_cuda(cudaMalloc(&c.norm, norm->nbytes), "cudaMalloc cached compressor norm");
+        check_cuda(cudaMemcpy(c.wkv, comp_shard.tensor_data(*wkv), wkv->nbytes, cudaMemcpyHostToDevice), "copy cached compressor wkv");
+        check_cuda(cudaMemcpy(c.wgate, comp_shard.tensor_data(*wgate), wgate->nbytes, cudaMemcpyHostToDevice), "copy cached compressor wgate");
+        check_cuda(cudaMemcpy(c.ape, comp_shard.tensor_data(*ape), ape->nbytes, cudaMemcpyHostToDevice), "copy cached compressor ape");
+        check_cuda(cudaMemcpy(c.norm, comp_shard.tensor_data(*norm), norm->nbytes, cudaMemcpyHostToDevice), "copy cached compressor norm");
+        auto inserted = compressor_cache.emplace(key, c);
+        return inserted.first->second;
+    }
+
+    DeviceCompressorCache& indexer_compressor_device_cache(int layer_id) {
+        const std::string key = std::to_string(layer_id);
+        auto it = indexer_compressor_cache.find(key);
+        if (it != indexer_compressor_cache.end()) return it->second;
+        const std::string prefix = "layers." + std::to_string(layer_id) + ".";
+        SafeTensorsShard& idx_shard = shard_for_tensor(prefix + "attn.indexer.wq_b.weight");
+        const auto* wkv = require_tensor(idx_shard, prefix + "attn.indexer.compressor.wkv.weight");
+        const auto* wgate = require_tensor(idx_shard, prefix + "attn.indexer.compressor.wgate.weight");
+        const auto* ape = require_tensor(idx_shard, prefix + "attn.indexer.compressor.ape");
+        const auto* norm = require_tensor(idx_shard, prefix + "attn.indexer.compressor.norm.weight");
+        DeviceCompressorCache c;
+        c.cols = static_cast<int>(wkv->shape[0]);
+        c.dim = static_cast<int>(wkv->shape[1]);
+        check_cuda(cudaMalloc(&c.wkv, wkv->nbytes), "cudaMalloc cached indexer compressor wkv");
+        check_cuda(cudaMalloc(&c.wgate, wgate->nbytes), "cudaMalloc cached indexer compressor wgate");
+        check_cuda(cudaMalloc(&c.ape, ape->nbytes), "cudaMalloc cached indexer compressor ape");
+        check_cuda(cudaMalloc(&c.norm, norm->nbytes), "cudaMalloc cached indexer compressor norm");
+        check_cuda(cudaMemcpy(c.wkv, idx_shard.tensor_data(*wkv), wkv->nbytes, cudaMemcpyHostToDevice), "copy cached indexer compressor wkv");
+        check_cuda(cudaMemcpy(c.wgate, idx_shard.tensor_data(*wgate), wgate->nbytes, cudaMemcpyHostToDevice), "copy cached indexer compressor wgate");
+        check_cuda(cudaMemcpy(c.ape, idx_shard.tensor_data(*ape), ape->nbytes, cudaMemcpyHostToDevice), "copy cached indexer compressor ape");
+        check_cuda(cudaMemcpy(c.norm, idx_shard.tensor_data(*norm), norm->nbytes, cudaMemcpyHostToDevice), "copy cached indexer compressor norm");
+        auto inserted = indexer_compressor_cache.emplace(key, c);
+        return inserted.first->second;
+    }
+
+
+    DeviceIndexerCache& indexer_device_cache(int layer_id) {
+        const std::string key = std::to_string(layer_id);
+        auto it = indexer_cache.find(key);
+        if (it != indexer_cache.end()) return it->second;
+        const std::string prefix = "layers." + std::to_string(layer_id) + ".";
+        SafeTensorsShard& idx_shard = shard_for_tensor(prefix + "attn.indexer.wq_b.weight");
+        const auto* wq_b = require_tensor(idx_shard, prefix + "attn.indexer.wq_b.weight");
+        const auto* wq_b_scale = require_tensor(idx_shard, prefix + "attn.indexer.wq_b.scale");
+        const auto* weights = require_tensor(idx_shard, prefix + "attn.indexer.weights_proj.weight");
+        DeviceIndexerCache c;
+        check_cuda(cudaMalloc(&c.wq_b, wq_b->nbytes), "cudaMalloc cached indexer wq_b");
+        check_cuda(cudaMalloc(&c.wq_b_scale, wq_b_scale->nbytes), "cudaMalloc cached indexer wq_b scale");
+        check_cuda(cudaMalloc(&c.weights_proj, weights->nbytes), "cudaMalloc cached indexer weights proj");
+        check_cuda(cudaMemcpy(c.wq_b, idx_shard.tensor_data(*wq_b), wq_b->nbytes, cudaMemcpyHostToDevice), "copy cached indexer wq_b");
+        check_cuda(cudaMemcpy(c.wq_b_scale, idx_shard.tensor_data(*wq_b_scale), wq_b_scale->nbytes, cudaMemcpyHostToDevice), "copy cached indexer wq_b scale");
+        check_cuda(cudaMemcpy(c.weights_proj, idx_shard.tensor_data(*weights), weights->nbytes, cudaMemcpyHostToDevice), "copy cached indexer weights proj");
+        auto inserted = indexer_cache.emplace(key, c);
         return inserted.first->second;
     }
 
@@ -917,6 +1144,18 @@ struct SafeForwardContext {
             (void)attention_device_cache(li, world, rank, dims);
             (void)shared_device_cache(li, world, rank, dim);
             (void)gate_device_cache(li);
+            (void)hc_device_cache(li);
+            if (use_gpu_compressor != 0 && static_cast<size_t>(li) < config.compress_ratios.size() && config.compress_ratios[static_cast<size_t>(li)] > 0) {
+                const std::string prefix = "layers." + std::to_string(li) + ".";
+                if (index.shard_for_tensor(prefix + "attn.compressor.wkv.weight") != nullptr) (void)compressor_device_cache(li);
+            }
+            if (static_cast<size_t>(li) < config.compress_ratios.size() && config.compress_ratios[static_cast<size_t>(li)] == 4) {
+                const std::string prefix = "layers." + std::to_string(li) + ".";
+                if (index.shard_for_tensor(prefix + "attn.indexer.wq_b.weight") != nullptr) {
+                    (void)indexer_device_cache(li);
+                    if (use_gpu_compressor != 0) (void)indexer_compressor_device_cache(li);
+                }
+            }
         }
     }
 
@@ -978,47 +1217,98 @@ struct SafeForwardContext {
         const auto* s2 = require_tensor(shared_shard, prefix + "ffn.shared_experts.w2.scale");
         const auto* w3 = require_tensor(shared_shard, prefix + "ffn.shared_experts.w3.weight");
         const auto* s3 = require_tensor(shared_shard, prefix + "ffn.shared_experts.w3.scale");
-        const int shared_inter = static_cast<int>(w1->shape[0]);
-        if ((shared_inter % tp_world) != 0) throw std::runtime_error("shared expert inter dim must divide TP world");
-        const int local_shared_inter = shared_inter / tp_world;
-        const int shared_row_start = tp_rank * local_shared_inter;
-        auto shared_w1 = slice_rows_u8(reinterpret_cast<const uint8_t*>(shared_shard.tensor_data(*w1)), shared_row_start, local_shared_inter, dim);
-        auto shared_s1 = slice_rows_u8(reinterpret_cast<const uint8_t*>(shared_shard.tensor_data(*s1)), shared_row_start / 128, local_shared_inter / 128, dim / 128);
-        auto shared_w3 = slice_rows_u8(reinterpret_cast<const uint8_t*>(shared_shard.tensor_data(*w3)), shared_row_start, local_shared_inter, dim);
-        auto shared_s3 = slice_rows_u8(reinterpret_cast<const uint8_t*>(shared_shard.tensor_data(*s3)), shared_row_start / 128, local_shared_inter / 128, dim / 128);
-        auto shared_w2 = slice_cols_u8(reinterpret_cast<const uint8_t*>(shared_shard.tensor_data(*w2)), dim, shared_inter, shared_row_start, local_shared_inter);
-        auto shared_s2 = slice_cols_u8(reinterpret_cast<const uint8_t*>(shared_shard.tensor_data(*s2)), dim / 128, shared_inter / 128, shared_row_start / 128, local_shared_inter / 128);
         DeviceSharedCache c;
-        check_cuda(cudaMalloc(&c.w1, shared_w1.size()), "cudaMalloc cached shared w1");
-        check_cuda(cudaMalloc(&c.s1, shared_s1.size()), "cudaMalloc cached shared s1");
-        check_cuda(cudaMalloc(&c.w2, shared_w2.size()), "cudaMalloc cached shared w2");
-        check_cuda(cudaMalloc(&c.s2, shared_s2.size()), "cudaMalloc cached shared s2");
-        check_cuda(cudaMalloc(&c.w3, shared_w3.size()), "cudaMalloc cached shared w3");
-        check_cuda(cudaMalloc(&c.s3, shared_s3.size()), "cudaMalloc cached shared s3");
-        check_cuda(cudaMemcpy(c.w1, shared_w1.data(), shared_w1.size(), cudaMemcpyHostToDevice), "copy cached shared w1");
-        check_cuda(cudaMemcpy(c.s1, shared_s1.data(), shared_s1.size(), cudaMemcpyHostToDevice), "copy cached shared s1");
-        check_cuda(cudaMemcpy(c.w2, shared_w2.data(), shared_w2.size(), cudaMemcpyHostToDevice), "copy cached shared w2");
-        check_cuda(cudaMemcpy(c.s2, shared_s2.data(), shared_s2.size(), cudaMemcpyHostToDevice), "copy cached shared s2");
-        check_cuda(cudaMemcpy(c.w3, shared_w3.data(), shared_w3.size(), cudaMemcpyHostToDevice), "copy cached shared w3");
-        check_cuda(cudaMemcpy(c.s3, shared_s3.data(), shared_s3.size(), cudaMemcpyHostToDevice), "copy cached shared s3");
+        check_cuda(cudaMalloc(&c.w1, w1->nbytes), "cudaMalloc cached shared w1");
+        check_cuda(cudaMalloc(&c.s1, s1->nbytes), "cudaMalloc cached shared s1");
+        check_cuda(cudaMalloc(&c.w2, w2->nbytes), "cudaMalloc cached shared w2");
+        check_cuda(cudaMalloc(&c.s2, s2->nbytes), "cudaMalloc cached shared s2");
+        check_cuda(cudaMalloc(&c.w3, w3->nbytes), "cudaMalloc cached shared w3");
+        check_cuda(cudaMalloc(&c.s3, s3->nbytes), "cudaMalloc cached shared s3");
+        check_cuda(cudaMemcpy(c.w1, shared_shard.tensor_data(*w1), w1->nbytes, cudaMemcpyHostToDevice), "copy cached shared w1");
+        check_cuda(cudaMemcpy(c.s1, shared_shard.tensor_data(*s1), s1->nbytes, cudaMemcpyHostToDevice), "copy cached shared s1");
+        check_cuda(cudaMemcpy(c.w2, shared_shard.tensor_data(*w2), w2->nbytes, cudaMemcpyHostToDevice), "copy cached shared w2");
+        check_cuda(cudaMemcpy(c.s2, shared_shard.tensor_data(*s2), s2->nbytes, cudaMemcpyHostToDevice), "copy cached shared s2");
+        check_cuda(cudaMemcpy(c.w3, shared_shard.tensor_data(*w3), w3->nbytes, cudaMemcpyHostToDevice), "copy cached shared w3");
+        check_cuda(cudaMemcpy(c.s3, shared_shard.tensor_data(*s3), s3->nbytes, cudaMemcpyHostToDevice), "copy cached shared s3");
         auto inserted = shared_cache.emplace(key, c);
         return inserted.first->second;
     }
 
-    std::vector<float>& compressor_kv_state_for_layer(int layer_id, int slots, int cols) {
-        auto it = compressor_kv_state.find(layer_id);
-        if (it != compressor_kv_state.end()) return it->second;
-        auto& state = compressor_kv_state[layer_id];
-        state.assign(static_cast<size_t>(slots) * cols, 0.0f);
-        return state;
+    DeviceMoeDecodeWorkspace& moe_decode_workspace(int topk, int dim, int inter_dim) {
+        const std::string key = std::to_string(topk) + ":" + std::to_string(dim) + ":" + std::to_string(inter_dim);
+        auto it = moe_decode_workspace_cache.find(key);
+        if (it != moe_decode_workspace_cache.end()) return it->second;
+        DeviceMoeDecodeWorkspace w;
+        w.fp4.topk = topk;
+        w.fp4.dim = dim;
+        w.fp4.inter_dim = inter_dim;
+        check_cuda(cudaMalloc(&w.fp4.d_x_q, static_cast<size_t>(dim)), "cudaMalloc moe decode x q");
+        check_cuda(cudaMalloc(&w.fp4.d_x_scale, sizeof(float)), "cudaMalloc moe decode x scale");
+        check_cuda(cudaMalloc(&w.fp4.d_gate, static_cast<size_t>(topk) * inter_dim * sizeof(float)), "cudaMalloc moe decode gate");
+        check_cuda(cudaMalloc(&w.fp4.d_up, static_cast<size_t>(topk) * inter_dim * sizeof(float)), "cudaMalloc moe decode up");
+        check_cuda(cudaMalloc(&w.fp4.d_hidden_q, static_cast<size_t>(topk) * inter_dim), "cudaMalloc moe decode hidden q");
+        check_cuda(cudaMalloc(&w.fp4.d_hidden_scale, static_cast<size_t>(topk) * sizeof(float)), "cudaMalloc moe decode hidden scale");
+        check_cuda(cudaMalloc(&w.fp4.d_route_y, static_cast<size_t>(topk) * dim * sizeof(float)), "cudaMalloc moe decode route y");
+        auto inserted = moe_decode_workspace_cache.emplace(key, w);
+        return inserted.first->second;
     }
 
-    std::vector<float>& compressor_score_state_for_layer(int layer_id, int slots, int cols) {
-        auto it = compressor_score_state.find(layer_id);
-        if (it != compressor_score_state.end()) return it->second;
-        auto& state = compressor_score_state[layer_id];
-        state.assign(static_cast<size_t>(slots) * cols, -INFINITY);
-        return state;
+    DeviceHcCache& hc_device_cache(int layer_id) {
+        auto it = hc_cache.find(layer_id);
+        if (it != hc_cache.end()) return it->second;
+        const std::string prefix = "layers." + std::to_string(layer_id) + ".";
+        SafeTensorsShard& shard = shard_for_tensor(prefix + "hc_attn_fn");
+        const auto* attn_fn = require_tensor(shard, prefix + "hc_attn_fn");
+        const auto* attn_scale = require_tensor(shard, prefix + "hc_attn_scale");
+        const auto* attn_base = require_tensor(shard, prefix + "hc_attn_base");
+        const auto* ffn_fn = require_tensor(shard, prefix + "hc_ffn_fn");
+        const auto* ffn_scale = require_tensor(shard, prefix + "hc_ffn_scale");
+        const auto* ffn_base = require_tensor(shard, prefix + "hc_ffn_base");
+        DeviceHcCache c;
+        check_cuda(cudaMalloc(&c.attn_fn, attn_fn->nbytes), "cudaMalloc hc attn fn");
+        check_cuda(cudaMalloc(&c.attn_scale, attn_scale->nbytes), "cudaMalloc hc attn scale");
+        check_cuda(cudaMalloc(&c.attn_base, attn_base->nbytes), "cudaMalloc hc attn base");
+        check_cuda(cudaMalloc(&c.ffn_fn, ffn_fn->nbytes), "cudaMalloc hc ffn fn");
+        check_cuda(cudaMalloc(&c.ffn_scale, ffn_scale->nbytes), "cudaMalloc hc ffn scale");
+        check_cuda(cudaMalloc(&c.ffn_base, ffn_base->nbytes), "cudaMalloc hc ffn base");
+        check_cuda(cudaMemcpy(c.attn_fn, shard.tensor_data(*attn_fn), attn_fn->nbytes, cudaMemcpyHostToDevice), "copy hc attn fn");
+        check_cuda(cudaMemcpy(c.attn_scale, shard.tensor_data(*attn_scale), attn_scale->nbytes, cudaMemcpyHostToDevice), "copy hc attn scale");
+        check_cuda(cudaMemcpy(c.attn_base, shard.tensor_data(*attn_base), attn_base->nbytes, cudaMemcpyHostToDevice), "copy hc attn base");
+        check_cuda(cudaMemcpy(c.ffn_fn, shard.tensor_data(*ffn_fn), ffn_fn->nbytes, cudaMemcpyHostToDevice), "copy hc ffn fn");
+        check_cuda(cudaMemcpy(c.ffn_scale, shard.tensor_data(*ffn_scale), ffn_scale->nbytes, cudaMemcpyHostToDevice), "copy hc ffn scale");
+        check_cuda(cudaMemcpy(c.ffn_base, shard.tensor_data(*ffn_base), ffn_base->nbytes, cudaMemcpyHostToDevice), "copy hc ffn base");
+        auto inserted = hc_cache.emplace(layer_id, c);
+        return inserted.first->second;
+    }
+
+    DeviceCompressorState& compressor_state_for_layer(int layer_id, int slots, int cols) {
+        auto it = compressor_device_state.find(layer_id);
+        if (it != compressor_device_state.end()) return it->second;
+        DeviceCompressorState state;
+        state.slots = slots;
+        state.cols = cols;
+        check_cuda(cudaMalloc(&state.kv, static_cast<size_t>(slots) * cols * sizeof(float)), "cudaMalloc compressor kv state");
+        check_cuda(cudaMalloc(&state.score, static_cast<size_t>(slots) * cols * sizeof(float)), "cudaMalloc compressor score state");
+        check_cuda(cudaMemset(state.kv, 0, static_cast<size_t>(slots) * cols * sizeof(float)), "zero compressor kv state");
+        std::vector<float> init(static_cast<size_t>(slots) * cols, -INFINITY);
+        check_cuda(cudaMemcpy(state.score, init.data(), init.size() * sizeof(float), cudaMemcpyHostToDevice), "init compressor score state");
+        auto inserted = compressor_device_state.emplace(layer_id, state);
+        return inserted.first->second;
+    }
+
+    DeviceCompressorState& indexer_compressor_state_for_layer(int layer_id, int slots, int cols) {
+        auto it = indexer_compressor_device_state.find(layer_id);
+        if (it != indexer_compressor_device_state.end()) return it->second;
+        DeviceCompressorState state;
+        state.slots = slots;
+        state.cols = cols;
+        check_cuda(cudaMalloc(&state.kv, static_cast<size_t>(slots) * cols * sizeof(float)), "cudaMalloc indexer compressor kv state");
+        check_cuda(cudaMalloc(&state.score, static_cast<size_t>(slots) * cols * sizeof(float)), "cudaMalloc indexer compressor score state");
+        check_cuda(cudaMemset(state.kv, 0, static_cast<size_t>(slots) * cols * sizeof(float)), "zero indexer compressor kv state");
+        std::vector<float> init(static_cast<size_t>(slots) * cols, -INFINITY);
+        check_cuda(cudaMemcpy(state.score, init.data(), init.size() * sizeof(float), cudaMemcpyHostToDevice), "init indexer compressor score state");
+        auto inserted = indexer_compressor_device_state.emplace(layer_id, state);
+        return inserted.first->second;
     }
 
     int kv_cache_capacity_for_layer(int layer_id) const {
@@ -1026,7 +1316,7 @@ struct SafeForwardContext {
         uint64_t ratio = 0;
         if (layer_id >= 0 && static_cast<size_t>(layer_id) < config.compress_ratios.size()) ratio = config.compress_ratios[static_cast<size_t>(layer_id)];
         const int compressed = ratio == 0 ? 0 : (kv_cache_tokens + static_cast<int>(ratio) - 1) / static_cast<int>(ratio);
-        return std::min(256, window + compressed);
+        return window + compressed;
     }
 
     float* kv_cache_for_layer(int layer_id, int head_dim) {
@@ -1049,21 +1339,46 @@ struct SafeForwardContext {
         return ptr;
     }
 
-    std::vector<float>& indexer_compressor_kv_state_for_layer(int layer_id, int slots, int cols) {
-        auto it = indexer_compressor_kv_state.find(layer_id);
-        if (it != indexer_compressor_kv_state.end()) return it->second;
-        auto& state = indexer_compressor_kv_state[layer_id];
-        state.assign(static_cast<size_t>(slots) * cols, 0.0f);
-        return state;
+    const float* rope_inv_freqs_for(int layer_id, bool use_compress, int rope_dim, float theta) {
+        auto& store = use_compress ? rope_inv_freqs_compress : rope_inv_freqs_plain;
+        auto it = store.find(layer_id);
+        if (it != store.end()) return it->second;
+        const int n = rope_dim / 2;
+        std::vector<float> host(n);
+        for (int i = 0; i < n; ++i) {
+            host[i] = std::pow(theta, -2.0 * i / static_cast<double>(rope_dim));
+        }
+        if (use_compress) {
+            // YaRN: when original_seq_len > 0, blend freqs with smooth ramp.
+            const double original_seq_len = static_cast<double>(config.original_context_length == 0 ? 65536 : config.original_context_length);
+            const double factor = config.rope_factor > 0.0 ? config.rope_factor : 16.0;
+            const double beta_fast = config.beta_fast > 0.0 ? config.beta_fast : 32.0;
+            const double beta_slow = config.beta_slow > 0.0 ? config.beta_slow : 1.0;
+            if (original_seq_len > 0.0 && factor > 0.0) {
+                auto correction_dim = [&](double num_rotations) {
+                    return rope_dim * std::log(original_seq_len / (num_rotations * 2.0 * M_PI)) / (2.0 * std::log(theta));
+                };
+                double low_d = std::floor(correction_dim(beta_fast));
+                double high_d = std::ceil(correction_dim(beta_slow));
+                double low = std::max(low_d, 0.0);
+                double high = std::min(high_d, static_cast<double>(rope_dim - 1));
+                if (low == high) high += 0.001;
+                for (int i = 0; i < n; ++i) {
+                    double pair_dim = static_cast<double>(2 * i);
+                    double t = std::clamp((pair_dim - low) / (high - low), 0.0, 1.0);
+                    double smooth = 1.0 - t;
+                    double base = host[i];
+                    host[i] = static_cast<float>(base / factor * (1.0 - smooth) + base * smooth);
+                }
+            }
+        }
+        float* ptr = nullptr;
+        check_cuda(cudaMalloc(&ptr, static_cast<size_t>(n) * sizeof(float)), "cudaMalloc rope inv freqs");
+        check_cuda(cudaMemcpy(ptr, host.data(), static_cast<size_t>(n) * sizeof(float), cudaMemcpyHostToDevice), "copy rope inv freqs");
+        store[layer_id] = ptr;
+        return ptr;
     }
 
-    std::vector<float>& indexer_compressor_score_state_for_layer(int layer_id, int slots, int cols) {
-        auto it = indexer_compressor_score_state.find(layer_id);
-        if (it != indexer_compressor_score_state.end()) return it->second;
-        auto& state = indexer_compressor_score_state[layer_id];
-        state.assign(static_cast<size_t>(slots) * cols, -INFINITY);
-        return state;
-    }
 
     std::string ckpt_dir;
     SafeTensorsIndex index;
@@ -1084,19 +1399,25 @@ struct SafeForwardContext {
     std::unordered_map<std::string, DeviceAttentionCache> attention_cache;
     std::unordered_map<std::string, DeviceSharedCache> shared_cache;
     std::unordered_map<std::string, DeviceFp4ExpertCache> expert_cache;
+    std::unordered_map<std::string, DeviceCompressorCache> compressor_cache;
+    std::unordered_map<int, DeviceHcCache> hc_cache;
+    std::unordered_map<std::string, DeviceMoeDecodeWorkspace> moe_decode_workspace_cache;
+    std::unordered_map<std::string, DeviceCompressorCache> indexer_compressor_cache;
+    std::unordered_map<int, DeviceCompressorState> compressor_device_state;
+    std::unordered_map<int, DeviceCompressorState> indexer_compressor_device_state;
+    std::unordered_map<std::string, DeviceIndexerCache> indexer_cache;
     std::unordered_map<std::string, DeviceFp4ActiveArena> active_arena_cache;
     std::unordered_map<std::string, HostFp4ExpertSlot> host_fp4_slot_cache;
     std::list<std::string> active_arena_lru;
     std::vector<ActiveArenaDeviceBuffers> active_arena_device_freelist;
     std::unordered_map<std::string, std::list<std::string>::iterator> active_arena_lru_pos;
     int active_arena_max_layers = env_int_or_default("DEEPSEEK_GPU_PREFILL_MOE_MAX_CACHED_LAYERS", 0);
+    int use_gpu_compressor = env_int_or_default("DSV4_CPP_GPU_COMPRESSOR", 1);
     std::unordered_map<std::string, DeviceGateCache> gate_cache;
     std::unordered_map<int, float*> kv_cache;
     std::unordered_map<int, float*> indexer_kv_cache;
-    std::unordered_map<int, std::vector<float>> compressor_kv_state;
-    std::unordered_map<int, std::vector<float>> compressor_score_state;
-    std::unordered_map<int, std::vector<float>> indexer_compressor_kv_state;
-    std::unordered_map<int, std::vector<float>> indexer_compressor_score_state;
+    std::unordered_map<int, float*> rope_inv_freqs_compress;
+    std::unordered_map<int, float*> rope_inv_freqs_plain;
 };
 
 }  // namespace
@@ -1126,7 +1447,7 @@ ForwardSmokeResult run_safetensors_prompt_forward_with_options(const std::string
     if (tokens.empty()) throw std::runtime_error("prompt has no tokens");
     SafeForwardContext ctx(ckpt_dir);
     ctx.options = options;
-    ctx.kv_cache_tokens = static_cast<int>(std::min<size_t>(tokens.size(), 256));
+    ctx.kv_cache_tokens = static_cast<int>(tokens.size());
     return run_safetensors_prompt_prefill_impl(ctx, tokens, layer_count);
 }
 
@@ -1139,15 +1460,14 @@ GenerateSmokeResult run_safetensors_generate_tokens_timed_with_options(const std
     if (max_new_tokens <= 0) return {};
     SafeForwardContext ctx(ckpt_dir);
     ctx.options = options;
-    ctx.kv_cache_tokens = static_cast<int>(std::min<size_t>(seed_tokens.size() + static_cast<size_t>(max_new_tokens), 256));
+    ctx.kv_cache_tokens = static_cast<int>(seed_tokens.size() + static_cast<size_t>(max_new_tokens));
     const int dim = static_cast<int>(ctx.embed->shape[1]);
     ctx.prepare_resident_device_caches(layer_count, options.tp_world, options.tp_rank, dim);
-    const bool prepare_fp4_host = !options.skip_fp4_host_prepare && env_int_or_default("DSV4_CPP_PREPARE_FP4_HOST", 0) != 0;
+    const bool prepare_fp4_host = !options.skip_fp4_host_prepare && env_int_or_default("DSV4_CPP_PREPARE_FP4_HOST", 1) != 0;
     if (prepare_fp4_host) ctx.prepare_fp4_host_weights(layer_count, options.tp_world, options.tp_rank);
     const auto timed_t0 = Clock::now();
+    const auto prefill_t0 = timed_t0;
     ForwardSmokeResult result = run_safetensors_prompt_prefill_impl(ctx, seed_tokens, layer_count);
-    std::vector<ForwardSmokeResult> out;
-    out.reserve(static_cast<size_t>(max_new_tokens));
     int token = result.top_token;
 #ifdef DSV4_HAVE_NCCL
     if (options.tp_world > 1 && !options.nccl_id_path.empty()) {
@@ -1157,10 +1477,14 @@ GenerateSmokeResult run_safetensors_generate_tokens_timed_with_options(const std
         result.top_logit = global.logit;
     }
 #endif
+    const auto prefill_t1 = Clock::now();
+    std::vector<ForwardSmokeResult> out;
+    out.reserve(static_cast<size_t>(max_new_tokens));
     ForwardSmokeResult generated = result;
     generated.token = token;
     out.push_back(generated);
     int position = static_cast<int>(seed_tokens.size());
+    const auto decode_t0 = Clock::now();
     for (int step = 1; step < max_new_tokens; ++step) {
         result = run_safetensors_token_forward_impl(ctx, token, layer_count, position + step - 1);
 #ifdef DSV4_HAVE_NCCL
@@ -1175,7 +1499,15 @@ GenerateSmokeResult run_safetensors_generate_tokens_timed_with_options(const std
         generated.token = token;
         out.push_back(generated);
     }
-    return GenerateSmokeResult{std::move(out), elapsed_ms(timed_t0, Clock::now()) / 1000.0};
+    const auto decode_t1 = Clock::now();
+    GenerateSmokeResult timed;
+    timed.tokens = std::move(out);
+    timed.wall_seconds = elapsed_ms(timed_t0, decode_t1) / 1000.0;
+    timed.prefill_seconds = elapsed_ms(prefill_t0, prefill_t1) / 1000.0;
+    timed.decode_seconds = max_new_tokens > 1 ? elapsed_ms(decode_t0, decode_t1) / 1000.0 : 0.0;
+    timed.prompt_tokens = static_cast<int>(seed_tokens.size());
+    timed.decode_tokens = max_new_tokens > 1 ? max_new_tokens - 1 : 0;
+    return timed;
 }
 
 std::vector<ForwardSmokeResult> run_safetensors_generate_tokens_with_options(const std::string& ckpt_dir, const std::vector<int>& seed_tokens, int layer_count, int max_new_tokens, const ForwardSmokeOptions& options) {
@@ -1207,6 +1539,10 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     if (head_rows % tp_world != 0) throw std::runtime_error("head vocab rows must divide TP world");
     const int local_head_rows = head_rows / tp_world;
     const int local_head_start = tp_rank * local_head_rows;
+
+#ifdef DSV4_HAVE_NCCL
+    BF16AllReduceScratch bf16_reduce_scratch;
+#endif
 
     std::vector<int> token_ids(tokens.begin(), tokens.end());
     for (int token : token_ids) {
@@ -1280,11 +1616,19 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     check_cuda(cudaMalloc(&d_attn_value, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "cudaMalloc prefill attn value");
     check_cuda(cudaMalloc(&d_attn_mid, static_cast<size_t>(attn_dims.attn_mid) * sizeof(float)), "cudaMalloc prefill attn mid");
     check_cuda(cudaMalloc(&d_attn_out, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc prefill attn out");
-    check_cuda(cudaMalloc(&d_kv_indices, 640 * sizeof(int)), "cudaMalloc prefill kv indices");
+    {
+        int max_compressed = 0;
+        for (uint64_t ratio : config.compress_ratios) {
+            if (ratio == 0) continue;
+            max_compressed = std::max(max_compressed, (token_count + static_cast<int>(ratio) - 1) / static_cast<int>(ratio));
+        }
+        const int max_kv_indices = static_cast<int>(std::max<uint64_t>(1, config.window_size == 0 ? 128 : config.window_size)) + std::max(1, max_compressed);
+        check_cuda(cudaMalloc(&d_kv_indices, static_cast<size_t>(max_kv_indices) * sizeof(int)), "cudaMalloc prefill kv indices");
+    }
     check_cuda(cudaMalloc(&d_moe_rows, token_dim * sizeof(float)), "cudaMalloc moe rows");
-    check_cuda(cudaMalloc(&d_shared_gate, static_cast<size_t>(token_count) * (inter / tp_world) * sizeof(float)), "cudaMalloc shared gate rows");
-    check_cuda(cudaMalloc(&d_shared_up, static_cast<size_t>(token_count) * (inter / tp_world) * sizeof(float)), "cudaMalloc shared up rows");
-    check_cuda(cudaMalloc(&d_shared_hidden, static_cast<size_t>(token_count) * (inter / tp_world) * sizeof(float)), "cudaMalloc shared hidden rows");
+    check_cuda(cudaMalloc(&d_shared_gate, static_cast<size_t>(token_count) * inter * sizeof(float)), "cudaMalloc shared gate rows");
+    check_cuda(cudaMalloc(&d_shared_up, static_cast<size_t>(token_count) * inter * sizeof(float)), "cudaMalloc shared up rows");
+    check_cuda(cudaMalloc(&d_shared_hidden, static_cast<size_t>(token_count) * inter * sizeof(float)), "cudaMalloc shared hidden rows");
     check_cuda(cudaMalloc(&d_shared_out, token_dim * sizeof(float)), "cudaMalloc shared out rows");
     check_cuda(cudaMalloc(&d_head, static_cast<size_t>(local_head_rows) * dim * sizeof(uint16_t)), "cudaMalloc head");
     check_cuda(cudaMalloc(&d_final_norm_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc final norm gamma");
@@ -1331,6 +1675,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
         uint64_t layer_compress_ratio = static_cast<size_t>(li) < ctx.config.compress_ratios.size() ? ctx.config.compress_ratios[static_cast<size_t>(li)] : 0;
         attn_dims.rope_theta = static_cast<float>(layer_compress_ratio == 0 ? config.rope_theta : config.compress_rope_theta);
         if (attn_dims.rope_theta <= 0.0f) throw std::runtime_error("invalid layer rope_theta");
+        attn_dims.d_inv_freqs = ctx.rope_inv_freqs_for(li, layer_compress_ratio != 0, attn_dims.rope_dim, attn_dims.rope_theta);
         float* d_layer_kv_cache = ctx.kv_cache_tokens > 0 ? ctx.kv_cache_for_layer(li, attn_dims.head_dim) : nullptr;
 
         std::vector<HcPreResult> attn_pre = hc_pre_rows_cpu(h4_rows, reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_attn_fn)), reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_attn_scale)), reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_attn_base)), token_count, dim);
@@ -1377,7 +1722,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
 #ifdef DSV4_HAVE_NCCL
             if (ctx.options.tp_world > 1) {
                 if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP prefill attention all-reduce requires --nccl-id-path");
-                nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_attn_out, dim);
+                all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_attn_out, dim, bf16_reduce_scratch);
             }
 #endif
             check_cuda(cudaMemcpy(attn_out_rows.data() + static_cast<size_t>(t) * dim, d_attn_out, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy prefill attn out token");
@@ -1460,27 +1805,21 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
                     check_cuda(cudaMemcpyAsync(arena.s3 + static_cast<size_t>(local) * arena.s3_bytes, slot.h_w3s, arena.s3_bytes, cudaMemcpyHostToDevice), "stage prefill s3");
                 }
             }
-            if (!moe_prefill_fp4_grouped_cuda(d_ffn_norm_rows, d_group_route_tokens, d_group_route_weights, d_seg_starts, arena.w1, arena.s1, arena.w2, arena.s2, arena.w3, arena.s3, d_moe_rows, token_count, total_routes, experts_per_rank, max_count, dim, inter, static_cast<float>(config.swiglu_limit))) throw std::runtime_error("prefill grouped fp4 moe launch failed");
+            if (!moe_prefill_fp4_grouped_cuda(d_ffn_norm_rows, d_group_route_tokens, d_group_route_weights, d_seg_starts, arena.w1, arena.s1, arena.w2, arena.s2, arena.w3, arena.s3, d_moe_rows, token_count, route_count, total_routes, experts_per_rank, max_count, dim, inter, static_cast<float>(config.swiglu_limit))) throw std::runtime_error("prefill grouped fp4 moe launch failed");
         }
 #ifdef DSV4_HAVE_NCCL
         if (ctx.options.tp_world > 1) {
             if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP prefill MoE all-reduce requires --nccl-id-path");
-            nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_moe_rows, static_cast<int>(token_dim));
+            all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_moe_rows, static_cast<int>(token_dim), bf16_reduce_scratch);
         }
 #endif
         {
             DeviceSharedCache& shared = ctx.shared_device_cache(li, tp_world, tp_rank, dim);
-            const int local_shared_inter = inter / tp_world;
-            if (!fp8_e4m3_e8m0_matmul_cuda(d_ffn_norm_rows, shared.w1, shared.s1, d_shared_gate, token_count, local_shared_inter, dim)) throw std::runtime_error("prefill shared w1 launch failed");
-            if (!fp8_e4m3_e8m0_matmul_cuda(d_ffn_norm_rows, shared.w3, shared.s3, d_shared_up, token_count, local_shared_inter, dim)) throw std::runtime_error("prefill shared w3 launch failed");
-            if (!silu_mul_rows_cuda(d_shared_gate, d_shared_up, d_shared_hidden, token_count, local_shared_inter)) throw std::runtime_error("prefill shared silu launch failed");
-            if (!fp8_e4m3_e8m0_matmul_cuda(d_shared_hidden, shared.w2, shared.s2, d_shared_out, token_count, dim, local_shared_inter)) throw std::runtime_error("prefill shared w2 launch failed");
-#ifdef DSV4_HAVE_NCCL
-            if (ctx.options.tp_world > 1) {
-                if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP prefill shared expert all-reduce requires --nccl-id-path");
-                nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_shared_out, static_cast<int>(token_dim));
-            }
-#endif
+            const int shared_inter = inter;
+            if (!fp8_e4m3_e8m0_matmul_cuda(d_ffn_norm_rows, shared.w1, shared.s1, d_shared_gate, token_count, shared_inter, dim)) throw std::runtime_error("prefill shared w1 launch failed");
+            if (!fp8_e4m3_e8m0_matmul_cuda(d_ffn_norm_rows, shared.w3, shared.s3, d_shared_up, token_count, shared_inter, dim)) throw std::runtime_error("prefill shared w3 launch failed");
+            if (!silu_mul_rows_cuda(d_shared_gate, d_shared_up, d_shared_hidden, token_count, shared_inter)) throw std::runtime_error("prefill shared silu launch failed");
+            if (!fp8_e4m3_e8m0_matmul_cuda(d_shared_hidden, shared.w2, shared.s2, d_shared_out, token_count, dim, shared_inter)) throw std::runtime_error("prefill shared w2 launch failed");
             if (!vector_accum_rows_cuda(d_shared_out, d_moe_rows, token_count, dim, 1.0f)) throw std::runtime_error("prefill shared accum failed");
         }
         std::vector<float> moe_rows(token_dim);
@@ -1543,22 +1882,11 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     const int local_head_rows = head_rows / tp_world;
     const int local_head_start = tp_rank * local_head_rows;
 
+#ifdef DSV4_HAVE_NCCL
+    BF16AllReduceScratch bf16_reduce_scratch;
+#endif
+
     uint16_t* d_embed = nullptr;
-    uint16_t* d_attn_gamma = nullptr;
-    uint8_t* d_wq_a = nullptr;
-    uint8_t* d_wq_a_scale = nullptr;
-    uint16_t* d_q_gamma = nullptr;
-    uint8_t* d_wq_b = nullptr;
-    uint8_t* d_wq_b_scale = nullptr;
-    uint8_t* d_wkv = nullptr;
-    uint8_t* d_wkv_scale = nullptr;
-    uint16_t* d_kv_gamma = nullptr;
-    uint8_t* d_wo_a = nullptr;
-    uint8_t* d_wo_a_scale = nullptr;
-    uint8_t* d_wo_b = nullptr;
-    uint8_t* d_wo_b_scale = nullptr;
-    float* d_attn_sink = nullptr;
-    uint16_t* d_ffn_gamma = nullptr;
     uint8_t* d_w1 = nullptr;
     uint8_t* d_s1 = nullptr;
     uint8_t* d_w2 = nullptr;
@@ -1568,6 +1896,11 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     uint16_t* d_head = nullptr;
     uint16_t* d_final_norm_gamma = nullptr;
     float* d_x = nullptr;
+    float* d_h4 = nullptr;
+    float* d_h4_next = nullptr;
+    uint16_t* d_h4_bf16 = nullptr;
+    float* d_hc_post = nullptr;
+    float* d_hc_comb = nullptr;
     float* d_attn_norm = nullptr;
     float* d_q_a = nullptr;
     float* d_q_norm = nullptr;
@@ -1577,10 +1910,17 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     float* d_attn_value = nullptr;
     float* d_attn_mid = nullptr;
     float* d_attn_out = nullptr;
+    uint16_t* d_compressor_input_bf16 = nullptr;
+    float* d_compressor_input_rounded = nullptr;
+    float* d_compressor_kv = nullptr;
+    float* d_compressor_score = nullptr;
+    float* d_indexer_comp_kv = nullptr;
+    float* d_indexer_comp_score = nullptr;
     float* d_index_q = nullptr;
     float* d_indexer_kv = nullptr;
     uint16_t* d_index_weight_proj = nullptr;
     int* d_index_selected = nullptr;
+    float* d_index_scores = nullptr;
     int* d_kv_indices = nullptr;
     float* d_resid1 = nullptr;
     float* d_ffn_norm = nullptr;
@@ -1589,27 +1929,13 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     float* d_hidden = nullptr;
     float* d_moe = nullptr;
     float* d_resid2 = nullptr;
+    float* d_shared_out = nullptr;
     int64_t* d_route_indices = nullptr;
     float* d_route_weights = nullptr;
     float* d_logits = nullptr;
 
     const auto* embed_data = reinterpret_cast<const uint16_t*>(ctx.embed_shard.tensor_data(*embed)) + static_cast<size_t>(token) * dim;
     check_cuda(cudaMalloc(&d_embed, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc embed");
-    check_cuda(cudaMalloc(&d_attn_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc attn gamma");
-    check_cuda(cudaMalloc(&d_wq_a, static_cast<size_t>(attn_dims.q_a_dim) * dim), "cudaMalloc wq_a");
-    check_cuda(cudaMalloc(&d_wq_a_scale, static_cast<size_t>(attn_dims.q_a_dim / 128) * (dim / 128)), "cudaMalloc wq_a scale");
-    check_cuda(cudaMalloc(&d_q_gamma, static_cast<size_t>(attn_dims.q_a_dim) * sizeof(uint16_t)), "cudaMalloc q gamma");
-    check_cuda(cudaMalloc(&d_wq_b, static_cast<size_t>(attn_dims.q_dim) * attn_dims.q_a_dim), "cudaMalloc wq_b");
-    check_cuda(cudaMalloc(&d_wq_b_scale, static_cast<size_t>(attn_dims.q_dim / 128) * (attn_dims.q_a_dim / 128)), "cudaMalloc wq_b scale");
-    check_cuda(cudaMalloc(&d_wkv, static_cast<size_t>(attn_dims.kv_dim) * dim), "cudaMalloc wkv");
-    check_cuda(cudaMalloc(&d_wkv_scale, static_cast<size_t>(attn_dims.kv_dim / 128) * (dim / 128)), "cudaMalloc wkv scale");
-    check_cuda(cudaMalloc(&d_kv_gamma, static_cast<size_t>(attn_dims.kv_dim) * sizeof(uint16_t)), "cudaMalloc kv gamma");
-    check_cuda(cudaMalloc(&d_wo_a, static_cast<size_t>(attn_dims.attn_mid) * dim), "cudaMalloc wo_a");
-    check_cuda(cudaMalloc(&d_wo_a_scale, static_cast<size_t>(attn_dims.attn_mid / 128) * (dim / 128)), "cudaMalloc wo_a scale");
-    check_cuda(cudaMalloc(&d_wo_b, static_cast<size_t>(dim) * attn_dims.attn_mid), "cudaMalloc wo_b");
-    check_cuda(cudaMalloc(&d_wo_b_scale, static_cast<size_t>(dim / 128) * (attn_dims.attn_mid / 128)), "cudaMalloc wo_b scale");
-    check_cuda(cudaMalloc(&d_attn_sink, static_cast<size_t>(attn_dims.heads) * sizeof(float)), "cudaMalloc attn sink");
-    check_cuda(cudaMalloc(&d_ffn_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc ffn gamma");
     check_cuda(cudaMalloc(&d_w1, static_cast<size_t>(inter) * dim), "cudaMalloc w1");
     check_cuda(cudaMalloc(&d_s1, first_w1.s->nbytes), "cudaMalloc s1");
     check_cuda(cudaMalloc(&d_w2, static_cast<size_t>(dim) * inter), "cudaMalloc w2");
@@ -1619,6 +1945,11 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     check_cuda(cudaMalloc(&d_head, static_cast<size_t>(local_head_rows) * dim * sizeof(uint16_t)), "cudaMalloc head");
     check_cuda(cudaMalloc(&d_final_norm_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc final norm gamma");
     check_cuda(cudaMalloc(&d_x, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc x");
+    check_cuda(cudaMalloc(&d_h4, static_cast<size_t>(4) * dim * sizeof(float)), "cudaMalloc hc h4");
+    check_cuda(cudaMalloc(&d_h4_next, static_cast<size_t>(4) * dim * sizeof(float)), "cudaMalloc hc h4 next");
+    check_cuda(cudaMalloc(&d_h4_bf16, static_cast<size_t>(4) * dim * sizeof(uint16_t)), "cudaMalloc hc h4 bf16");
+    check_cuda(cudaMalloc(&d_hc_post, static_cast<size_t>(4) * sizeof(float)), "cudaMalloc hc post");
+    check_cuda(cudaMalloc(&d_hc_comb, static_cast<size_t>(16) * sizeof(float)), "cudaMalloc hc comb");
     check_cuda(cudaMalloc(&d_attn_norm, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc attn norm");
     check_cuda(cudaMalloc(&d_q_a, static_cast<size_t>(attn_dims.q_a_dim) * sizeof(float)), "cudaMalloc q_a");
     check_cuda(cudaMalloc(&d_q_norm, static_cast<size_t>(attn_dims.q_a_dim) * sizeof(float)), "cudaMalloc q_norm");
@@ -1628,11 +1959,26 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     check_cuda(cudaMalloc(&d_attn_value, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "cudaMalloc attn value");
     check_cuda(cudaMalloc(&d_attn_mid, static_cast<size_t>(attn_dims.attn_mid) * sizeof(float)), "cudaMalloc attn mid");
     check_cuda(cudaMalloc(&d_attn_out, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc attn out");
+    if (ctx.use_gpu_compressor != 0) {
+        check_cuda(cudaMalloc(&d_compressor_input_bf16, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc compressor input bf16");
+        check_cuda(cudaMalloc(&d_compressor_input_rounded, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc compressor input rounded");
+        check_cuda(cudaMalloc(&d_compressor_kv, static_cast<size_t>(1024) * sizeof(float)), "cudaMalloc compressor kv");
+        check_cuda(cudaMalloc(&d_compressor_score, static_cast<size_t>(1024) * sizeof(float)), "cudaMalloc compressor score");
+        check_cuda(cudaMalloc(&d_indexer_comp_kv, static_cast<size_t>(std::max<uint64_t>(1, config.index_head_dim * 2)) * sizeof(float)), "cudaMalloc indexer compressor kv");
+        check_cuda(cudaMalloc(&d_indexer_comp_score, static_cast<size_t>(std::max<uint64_t>(1, config.index_head_dim * 2)) * sizeof(float)), "cudaMalloc indexer compressor score");
+    }
     check_cuda(cudaMalloc(&d_index_q, static_cast<size_t>(std::max<uint64_t>(1, config.index_n_heads * config.index_head_dim)) * sizeof(float)), "cudaMalloc index q");
     check_cuda(cudaMalloc(&d_indexer_kv, static_cast<size_t>(std::max<uint64_t>(1, config.index_head_dim)) * sizeof(float)), "cudaMalloc indexer kv tmp");
     check_cuda(cudaMalloc(&d_index_weight_proj, static_cast<size_t>(std::max<uint64_t>(1, config.index_n_heads * config.dim)) * sizeof(uint16_t)), "cudaMalloc index weight proj");
-    check_cuda(cudaMalloc(&d_index_selected, 640 * sizeof(int)), "cudaMalloc index selected");
-    check_cuda(cudaMalloc(&d_kv_indices, 640 * sizeof(int)), "cudaMalloc kv indices");
+    {
+        const int max_compressed = std::max(1, (ctx.kv_cache_tokens + 3) / 4);
+        const int max_keep = static_cast<int>(std::max<uint64_t>(1, config.index_topk));
+        const int max_kv_indices = static_cast<int>(std::max<uint64_t>(1, config.window_size == 0 ? 128 : config.window_size)) + max_keep;
+        const int max_index_heads = static_cast<int>(std::max<uint64_t>(1, config.index_n_heads));
+        check_cuda(cudaMalloc(&d_index_selected, static_cast<size_t>(max_keep) * sizeof(int)), "cudaMalloc index selected");
+        check_cuda(cudaMalloc(&d_index_scores, static_cast<size_t>(max_compressed + max_index_heads) * sizeof(float)), "cudaMalloc index scores");
+        check_cuda(cudaMalloc(&d_kv_indices, static_cast<size_t>(max_kv_indices) * sizeof(int)), "cudaMalloc kv indices");
+    }
     check_cuda(cudaMalloc(&d_resid1, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc resid1");
     check_cuda(cudaMalloc(&d_ffn_norm, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc ffn norm");
     check_cuda(cudaMalloc(&d_gate, static_cast<size_t>(inter) * sizeof(float)), "cudaMalloc gate");
@@ -1640,9 +1986,16 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     check_cuda(cudaMalloc(&d_hidden, static_cast<size_t>(inter) * sizeof(float)), "cudaMalloc hidden");
     check_cuda(cudaMalloc(&d_moe, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc moe");
     check_cuda(cudaMalloc(&d_resid2, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc resid2");
+    check_cuda(cudaMalloc(&d_shared_out, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc shared out");
     check_cuda(cudaMalloc(&d_route_indices, static_cast<size_t>(config.n_activated_experts) * sizeof(int64_t)), "cudaMalloc route indices");
     check_cuda(cudaMalloc(&d_route_weights, static_cast<size_t>(config.n_activated_experts) * sizeof(float)), "cudaMalloc route weights");
     check_cuda(cudaMalloc(&d_logits, static_cast<size_t>(local_head_rows) * sizeof(float)), "cudaMalloc logits");
+
+    cudaStream_t moe_copy_stream = nullptr;
+    cudaEvent_t moe_stage_event = nullptr;
+    bool moe_stage_event_recorded = false;
+    check_cuda(cudaStreamCreateWithFlags(&moe_copy_stream, cudaStreamNonBlocking), "create moe copy stream");
+    check_cuda(cudaEventCreateWithFlags(&moe_stage_event, cudaEventDisableTiming), "create moe stage event");
 
     check_cuda(cudaMemcpy(d_embed, embed_data, static_cast<size_t>(dim) * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy embed");
     const auto* head_data = reinterpret_cast<const uint16_t*>(ctx.head_shard.tensor_data(*head)) + static_cast<size_t>(local_head_start) * dim;
@@ -1655,13 +2008,22 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     double total_hc_ms = 0.0;
     double total_attn_ms = 0.0;
     double total_route_ms = 0.0;
+    double total_route_comp_ms = 0.0;
+    double total_route_indexer_comp_ms = 0.0;
+    double total_route_indexer_q_ms = 0.0;
+    double total_route_indexer_topk_ms = 0.0;
+    double total_route_gate_ms = 0.0;
     double total_moe_ms = 0.0;
+    double total_moe_stage_ms = 0.0;
+    double total_moe_kernel_ms = 0.0;
+    double total_moe_reduce_ms = 0.0;
     double total_shared_ms = 0.0;
     double total_post_ms = 0.0;
     std::vector<float> h4(static_cast<size_t>(4) * dim);
     std::vector<float> host_x(dim);
     check_cuda(cudaMemcpy(host_x.data(), d_x, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy embed host");
     for (int m = 0; m < 4; ++m) std::copy(host_x.begin(), host_x.end(), h4.begin() + static_cast<size_t>(m) * dim);
+    check_cuda(cudaMemcpy(d_h4, h4.data(), static_cast<size_t>(4) * dim * sizeof(float), cudaMemcpyHostToDevice), "copy initial hc h4");
 
     for (int li = 0; li < layer_count; ++li) {
         const auto layer_t0 = Clock::now();
@@ -1670,7 +2032,15 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         double hc_ms = 0.0;
         double attn_ms = 0.0;
         double route_ms = 0.0;
+        double route_comp_ms = 0.0;
+        double route_indexer_comp_ms = 0.0;
+        double route_indexer_q_ms = 0.0;
+        double route_indexer_topk_ms = 0.0;
+        double route_gate_ms = 0.0;
         double moe_ms = 0.0;
+        double moe_stage_ms = 0.0;
+        double moe_kernel_ms = 0.0;
+        double moe_reduce_ms = 0.0;
         double shared_ms = 0.0;
         double post_ms = 0.0;
         const std::string prefix = "layers." + std::to_string(li) + ".";
@@ -1680,46 +2050,30 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         uint64_t layer_compress_ratio = static_cast<size_t>(li) < ctx.config.compress_ratios.size() ? ctx.config.compress_ratios[static_cast<size_t>(li)] : 0;
         attn_dims.rope_theta = static_cast<float>(layer_compress_ratio == 0 ? config.rope_theta : config.compress_rope_theta);
         if (attn_dims.rope_theta <= 0.0f) throw std::runtime_error("invalid layer rope_theta");
+        attn_dims.d_inv_freqs = ctx.rope_inv_freqs_for(li, layer_compress_ratio != 0, attn_dims.rope_dim, attn_dims.rope_theta);
         const int compressed_ready = layer_compress_ratio == 0 ? 0 : (position + 1) / static_cast<int>(layer_compress_ratio);
         const int window_len = std::min(position + 1, attn_dims.window_size);
         const int layer_cache_len = d_layer_kv_cache == nullptr ? 0 : std::min(ctx.kv_cache_capacity_for_layer(li), window_len + compressed_ready);
         std::vector<int> kv_indices;
-        SafeTensorsShard& attn_norm_shard = ctx.shard_for_tensor(prefix + "attn_norm.weight");
         SafeTensorsShard& qkv_shard = ctx.shard_for_tensor(prefix + "attn.wq_a.weight");
         SafeTensorsShard& wo_a_shard = ctx.shard_for_tensor(prefix + "attn.wo_a.weight");
         SafeTensorsShard& wo_b_shard = ctx.shard_for_tensor(prefix + "attn.wo_b.weight");
-        SafeTensorsShard& ffn_norm_shard = ctx.shard_for_tensor(prefix + "ffn_norm.weight");
-        const auto* hc_attn_fn = require_tensor(qkv_shard, prefix + "hc_attn_fn");
-        const auto* hc_attn_scale = require_tensor(qkv_shard, prefix + "hc_attn_scale");
-        const auto* hc_attn_base = require_tensor(qkv_shard, prefix + "hc_attn_base");
-        const auto* hc_ffn_fn = require_tensor(qkv_shard, prefix + "hc_ffn_fn");
-        const auto* hc_ffn_scale = require_tensor(qkv_shard, prefix + "hc_ffn_scale");
-        const auto* hc_ffn_base = require_tensor(qkv_shard, prefix + "hc_ffn_base");
-        const auto* attn_norm = require_tensor(attn_norm_shard, prefix + "attn_norm.weight");
-        const auto* q_norm = require_tensor(qkv_shard, prefix + "attn.q_norm.weight");
-        const auto* kv_norm = require_tensor(qkv_shard, prefix + "attn.kv_norm.weight");
-        const auto* ffn_norm = require_tensor(ffn_norm_shard, prefix + "ffn_norm.weight");
         DeviceAttentionCache& attn_cache = ctx.attention_device_cache(li, tp_world, tp_rank, attn_dims);
 
-        check_cuda(cudaMemcpy(d_attn_gamma, attn_norm_shard.tensor_data(*attn_norm), attn_norm->nbytes, cudaMemcpyHostToDevice), "copy attn gamma");
-        check_cuda(cudaMemcpy(d_q_gamma, qkv_shard.tensor_data(*q_norm), q_norm->nbytes, cudaMemcpyHostToDevice), "copy q norm");
-        check_cuda(cudaMemcpy(d_kv_gamma, qkv_shard.tensor_data(*kv_norm), kv_norm->nbytes, cudaMemcpyHostToDevice), "copy kv norm");
-        check_cuda(cudaMemcpy(d_ffn_gamma, ffn_norm_shard.tensor_data(*ffn_norm), ffn_norm->nbytes, cudaMemcpyHostToDevice), "copy ffn gamma");
         load_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
 
-        const HcPreResult attn_hc = hc_pre_cpu(
-            h4,
-            reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_attn_fn)),
-            reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_attn_scale)),
-            reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_attn_base)),
-            dim);
-        check_cuda(cudaMemcpy(d_x, attn_hc.x.data(), static_cast<size_t>(dim) * sizeof(float), cudaMemcpyHostToDevice), "copy hc attn pre");
+        DeviceHcCache& hc_cache = ctx.hc_device_cache(li);
+        if (!hc_pre_float_cuda(d_h4, hc_cache.attn_fn, hc_cache.attn_scale, hc_cache.attn_base, d_x, d_hc_post, d_hc_comb, dim)) throw std::runtime_error("hc attn pre launch failed");
         hc_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
+        auto route_stage_t = stage_t;
 
         uint64_t compress_ratio = layer_compress_ratio;
+        std::vector<float> compressor_input_host;
         if (d_layer_kv_cache != nullptr && compress_ratio > 0 && compress_ratio <= 256 && index.shard_for_tensor(prefix + "attn.compressor.wkv.weight") != nullptr) {
+            route_stage_t = Clock::now();
+            if (!rmsnorm_bf16_gamma_cuda(d_x, attn_cache.attn_norm, d_attn_norm, dim, 1e-6f)) throw std::runtime_error("compressor pre-norm launch failed");
             SafeTensorsShard& comp_shard = ctx.shard_for_tensor(prefix + "attn.compressor.wkv.weight");
             const auto* comp_wkv = require_tensor(comp_shard, prefix + "attn.compressor.wkv.weight");
             const auto* comp_wgate = require_tensor(comp_shard, prefix + "attn.compressor.wgate.weight");
@@ -1728,57 +2082,55 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             const int comp_cols = static_cast<int>(comp_wkv->shape[0]);
             const int ratio = static_cast<int>(compress_ratio);
             const bool overlap = comp_cols == attn_dims.head_dim * 2;
+            const int state_cols = overlap ? attn_dims.head_dim * 2 : attn_dims.head_dim;
             const int slots = ratio * (overlap ? 2 : 1);
-            std::vector<float> comp_kv = bf16_matvec_cpu(attn_hc.x, reinterpret_cast<const uint16_t*>(comp_shard.tensor_data(*comp_wkv)), comp_cols, dim);
-            std::vector<float> comp_score = bf16_matvec_cpu(attn_hc.x, reinterpret_cast<const uint16_t*>(comp_shard.tensor_data(*comp_wgate)), comp_cols, dim);
-            const int offset = position % ratio;
-            const float* ape = reinterpret_cast<const float*>(comp_shard.tensor_data(*comp_ape)) + static_cast<size_t>(offset) * comp_cols;
-            std::vector<float>& kv_state = ctx.compressor_kv_state_for_layer(li, slots, attn_dims.head_dim);
-            std::vector<float>& score_state = ctx.compressor_score_state_for_layer(li, slots, attn_dims.head_dim);
-            if (overlap) {
-                for (int d = 0; d < attn_dims.head_dim; ++d) {
-                    kv_state[static_cast<size_t>(ratio + offset) * attn_dims.head_dim + d] = comp_kv[attn_dims.head_dim + d];
-                    score_state[static_cast<size_t>(ratio + offset) * attn_dims.head_dim + d] = comp_score[attn_dims.head_dim + d] + ape[attn_dims.head_dim + d];
-                }
+            if (ctx.use_gpu_compressor == 0) throw std::runtime_error("host compressor path is disabled for PyTorch resident parity");
+            DeviceCompressorCache& comp_cache = ctx.compressor_device_cache(li);
+            if (!fp32_to_bf16_cuda(d_attn_norm, d_compressor_input_bf16, dim)) throw std::runtime_error("compressor input bf16 round failed");
+            if (!bf16_to_fp32_cuda(d_compressor_input_bf16, d_compressor_input_rounded, dim)) throw std::runtime_error("compressor input bf16 restore failed");
+            if (ctx.use_gpu_compressor == 2) {
+                if (!bf16_matvec_cpu_order_cuda(d_compressor_input_rounded, comp_cache.wkv, d_compressor_kv, comp_cols, dim)) throw std::runtime_error("compressor wkv launch failed");
+                if (!bf16_matvec_cpu_order_cuda(d_compressor_input_rounded, comp_cache.wgate, d_compressor_score, comp_cols, dim)) throw std::runtime_error("compressor wgate launch failed");
             } else {
-                for (int d = 0; d < attn_dims.head_dim; ++d) {
-                    kv_state[static_cast<size_t>(offset) * attn_dims.head_dim + d] = comp_kv[d];
-                    score_state[static_cast<size_t>(offset) * attn_dims.head_dim + d] = comp_score[d] + ape[d];
-                }
+                if (!bf16_dual_matvec_cuda(d_compressor_input_rounded, comp_cache.wkv, comp_cache.wgate, d_compressor_kv, d_compressor_score, comp_cols, dim)) throw std::runtime_error("compressor matvec launch failed");
             }
+            if (debug_forward) {
+                compressor_input_host.resize(dim);
+                check_cuda(cudaMemcpy(compressor_input_host.data(), d_compressor_input_rounded, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy compressor input debug");
+                print_summary("layer=" + std::to_string(li) + ".compressor_input", compressor_input_host);
+            }
+            const int offset = position % ratio;
+            const float* ape = comp_cache.ape + static_cast<size_t>(offset) * comp_cols;
+            DeviceCompressorState& comp_state = ctx.compressor_state_for_layer(li, slots, state_cols);
+            const int write_slot = overlap ? ratio + offset : offset;
+            if (!compressor_update_state_cuda(d_compressor_kv, d_compressor_score, ape, comp_state.kv, comp_state.score, offset, write_slot, state_cols)) throw std::runtime_error("compressor state update launch failed");
             if ((position + 1) % ratio == 0) {
-                std::vector<float> pooled(attn_dims.head_dim, 0.0f);
-                const int pool_slots = overlap ? ratio * 2 : ratio;
-                for (int d = 0; d < attn_dims.head_dim; ++d) {
-                    float max_score = -INFINITY;
-                    for (int t = 0; t < pool_slots; ++t) max_score = std::max(max_score, score_state[static_cast<size_t>(t) * attn_dims.head_dim + d]);
-                    float denom = 0.0f;
-                    for (int t = 0; t < pool_slots; ++t) denom += std::exp(score_state[static_cast<size_t>(t) * attn_dims.head_dim + d] - max_score);
-                    for (int t = 0; t < pool_slots; ++t) {
-                        const float w = std::exp(score_state[static_cast<size_t>(t) * attn_dims.head_dim + d] - max_score) / denom;
-                        pooled[d] += w * kv_state[static_cast<size_t>(t) * attn_dims.head_dim + d];
-                    }
-                }
-                pooled = rmsnorm_cpu(pooled, reinterpret_cast<const uint16_t*>(comp_shard.tensor_data(*comp_norm)), 1e-6f);
                 const int compressed_slot = attn_dims.window_size + position / ratio;
                 if (compressed_slot < ctx.kv_cache_capacity_for_layer(li)) {
-                    check_cuda(cudaMemcpy(d_layer_kv_cache + static_cast<size_t>(compressed_slot) * attn_dims.head_dim, pooled.data(), static_cast<size_t>(attn_dims.head_dim) * sizeof(float), cudaMemcpyHostToDevice), "copy compressed kv");
+                    float* d_pooled_slot = d_layer_kv_cache + static_cast<size_t>(compressed_slot) * attn_dims.head_dim;
+                    if (!compressor_pool_cuda(comp_state.kv, comp_state.score, d_pooled_slot, ratio, attn_dims.head_dim, state_cols, overlap)) throw std::runtime_error("compressor pool launch failed");
+                    if (!rmsnorm_bf16_gamma_cuda(d_pooled_slot, comp_cache.norm, d_pooled_slot, attn_dims.head_dim, 1e-6f)) throw std::runtime_error("compressed kv norm launch failed");
+                    const float comp_rope_theta = static_cast<float>(config.compress_rope_theta == 0 ? 160000 : config.compress_rope_theta);
+                    const float* comp_freqs = ctx.rope_inv_freqs_for(li, true, attn_dims.rope_dim, comp_rope_theta);
+                    if (!head_rmsnorm_rope_freqs_cuda(d_pooled_slot, comp_freqs, 1, attn_dims.head_dim, attn_dims.rope_dim, position + 1 - ratio, false, 0.0f)) throw std::runtime_error("compressed kv rope failed");
+                    if (!fp8_act_quant_dequant_cuda(d_pooled_slot, attn_dims.head_dim - attn_dims.rope_dim, 64)) throw std::runtime_error("compressed kv act quant failed");
+                    if (debug_forward) {
+                        std::vector<float> pooled_slot(attn_dims.head_dim);
+                        check_cuda(cudaMemcpy(pooled_slot.data(), d_pooled_slot, static_cast<size_t>(attn_dims.head_dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy compressed kv debug");
+                        print_summary("layer=" + std::to_string(li) + ".compressed_kv", pooled_slot);
+                    }
                 }
-                if (overlap) {
-                    std::copy(kv_state.begin() + static_cast<size_t>(ratio) * attn_dims.head_dim, kv_state.end(), kv_state.begin());
-                    std::copy(score_state.begin() + static_cast<size_t>(ratio) * attn_dims.head_dim, score_state.end(), score_state.begin());
-                }
+                if (overlap && !compressor_shift_overlap_state_cuda(comp_state.kv, comp_state.score, ratio, state_cols)) throw std::runtime_error("compressor state shift launch failed");
             }
+            route_comp_ms += elapsed_ms(route_stage_t, Clock::now());
         }
         if (d_layer_kv_cache != nullptr) {
             kv_indices.reserve(static_cast<size_t>(window_len + compressed_ready));
             const int window_start = std::max(0, position - window_len + 1);
             for (int p = window_start; p <= position; ++p) kv_indices.push_back(p % attn_dims.window_size);
             if (compress_ratio == 4 && compressed_ready > 0 && index.shard_for_tensor(prefix + "attn.indexer.wq_b.weight") != nullptr) {
+                route_stage_t = Clock::now();
                 SafeTensorsShard& idx_shard = ctx.shard_for_tensor(prefix + "attn.indexer.wq_b.weight");
-                const auto* idx_wq_b = require_tensor(idx_shard, prefix + "attn.indexer.wq_b.weight");
-                const auto* idx_wq_b_scale = require_tensor(idx_shard, prefix + "attn.indexer.wq_b.scale");
-                const auto* idx_weights = require_tensor(idx_shard, prefix + "attn.indexer.weights_proj.weight");
                 const auto* idx_comp_wkv = require_tensor(idx_shard, prefix + "attn.indexer.compressor.wkv.weight");
                 const auto* idx_comp_wgate = require_tensor(idx_shard, prefix + "attn.indexer.compressor.wgate.weight");
                 const auto* idx_comp_ape = require_tensor(idx_shard, prefix + "attn.indexer.compressor.ape");
@@ -1787,59 +2139,61 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                 const int idx_head_dim = static_cast<int>(config.index_head_dim);
                 const int idx_cols = static_cast<int>(idx_comp_wkv->shape[0]);
                 const bool idx_overlap = idx_cols == idx_head_dim * 2;
+                const int idx_state_cols = idx_overlap ? idx_head_dim * 2 : idx_head_dim;
                 const int idx_slots = 4 * (idx_overlap ? 2 : 1);
-                std::vector<float> idx_comp_kv = bf16_matvec_cpu(attn_hc.x, reinterpret_cast<const uint16_t*>(idx_shard.tensor_data(*idx_comp_wkv)), idx_cols, dim);
-                std::vector<float> idx_comp_score = bf16_matvec_cpu(attn_hc.x, reinterpret_cast<const uint16_t*>(idx_shard.tensor_data(*idx_comp_wgate)), idx_cols, dim);
-                const int offset = position % 4;
-                const float* ape = reinterpret_cast<const float*>(idx_shard.tensor_data(*idx_comp_ape)) + static_cast<size_t>(offset) * idx_cols;
-                std::vector<float>& idx_kv_state = ctx.indexer_compressor_kv_state_for_layer(li, idx_slots, idx_head_dim);
-                std::vector<float>& idx_score_state = ctx.indexer_compressor_score_state_for_layer(li, idx_slots, idx_head_dim);
-                if (idx_overlap) {
-                    for (int d = 0; d < idx_head_dim; ++d) {
-                        idx_kv_state[static_cast<size_t>(4 + offset) * idx_head_dim + d] = idx_comp_kv[idx_head_dim + d];
-                        idx_score_state[static_cast<size_t>(4 + offset) * idx_head_dim + d] = idx_comp_score[idx_head_dim + d] + ape[idx_head_dim + d];
-                    }
+                if (ctx.use_gpu_compressor == 0) throw std::runtime_error("host indexer compressor path is disabled for PyTorch resident parity");
+                DeviceCompressorCache& idx_comp_cache = ctx.indexer_compressor_device_cache(li);
+                if (ctx.use_gpu_compressor == 2) {
+                    if (!bf16_matvec_cpu_order_cuda(d_compressor_input_rounded, idx_comp_cache.wkv, d_indexer_comp_kv, idx_cols, dim)) throw std::runtime_error("indexer compressor wkv launch failed");
+                    if (!bf16_matvec_cpu_order_cuda(d_compressor_input_rounded, idx_comp_cache.wgate, d_indexer_comp_score, idx_cols, dim)) throw std::runtime_error("indexer compressor wgate launch failed");
                 } else {
-                    for (int d = 0; d < idx_head_dim; ++d) {
-                        idx_kv_state[static_cast<size_t>(offset) * idx_head_dim + d] = idx_comp_kv[d];
-                        idx_score_state[static_cast<size_t>(offset) * idx_head_dim + d] = idx_comp_score[d] + ape[d];
-                    }
+                    if (!bf16_dual_matvec_cuda(d_compressor_input_rounded, idx_comp_cache.wkv, idx_comp_cache.wgate, d_indexer_comp_kv, d_indexer_comp_score, idx_cols, dim)) throw std::runtime_error("indexer compressor matvec launch failed");
                 }
+                const int offset = position % 4;
+                const float* ape = idx_comp_cache.ape + static_cast<size_t>(offset) * idx_cols;
+                DeviceCompressorState& idx_state = ctx.indexer_compressor_state_for_layer(li, idx_slots, idx_state_cols);
+                const int idx_write_slot = idx_overlap ? 4 + offset : offset;
+                if (!compressor_update_state_cuda(d_indexer_comp_kv, d_indexer_comp_score, ape, idx_state.kv, idx_state.score, offset, idx_write_slot, idx_state_cols)) throw std::runtime_error("indexer compressor state update launch failed");
                 if ((position + 1) % 4 == 0) {
-                    std::vector<float> pooled(idx_head_dim, 0.0f);
-                    const int pool_slots = idx_overlap ? 8 : 4;
-                    for (int d = 0; d < idx_head_dim; ++d) {
-                        float max_score = -INFINITY;
-                        for (int t = 0; t < pool_slots; ++t) max_score = std::max(max_score, idx_score_state[static_cast<size_t>(t) * idx_head_dim + d]);
-                        float denom = 0.0f;
-                        for (int t = 0; t < pool_slots; ++t) denom += std::exp(idx_score_state[static_cast<size_t>(t) * idx_head_dim + d] - max_score);
-                        for (int t = 0; t < pool_slots; ++t) {
-                            const float w = std::exp(idx_score_state[static_cast<size_t>(t) * idx_head_dim + d] - max_score) / denom;
-                            pooled[d] += w * idx_kv_state[static_cast<size_t>(t) * idx_head_dim + d];
-                        }
-                    }
-                    pooled = rmsnorm_cpu(pooled, reinterpret_cast<const uint16_t*>(idx_shard.tensor_data(*idx_comp_norm)), 1e-6f);
                     float* d_idx_cache = ctx.indexer_kv_cache_for_layer(li, idx_head_dim);
-                    check_cuda(cudaMemcpy(d_idx_cache + static_cast<size_t>(position / 4) * idx_head_dim, pooled.data(), static_cast<size_t>(idx_head_dim) * sizeof(float), cudaMemcpyHostToDevice), "copy indexer compressed kv");
-                    if (idx_overlap) {
-                        std::copy(idx_kv_state.begin() + static_cast<size_t>(4) * idx_head_dim, idx_kv_state.end(), idx_kv_state.begin());
-                        std::copy(idx_score_state.begin() + static_cast<size_t>(4) * idx_head_dim, idx_score_state.end(), idx_score_state.begin());
+                    float* d_idx_slot = d_idx_cache + static_cast<size_t>(position / 4) * idx_head_dim;
+                    if (!compressor_pool_cuda(idx_state.kv, idx_state.score, d_idx_slot, 4, idx_head_dim, idx_state_cols, idx_overlap)) throw std::runtime_error("indexer compressor pool launch failed");
+                    if (!rmsnorm_bf16_gamma_cuda(d_idx_slot, idx_comp_cache.norm, d_idx_slot, idx_head_dim, 1e-6f)) throw std::runtime_error("indexer compressed kv norm launch failed");
+                    const float comp_rope_theta = static_cast<float>(config.compress_rope_theta == 0 ? 160000 : config.compress_rope_theta);
+                    const float* comp_freqs = ctx.rope_inv_freqs_for(li, true, attn_dims.rope_dim, comp_rope_theta);
+                    if (!head_rmsnorm_rope_freqs_cuda(d_idx_slot, comp_freqs, 1, idx_head_dim, attn_dims.rope_dim, position + 1 - 4, false, 0.0f)) throw std::runtime_error("indexer compressed kv rope failed");
+                    if (!hadamard128_rows_cuda(d_idx_slot, d_idx_slot, 1)) throw std::runtime_error("indexer compressed kv hadamard failed");
+                    if (!fp4_fake_quant128_rows_cuda(d_idx_slot, 1)) throw std::runtime_error("indexer compressed kv fp4 quant failed");
+                    if (debug_forward) {
+                        std::vector<float> idx_slot(idx_head_dim);
+                        check_cuda(cudaMemcpy(idx_slot.data(), d_idx_slot, static_cast<size_t>(idx_head_dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy indexer compressed kv debug");
+                        print_summary("layer=" + std::to_string(li) + ".indexer_compressed_kv", idx_slot);
                     }
+                    if (idx_overlap && !compressor_shift_overlap_state_cuda(idx_state.kv, idx_state.score, 4, idx_state_cols)) throw std::runtime_error("indexer compressor state shift launch failed");
                 }
-                if (!rmsnorm_bf16_gamma_cuda(d_x, d_attn_gamma, d_attn_norm, dim, 1e-6f)) throw std::runtime_error("indexer attn norm launch failed");
-                if (!fp8_e4m3_e8m0_matvec_cuda(d_attn_norm, d_wq_a, d_wq_a_scale, d_q_a, attn_dims.q_a_dim, dim)) throw std::runtime_error("indexer wq_a launch failed");
-                if (!rmsnorm_bf16_gamma_cuda(d_q_a, d_q_gamma, d_q_norm, attn_dims.q_a_dim, 1e-6f)) throw std::runtime_error("indexer q norm launch failed");
-                check_cuda(cudaMemcpy(d_w2, idx_shard.tensor_data(*idx_wq_b), idx_wq_b->nbytes, cudaMemcpyHostToDevice), "copy indexer wq_b");
-                check_cuda(cudaMemcpy(d_s2, idx_shard.tensor_data(*idx_wq_b_scale), idx_wq_b_scale->nbytes, cudaMemcpyHostToDevice), "copy indexer wq_b scale");
-                if (!fp8_e4m3_e8m0_matvec_cuda(d_q_norm, d_w2, d_s2, d_index_q, idx_heads * idx_head_dim, attn_dims.q_a_dim)) throw std::runtime_error("indexer wq_b launch failed");
-                if (!head_rmsnorm_rope_cuda(d_index_q, idx_heads, idx_head_dim, attn_dims.rope_dim, position, attn_dims.rope_theta, false, 1e-6f)) throw std::runtime_error("indexer q rope launch failed");
+                route_indexer_comp_ms += elapsed_ms(route_stage_t, Clock::now());
+                route_stage_t = Clock::now();
+                if (!rmsnorm_bf16_gamma_cuda(d_x, attn_cache.attn_norm, d_attn_norm, dim, 1e-6f)) throw std::runtime_error("indexer attn norm launch failed");
+                if (!fp8_e4m3_e8m0_matvec_cuda(d_attn_norm, attn_cache.wq_a, attn_cache.wq_a_scale, d_q_a, attn_dims.q_a_dim, dim)) throw std::runtime_error("indexer wq_a launch failed");
+                if (!rmsnorm_bf16_gamma_cuda(d_q_a, attn_cache.q_norm, d_q_norm, attn_dims.q_a_dim, 1e-6f)) throw std::runtime_error("indexer q norm launch failed");
+                DeviceIndexerCache& idx_cache = ctx.indexer_device_cache(li);
+                if (!fp8_e4m3_e8m0_matvec_cuda(d_q_norm, idx_cache.wq_b, idx_cache.wq_b_scale, d_index_q, idx_heads * idx_head_dim, attn_dims.q_a_dim)) throw std::runtime_error("indexer wq_b launch failed");
+                {
+                    const float* idx_freqs = attn_dims.d_inv_freqs;
+                    if (idx_freqs == nullptr) throw std::runtime_error("missing indexer rope freqs");
+                    if (!head_rmsnorm_rope_freqs_cuda(d_index_q, idx_freqs, idx_heads, idx_head_dim, attn_dims.rope_dim, position, false, 0.0f)) throw std::runtime_error("indexer q rope launch failed");
+                }
+                if (!hadamard128_rows_cuda(d_index_q, d_index_q, idx_heads)) throw std::runtime_error("indexer q hadamard launch failed");
+                if (!fp4_fake_quant128_rows_cuda(d_index_q, idx_heads)) throw std::runtime_error("indexer q fp4 quant launch failed");
+                route_indexer_q_ms += elapsed_ms(route_stage_t, Clock::now());
+                route_stage_t = Clock::now();
                 const int keep = std::min<int>(compressed_ready, std::max<uint64_t>(1, config.index_topk));
-                check_cuda(cudaMemcpy(d_index_weight_proj, idx_shard.tensor_data(*idx_weights), idx_weights->nbytes, cudaMemcpyHostToDevice), "copy indexer weights proj");
                 if (!indexer_select_topk_cuda(
                         d_index_q,
                         ctx.indexer_kv_cache_for_layer(li, idx_head_dim),
-                        d_index_weight_proj,
+                        idx_cache.weights_proj,
                         d_x,
+                        d_index_scores,
                         d_index_selected,
                         compressed_ready,
                         keep,
@@ -1851,6 +2205,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                 }
                 std::vector<int> selected(keep);
                 check_cuda(cudaMemcpy(selected.data(), d_index_selected, selected.size() * sizeof(int), cudaMemcpyDeviceToHost), "copy indexer selected");
+                route_indexer_topk_ms += elapsed_ms(route_stage_t, Clock::now());
                 kv_indices.insert(kv_indices.end(), selected.begin(), selected.end());
             } else {
                 for (int c = 0; c < compressed_ready; ++c) {
@@ -1859,6 +2214,11 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                 }
             }
             if (!kv_indices.empty()) check_cuda(cudaMemcpy(d_kv_indices, kv_indices.data(), kv_indices.size() * sizeof(int), cudaMemcpyHostToDevice), "copy kv indices");
+            if (debug_forward) {
+                std::cout << "CPP layer=" << li << ".kv_indices count=" << kv_indices.size();
+                for (int idx : kv_indices) std::cout << ' ' << idx;
+                std::cout << "\n";
+            }
         }
 
         route_ms += elapsed_ms(stage_t, Clock::now());
@@ -1866,15 +2226,15 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         if (!run_single_token_attention_smoke(
                 attn_dims,
                 d_x,
-                d_attn_gamma,
+                attn_cache.attn_norm,
                 attn_cache.wq_a,
                 attn_cache.wq_a_scale,
-                d_q_gamma,
+                attn_cache.q_norm,
                 attn_cache.wq_b,
                 attn_cache.wq_b_scale,
                 attn_cache.wkv,
                 attn_cache.wkv_scale,
-                d_kv_gamma,
+                attn_cache.kv_norm,
                 attn_cache.wo_a,
                 attn_cache.wo_a_scale,
                 attn_cache.wo_b,
@@ -1898,64 +2258,58 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
 #ifdef DSV4_HAVE_NCCL
         if (ctx.options.tp_world > 1) {
             if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP attention all-reduce requires --nccl-id-path");
-            nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_attn_out, dim);
+            all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_attn_out, dim, bf16_reduce_scratch);
         }
 #endif
-        check_cuda(cudaMemcpy(host_x.data(), d_attn_out, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy attn out host");
         attn_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
-        if (debug_forward) print_summary("layer=" + std::to_string(li) + ".attn_out", host_x);
-        h4 = hc_post_cpu(host_x, h4, attn_hc, dim);
-        round_vector_to_bf16(h4);
+        if (debug_forward) {
+            check_cuda(cudaMemcpy(host_x.data(), d_attn_out, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy attn out debug");
+            print_summary("layer=" + std::to_string(li) + ".attn_out", host_x);
+        }
+        if (!hc_post_float_cuda(d_attn_out, d_h4, d_hc_post, d_hc_comb, d_h4_next, dim)) throw std::runtime_error("hc attn post launch failed");
+        if (!fp32_to_bf16_cuda(d_h4_next, d_h4_bf16, 4 * dim)) throw std::runtime_error("hc attn post bf16 round failed");
+        if (!bf16_to_fp32_cuda(d_h4_bf16, d_h4, 4 * dim)) throw std::runtime_error("hc attn post bf16 restore failed");
         post_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
-        if (debug_forward) print_summary("layer=" + std::to_string(li) + ".attn_post", h4);
-        const HcPreResult ffn_hc = hc_pre_cpu(
-            h4,
-            reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_ffn_fn)),
-            reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_ffn_scale)),
-            reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_ffn_base)),
-            dim);
-        if (debug_forward) print_summary("layer=" + std::to_string(li) + ".ffn_hc_pre", ffn_hc.x);
-        check_cuda(cudaMemcpy(d_resid1, ffn_hc.x.data(), static_cast<size_t>(dim) * sizeof(float), cudaMemcpyHostToDevice), "copy hc ffn pre");
-        if (!rmsnorm_bf16_gamma_cuda(d_resid1, d_ffn_gamma, d_ffn_norm, dim, 1e-6f)) throw std::runtime_error("ffn norm launch failed");
+        if (debug_forward) {
+            check_cuda(cudaMemcpy(h4.data(), d_h4, static_cast<size_t>(4) * dim * sizeof(float), cudaMemcpyDeviceToHost), "copy attn post debug");
+            print_summary("layer=" + std::to_string(li) + ".attn_post", h4);
+        }
+        if (!hc_pre_float_cuda(d_h4, hc_cache.ffn_fn, hc_cache.ffn_scale, hc_cache.ffn_base, d_resid1, d_hc_post, d_hc_comb, dim)) throw std::runtime_error("hc ffn pre launch failed");
+        if (debug_forward) {
+            check_cuda(cudaMemcpy(host_x.data(), d_resid1, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy ffn hc pre debug");
+            print_summary("layer=" + std::to_string(li) + ".ffn_hc_pre", host_x);
+        }
+        if (!rmsnorm_bf16_gamma_cuda(d_resid1, attn_cache.ffn_norm, d_ffn_norm, dim, 1e-6f)) throw std::runtime_error("ffn norm launch failed");
         const int route_count = static_cast<int>(std::min<uint64_t>(config.n_activated_experts, config.n_routed_experts));
         std::vector<RoutedExpert> routed;
         std::vector<int64_t> selected_route_ids;
-        std::vector<float> selected_route_weights;
-        if (static_cast<uint64_t>(li) < config.n_hash_layers && index.shard_for_tensor(prefix + "ffn.gate.tid2eid") != nullptr) {
-            std::vector<float> ffn_norm_host(dim);
-            check_cuda(cudaMemcpy(ffn_norm_host.data(), d_ffn_norm, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy ffn norm for hash gate");
-            const auto selected = select_smoke_experts(index, prefix, li, token, ffn_norm_host, config.n_hash_layers, config.n_routed_experts, config.n_activated_experts, static_cast<float>(config.route_scale));
-            selected_route_ids.reserve(selected.size());
-            selected_route_weights.reserve(selected.size());
-            for (const RoutedExpert& route : selected) {
-                selected_route_ids.push_back(route.id);
-                selected_route_weights.push_back(route.weight);
-            }
+        route_stage_t = Clock::now();
+        DeviceGateCache& gate = ctx.gate_device_cache(li);
+        if (static_cast<uint64_t>(li) < config.n_hash_layers && gate.tid2eid != nullptr) {
+            if (!gate_hash_bf16_cuda(d_ffn_norm, gate.weight, gate.tid2eid, gate.original, d_route_indices, d_route_weights, token, gate.dim, gate.hash_topk, route_count, static_cast<float>(config.route_scale))) throw std::runtime_error("hash gate launch failed");
         } else {
-            DeviceGateCache& gate = ctx.gate_device_cache(li);
             if (!gate_topk_bf16_cuda_with_buffers(d_ffn_norm, gate.weight, gate.bias, gate.original, gate.scored, d_route_indices, d_route_weights, gate.experts, gate.dim, route_count, static_cast<float>(config.route_scale))) throw std::runtime_error("gate topk launch failed");
-            selected_route_ids.resize(route_count);
-            selected_route_weights.resize(route_count);
-            check_cuda(cudaMemcpy(selected_route_ids.data(), d_route_indices, selected_route_ids.size() * sizeof(int64_t), cudaMemcpyDeviceToHost), "copy gate route ids");
-            check_cuda(cudaMemcpy(selected_route_weights.data(), d_route_weights, selected_route_weights.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy gate route weights");
         }
+        selected_route_ids.resize(route_count);
+        check_cuda(cudaMemcpy(selected_route_ids.data(), d_route_indices, selected_route_ids.size() * sizeof(int64_t), cudaMemcpyDeviceToHost), "copy gate route ids");
+        route_gate_ms += elapsed_ms(route_stage_t, Clock::now());
         routed.reserve(selected_route_ids.size());
-        for (size_t ri = 0; ri < selected_route_ids.size(); ++ri) routed.push_back(RoutedExpert{static_cast<int>(selected_route_ids[ri]), selected_route_weights[ri]});
+        for (int64_t route_id : selected_route_ids) routed.push_back(RoutedExpert{static_cast<int>(route_id), 0.0f});
         route_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
         check_cuda(cudaMemset(d_moe, 0, static_cast<size_t>(dim) * sizeof(float)), "zero moe");
+        moe_stage_ms += elapsed_ms(stage_t, Clock::now());
+        stage_t = Clock::now();
         const int experts_per_rank = ctx.options.tp_world > 1 ? static_cast<int>(config.n_routed_experts / ctx.options.tp_world) : static_cast<int>(config.n_routed_experts);
         const int expert_start = ctx.options.tp_rank * experts_per_rank;
         const int expert_end = ctx.options.tp_world > 1 ? expert_start + experts_per_rank : static_cast<int>(config.n_routed_experts);
         std::vector<int64_t> route_indices;
-        std::vector<float> route_weights;
         std::vector<Fp4View> active_w1;
         std::vector<Fp4View> active_w2;
         std::vector<Fp4View> active_w3;
         route_indices.reserve(routed.size());
-        route_weights.reserve(routed.size());
         active_w1.reserve(routed.size());
         active_w2.reserve(routed.size());
         active_w3.reserve(routed.size());
@@ -1963,13 +2317,14 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         for (const RoutedExpert& route : routed) {
             if (ctx.options.tp_world > 1 && (route.id < expert_start || route.id >= expert_end)) continue;
             route_indices.push_back(route.id);
-            route_weights.push_back(route.weight);
             active_local_ids.push_back(route.id - expert_start);
             active_w1.push_back(ctx.fp4_view(prefix + "ffn.experts." + std::to_string(route.id) + ".w1.weight"));
             active_w2.push_back(ctx.fp4_view(prefix + "ffn.experts." + std::to_string(route.id) + ".w2.weight"));
             active_w3.push_back(ctx.fp4_view(prefix + "ffn.experts." + std::to_string(route.id) + ".w3.weight"));
         }
-        if (!active_w1.empty()) {
+        bool has_active_moe = !active_w1.empty();
+        DeviceFp4ActiveArena* active_arena = nullptr;
+        if (has_active_moe) {
             DeviceFp4ExpertCache sample;
             sample.w1_bytes = active_w1.front().w->nbytes;
             sample.s1_bytes = active_w1.front().s->nbytes;
@@ -1977,56 +2332,65 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             sample.s2_bytes = active_w2.front().s->nbytes;
             sample.w3_bytes = active_w3.front().w->nbytes;
             sample.s3_bytes = active_w3.front().s->nbytes;
-            DeviceFp4ActiveArena& arena = ctx.active_fp4_arena(li, tp_world, tp_rank, experts_per_rank, sample);
+            active_arena = &ctx.active_fp4_arena(li, tp_world, tp_rank, experts_per_rank, sample);
+            if (moe_stage_event_recorded) check_cuda(cudaStreamWaitEvent(moe_copy_stream, moe_stage_event, 0), "wait prior moe stage event");
             for (size_t ri = 0; ri < active_w1.size(); ++ri) {
                 const int local = active_local_ids[ri];
-                if (arena.staged_local.insert(local).second) {
+                if (active_arena->staged_local.insert(local).second) {
                     HostFp4ExpertSlot& slot = ctx.host_fp4_slot(li, expert_start + local, active_w1[ri], active_w2[ri], active_w3[ri]);
-                    check_cuda(cudaMemcpyAsync(arena.w1 + static_cast<size_t>(local) * arena.w1_bytes, slot.h_w1q, arena.w1_bytes, cudaMemcpyHostToDevice), "stage active w1");
-                    check_cuda(cudaMemcpyAsync(arena.s1 + static_cast<size_t>(local) * arena.s1_bytes, slot.h_w1s, arena.s1_bytes, cudaMemcpyHostToDevice), "stage active s1");
-                    check_cuda(cudaMemcpyAsync(arena.w2 + static_cast<size_t>(local) * arena.w2_bytes, slot.h_w2q, arena.w2_bytes, cudaMemcpyHostToDevice), "stage active w2");
-                    check_cuda(cudaMemcpyAsync(arena.s2 + static_cast<size_t>(local) * arena.s2_bytes, slot.h_w2s, arena.s2_bytes, cudaMemcpyHostToDevice), "stage active s2");
-                    check_cuda(cudaMemcpyAsync(arena.w3 + static_cast<size_t>(local) * arena.w3_bytes, slot.h_w3q, arena.w3_bytes, cudaMemcpyHostToDevice), "stage active w3");
-                    check_cuda(cudaMemcpyAsync(arena.s3 + static_cast<size_t>(local) * arena.s3_bytes, slot.h_w3s, arena.s3_bytes, cudaMemcpyHostToDevice), "stage active s3");
+                    check_cuda(cudaMemcpyAsync(active_arena->w1 + static_cast<size_t>(local) * active_arena->w1_bytes, slot.h_w1q, active_arena->w1_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active w1");
+                    check_cuda(cudaMemcpyAsync(active_arena->s1 + static_cast<size_t>(local) * active_arena->s1_bytes, slot.h_w1s, active_arena->s1_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active s1");
+                    check_cuda(cudaMemcpyAsync(active_arena->w2 + static_cast<size_t>(local) * active_arena->w2_bytes, slot.h_w2q, active_arena->w2_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active w2");
+                    check_cuda(cudaMemcpyAsync(active_arena->s2 + static_cast<size_t>(local) * active_arena->s2_bytes, slot.h_w2s, active_arena->s2_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active s2");
+                    check_cuda(cudaMemcpyAsync(active_arena->w3 + static_cast<size_t>(local) * active_arena->w3_bytes, slot.h_w3q, active_arena->w3_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active w3");
+                    check_cuda(cudaMemcpyAsync(active_arena->s3 + static_cast<size_t>(local) * active_arena->s3_bytes, slot.h_w3s, active_arena->s3_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active s3");
                 }
             }
-            check_cuda(cudaMemcpy(d_route_indices, route_indices.data(), route_indices.size() * sizeof(int64_t), cudaMemcpyHostToDevice), "copy active route indices");
-            check_cuda(cudaMemcpy(d_route_weights, route_weights.data(), route_weights.size() * sizeof(float), cudaMemcpyHostToDevice), "copy active route weights");
-            if (!moe_single_token_fp4_cuda(d_ffn_norm, d_route_indices, d_route_weights, arena.w1, arena.s1, arena.w2, arena.s2, arena.w3, arena.s3, d_resid2, static_cast<int>(route_indices.size()), expert_start, experts_per_rank, dim, inter, static_cast<float>(config.swiglu_limit))) {
-                throw std::runtime_error("active fp4 moe launch failed");
-            }
-            if (!vector_accum_cuda(d_resid2, d_moe, dim, 1.0f)) throw std::runtime_error("moe accum failed");
+            check_cuda(cudaMemcpyAsync(d_route_indices, route_indices.data(), route_indices.size() * sizeof(int64_t), cudaMemcpyHostToDevice, moe_copy_stream), "copy active route indices");
+            check_cuda(cudaEventRecord(moe_stage_event, moe_copy_stream), "record moe stage event");
+            moe_stage_event_recorded = true;
         }
-#ifdef DSV4_HAVE_NCCL
-        if (ctx.options.tp_world > 1) {
-            if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP MoE all-reduce requires --nccl-id-path");
-            nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_moe, dim);
-        }
-#endif
-        moe_ms += elapsed_ms(stage_t, Clock::now());
+        moe_stage_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
         {
             DeviceSharedCache& shared = ctx.shared_device_cache(li, tp_world, tp_rank, dim);
             const int shared_inter = inter;
-            const int local_shared_inter = shared_inter / tp_world;
-            if (!fp8_e4m3_e8m0_matvec_cuda(d_ffn_norm, shared.w1, shared.s1, d_gate, local_shared_inter, dim)) throw std::runtime_error("shared w1 launch failed");
-            if (!fp8_e4m3_e8m0_matvec_cuda(d_ffn_norm, shared.w3, shared.s3, d_up, local_shared_inter, dim)) throw std::runtime_error("shared w3 launch failed");
-            if (!silu_mul_cuda(d_gate, d_up, d_hidden, local_shared_inter)) throw std::runtime_error("shared silu launch failed");
-            if (!fp8_e4m3_e8m0_matvec_cuda(d_hidden, shared.w2, shared.s2, d_resid2, dim, local_shared_inter)) throw std::runtime_error("shared w2 launch failed");
-#ifdef DSV4_HAVE_NCCL
-            if (ctx.options.tp_world > 1) {
-                if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP shared expert all-reduce requires --nccl-id-path");
-                nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_resid2, dim);
-            }
-#endif
-            if (!vector_accum_cuda(d_resid2, d_moe, dim, 1.0f)) throw std::runtime_error("shared accum failed");
+            if (!fp8_e4m3_e8m0_matvec_cuda(d_ffn_norm, shared.w1, shared.s1, d_gate, shared_inter, dim)) throw std::runtime_error("shared w1 launch failed");
+            if (!fp8_e4m3_e8m0_matvec_cuda(d_ffn_norm, shared.w3, shared.s3, d_up, shared_inter, dim)) throw std::runtime_error("shared w3 launch failed");
+            if (!silu_mul_cuda(d_gate, d_up, d_hidden, shared_inter)) throw std::runtime_error("shared silu launch failed");
+            if (!fp8_e4m3_e8m0_matvec_cuda(d_hidden, shared.w2, shared.s2, d_shared_out, dim, shared_inter)) throw std::runtime_error("shared w2 launch failed");
         }
         shared_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
-        check_cuda(cudaMemcpy(host_x.data(), d_moe, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy moe host");
-        if (debug_forward) print_summary("layer=" + std::to_string(li) + ".moe_out", host_x);
-        h4 = hc_post_cpu(host_x, h4, ffn_hc, dim);
-        round_vector_to_bf16(h4);
+        if (has_active_moe) {
+            check_cuda(cudaStreamWaitEvent(nullptr, moe_stage_event, 0), "wait active moe stage");
+            DeviceMoeDecodeWorkspace& moe_workspace = ctx.moe_decode_workspace(route_count, dim, inter);
+            if (!moe_single_token_fp4_cuda_with_workspace(d_ffn_norm, d_route_indices, d_route_weights, active_arena->w1, active_arena->s1, active_arena->w2, active_arena->s2, active_arena->w3, active_arena->s3, d_resid2, route_count, expert_start, experts_per_rank, dim, inter, static_cast<float>(config.swiglu_limit), moe_workspace.fp4)) {
+                throw std::runtime_error("active fp4 moe launch failed");
+            }
+            if (!vector_accum_cuda(d_resid2, d_moe, dim, 1.0f)) throw std::runtime_error("moe accum failed");
+        }
+        moe_kernel_ms += elapsed_ms(stage_t, Clock::now());
+        stage_t = Clock::now();
+#ifdef DSV4_HAVE_NCCL
+        if (ctx.options.tp_world > 1) {
+            if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP MoE all-reduce requires --nccl-id-path");
+            all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_moe, dim, bf16_reduce_scratch);
+        }
+#endif
+        moe_reduce_ms += elapsed_ms(stage_t, Clock::now());
+        moe_ms += moe_stage_ms + moe_kernel_ms + moe_reduce_ms;
+        stage_t = Clock::now();
+        if (!vector_accum_cuda(d_shared_out, d_moe, dim, 1.0f)) throw std::runtime_error("shared accum failed");
+        shared_ms += elapsed_ms(stage_t, Clock::now());
+        stage_t = Clock::now();
+        if (debug_forward) {
+            check_cuda(cudaMemcpy(host_x.data(), d_moe, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy moe debug");
+            print_summary("layer=" + std::to_string(li) + ".moe_out", host_x);
+        }
+        if (!hc_post_float_cuda(d_moe, d_h4, d_hc_post, d_hc_comb, d_h4_next, dim)) throw std::runtime_error("hc ffn post launch failed");
+        if (!fp32_to_bf16_cuda(d_h4_next, d_h4_bf16, 4 * dim)) throw std::runtime_error("hc ffn post bf16 round failed");
+        if (!bf16_to_fp32_cuda(d_h4_bf16, d_h4, 4 * dim)) throw std::runtime_error("hc ffn post bf16 restore failed");
         post_ms += elapsed_ms(stage_t, Clock::now());
         if (profile_forward) {
             const double layer_ms = elapsed_ms(layer_t0, Clock::now());
@@ -2036,7 +2400,15 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                       << " hc_ms=" << hc_ms
                       << " attn_ms=" << attn_ms
                       << " route_ms=" << route_ms
+                      << " route_comp_ms=" << route_comp_ms
+                      << " route_indexer_comp_ms=" << route_indexer_comp_ms
+                      << " route_indexer_q_ms=" << route_indexer_q_ms
+                      << " route_indexer_topk_ms=" << route_indexer_topk_ms
+                      << " route_gate_ms=" << route_gate_ms
                       << " moe_ms=" << moe_ms
+                      << " moe_stage_ms=" << moe_stage_ms
+                      << " moe_kernel_ms=" << moe_kernel_ms
+                      << " moe_reduce_ms=" << moe_reduce_ms
                       << " shared_ms=" << shared_ms
                       << " post_ms=" << post_ms << "\n";
         }
@@ -2044,10 +2416,21 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         total_hc_ms += hc_ms;
         total_attn_ms += attn_ms;
         total_route_ms += route_ms;
+        total_route_comp_ms += route_comp_ms;
+        total_route_indexer_comp_ms += route_indexer_comp_ms;
+        total_route_indexer_q_ms += route_indexer_q_ms;
+        total_route_indexer_topk_ms += route_indexer_topk_ms;
+        total_route_gate_ms += route_gate_ms;
         total_moe_ms += moe_ms;
+        total_moe_stage_ms += moe_stage_ms;
+        total_moe_kernel_ms += moe_kernel_ms;
+        total_moe_reduce_ms += moe_reduce_ms;
         total_shared_ms += shared_ms;
         total_post_ms += post_ms;
-        if (debug_forward) print_summary("layer=" + std::to_string(li), h4);
+        if (debug_forward) {
+            check_cuda(cudaMemcpy(h4.data(), d_h4, static_cast<size_t>(4) * dim * sizeof(float), cudaMemcpyDeviceToHost), "copy layer h4 debug");
+            print_summary("layer=" + std::to_string(li), h4);
+        }
     }
 
     if (profile_forward) {
@@ -2055,10 +2438,19 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                   << " hc_ms=" << total_hc_ms
                   << " attn_ms=" << total_attn_ms
                   << " route_ms=" << total_route_ms
+                  << " route_comp_ms=" << total_route_comp_ms
+                  << " route_indexer_comp_ms=" << total_route_indexer_comp_ms
+                  << " route_indexer_q_ms=" << total_route_indexer_q_ms
+                  << " route_indexer_topk_ms=" << total_route_indexer_topk_ms
+                  << " route_gate_ms=" << total_route_gate_ms
                   << " moe_ms=" << total_moe_ms
+                  << " moe_stage_ms=" << total_moe_stage_ms
+                  << " moe_kernel_ms=" << total_moe_kernel_ms
+                  << " moe_reduce_ms=" << total_moe_reduce_ms
                   << " shared_ms=" << total_shared_ms
                   << " post_ms=" << total_post_ms << "\n";
     }
+    check_cuda(cudaMemcpy(h4.data(), d_h4, static_cast<size_t>(4) * dim * sizeof(float), cudaMemcpyDeviceToHost), "copy final hc h4");
     if (debug_forward) print_summary("final_h", h4);
     host_x = hc_head_cpu(
         h4,
@@ -2087,21 +2479,6 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     if (!std::isfinite(checksum) || !std::isfinite(top_logit)) throw std::runtime_error("non-finite smoke logits");
 
     cudaFree(d_embed);
-    cudaFree(d_attn_gamma);
-    cudaFree(d_wq_a);
-    cudaFree(d_wq_a_scale);
-    cudaFree(d_q_gamma);
-    cudaFree(d_wq_b);
-    cudaFree(d_wq_b_scale);
-    cudaFree(d_wkv);
-    cudaFree(d_wkv_scale);
-    cudaFree(d_kv_gamma);
-    cudaFree(d_wo_a);
-    cudaFree(d_wo_a_scale);
-    cudaFree(d_wo_b);
-    cudaFree(d_wo_b_scale);
-    cudaFree(d_attn_sink);
-    cudaFree(d_ffn_gamma);
     cudaFree(d_w1);
     cudaFree(d_s1);
     cudaFree(d_w2);
@@ -2111,6 +2488,11 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     cudaFree(d_head);
     cudaFree(d_final_norm_gamma);
     cudaFree(d_x);
+    cudaFree(d_h4);
+    cudaFree(d_h4_next);
+    cudaFree(d_h4_bf16);
+    cudaFree(d_hc_post);
+    cudaFree(d_hc_comb);
     cudaFree(d_attn_norm);
     cudaFree(d_q_a);
     cudaFree(d_q_norm);
@@ -2120,10 +2502,17 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     cudaFree(d_attn_value);
     cudaFree(d_attn_mid);
     cudaFree(d_attn_out);
+    cudaFree(d_compressor_input_bf16);
+    cudaFree(d_compressor_input_rounded);
+    cudaFree(d_compressor_kv);
+    cudaFree(d_compressor_score);
+    cudaFree(d_indexer_comp_kv);
+    cudaFree(d_indexer_comp_score);
     cudaFree(d_index_q);
     cudaFree(d_indexer_kv);
     cudaFree(d_index_weight_proj);
     cudaFree(d_index_selected);
+    cudaFree(d_index_scores);
     cudaFree(d_kv_indices);
     cudaFree(d_resid1);
     cudaFree(d_ffn_norm);
@@ -2132,9 +2521,13 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     cudaFree(d_hidden);
     cudaFree(d_moe);
     cudaFree(d_resid2);
+    cudaFree(d_shared_out);
     cudaFree(d_route_indices);
     cudaFree(d_route_weights);
     cudaFree(d_logits);
+
+    cudaEventDestroy(moe_stage_event);
+    cudaStreamDestroy(moe_copy_stream);
 
     return ForwardSmokeResult{token, dim, inter, head_rows, layer_count, top_token, top_logit, checksum};
 }

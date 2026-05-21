@@ -106,7 +106,12 @@ void nccl_all_reduce_sum_float_inplace(int world, int rank, int device, const ch
     if (world <= 0 || rank < 0 || rank >= world || d_values == nullptr || count <= 0) throw std::runtime_error("invalid NCCL all-reduce args");
     ncclComm_t comm = cached_comm(world, rank, device, id_path);
     check_nccl(ncclAllReduce(d_values, d_values, count, ncclFloat, ncclSum, comm, nullptr), "ncclAllReduce inplace");
-    check_cuda(cudaDeviceSynchronize(), "sync all-reduce inplace");
+}
+
+void nccl_all_reduce_sum_bf16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count) {
+    if (world <= 0 || rank < 0 || rank >= world || d_values == nullptr || count <= 0) throw std::runtime_error("invalid NCCL bf16 all-reduce args");
+    ncclComm_t comm = cached_comm(world, rank, device, id_path);
+    check_nccl(ncclAllReduce(d_values, d_values, count, ncclBfloat16, ncclSum, comm, nullptr), "ncclAllReduce bf16 inplace");
 }
 
 TpTopResult nccl_global_top1(int world, int rank, int device, const char* id_path, int local_token, float local_logit) {

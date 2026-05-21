@@ -7,7 +7,9 @@
 
 #include <cuda_runtime.h>
 #include <chrono>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
@@ -19,6 +21,8 @@ struct Args {
     std::string ckpt;
     std::string inspect_tensor;
     std::string prompt;
+    std::string token_ids_csv;
+    std::string token_ids_file;
     int smoke_layers = 1;
     int forward_token = -1;
     int position = 0;
@@ -79,6 +83,12 @@ Args parse_args(int argc, char** argv) {
         } else if (arg == "--prompt" && i + 1 < argc) {
             args.smoke_forward = true;
             args.prompt = argv[++i];
+        } else if (arg == "--token-ids" && i + 1 < argc) {
+            args.smoke_forward = true;
+            args.token_ids_csv = argv[++i];
+        } else if (arg == "--token-ids-file" && i + 1 < argc) {
+            args.smoke_forward = true;
+            args.token_ids_file = argv[++i];
         } else if (arg == "--tokens" && i + 1 < argc) {
             ++i;
         } else if (arg == "--max-new-tokens" && i + 1 < argc) {
@@ -105,6 +115,30 @@ Args parse_args(int argc, char** argv) {
         throw std::runtime_error("--model or --ckpt is required");
     }
     return args;
+}
+
+
+std::vector<int> parse_token_ids_csv(const std::string& text) {
+    std::vector<int> out;
+    std::stringstream ss(text);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        if (item.empty()) continue;
+        out.push_back(std::stoi(item));
+    }
+    return out;
+}
+
+std::vector<int> load_token_ids(const Args& args) {
+    if (!args.token_ids_csv.empty()) return parse_token_ids_csv(args.token_ids_csv);
+    if (!args.token_ids_file.empty()) {
+        std::ifstream in(args.token_ids_file);
+        if (!in) throw std::runtime_error("failed to open token ids file: " + args.token_ids_file);
+        std::stringstream buf;
+        buf << in.rdbuf();
+        return parse_token_ids_csv(buf.str());
+    }
+    return {};
 }
 
 void print_safe_tensor(const dsv4::SafeTensorInfo& info, const std::string& shard) {
@@ -150,7 +184,15 @@ int main(int argc, char** argv) {
             }
             if (args.smoke_forward) {
                 dsv4::Tokenizer tokenizer(args.ckpt);
-                std::vector<int> prompt_ids;
+                std::vector<int> prompt_ids = load_token_ids(args);
+                if (!prompt_ids.empty()) {
+                    args.forward_token = prompt_ids.back();
+                    args.position = static_cast<int>(prompt_ids.size()) - 1;
+                    std::cout << "prompt_tokens=" << prompt_ids.size()
+                              << " last_token=" << args.forward_token
+                              << " position=" << args.position
+                              << " token_ids_source=" << (args.token_ids_csv.empty() ? "file" : "csv") << "\n";
+                }
                 if (!args.prompt.empty()) {
                     prompt_ids = tokenizer.encode_basic(args.prompt, false);
                     if (prompt_ids.empty()) throw std::runtime_error("prompt encoded to no tokens");
@@ -225,12 +267,21 @@ int main(int argc, char** argv) {
                     }
                     if (args.resident_bench) {
                         const double wall = timed.wall_seconds;
+                        const double prefill = timed.prefill_seconds;
+                        const double decode = timed.decode_seconds;
+                        const double prefill_tps = prefill > 0.0 ? static_cast<double>(timed.prompt_tokens) / prefill : 0.0;
+                        const double decode_tps = decode > 0.0 ? static_cast<double>(timed.decode_tokens) / decode : 0.0;
                         const double tokens = static_cast<double>(prompt_ids.size() + results.size());
                         const double tps = wall > 0.0 ? tokens / wall : 0.0;
                         std::cout << "resident_bench=1 prompt_tokens=" << prompt_ids.size()
                                   << " generated_tokens=" << results.size()
                                   << " wall=" << wall
                                   << " tokens_per_s=" << tps
+                                  << " prefill_seconds=" << prefill
+                                  << " prefill_tokens_per_s=" << prefill_tps
+                                  << " decode_seconds=" << decode
+                                  << " decode_tokens_per_s=" << decode_tps
+                                  << " decode_token_count=" << timed.decode_tokens
                                   << " tp_world=" << args.tp_world
                                   << " tp_rank=" << args.tp_rank << "\n";
                     }

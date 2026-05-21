@@ -44,6 +44,44 @@ __global__ void bf16_matvec_kernel(const float* x, const uint16_t* w, float* y, 
     if (threadIdx.x == 0) y[row] = scratch[0];
 }
 
+__global__ void bf16_dual_matvec_kernel(const float* x, const uint16_t* w_a, const uint16_t* w_b, float* y_a, float* y_b, int rows, int cols) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    float sum_a = 0.0f;
+    float sum_b = 0.0f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        const float xv = x[c];
+        const size_t idx = static_cast<size_t>(row) * cols + c;
+        sum_a += bf16_to_float(w_a[idx]) * xv;
+        sum_b += bf16_to_float(w_b[idx]) * xv;
+    }
+    extern __shared__ float scratch[];
+    float* scratch_a = scratch;
+    float* scratch_b = scratch + blockDim.x;
+    scratch_a[threadIdx.x] = sum_a;
+    scratch_b[threadIdx.x] = sum_b;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            scratch_a[threadIdx.x] += scratch_a[threadIdx.x + stride];
+            scratch_b[threadIdx.x] += scratch_b[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        y_a[row] = scratch_a[0];
+        y_b[row] = scratch_b[0];
+    }
+}
+
+__global__ void bf16_matvec_cpu_order_kernel(const float* x, const uint16_t* w, float* y, int rows, int cols) {
+    const int row = blockIdx.x;
+    if (row >= rows || threadIdx.x != 0) return;
+    double sum = 0.0;
+    for (int c = 0; c < cols; ++c) sum += static_cast<double>(bf16_to_float(w[static_cast<size_t>(row) * cols + c])) * x[c];
+    y[row] = static_cast<float>(sum);
+}
+
 __device__ __forceinline__ float sqrt_softplus(float x) {
     return sqrtf(log1pf(expf(x)));
 }
@@ -69,6 +107,42 @@ __global__ void gate_scores_kernel(const float* x, const uint16_t* w, const floa
         token_original[row] = orig;
         token_scored[row] = orig + (bias == nullptr ? 0.0f : bias[row]);
     }
+}
+
+__global__ void gate_hash_scores_kernel(
+    const float* x,
+    const uint16_t* w,
+    const int64_t* tid2eid,
+    float* original,
+    int64_t* indices,
+    int token_id,
+    int cols,
+    int table_topk,
+    int topk) {
+    const int k = blockIdx.x;
+    if (k >= topk) return;
+    const int64_t expert = tid2eid[static_cast<size_t>(token_id) * table_topk + k];
+    float sum = 0.0f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) sum += bf16_to_float(w[static_cast<size_t>(expert) * cols + c]) * x[c];
+    extern __shared__ float scratch[];
+    scratch[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        original[k] = sqrt_softplus(scratch[0]);
+        indices[k] = expert;
+    }
+}
+
+__global__ void gate_hash_finalize_kernel(const float* original, float* weights, int topk, float route_scale) {
+    if (threadIdx.x != 0) return;
+    float denom = 0.0f;
+    for (int k = 0; k < topk; ++k) denom += original[k];
+    denom = denom == 0.0f ? 1.0f : denom;
+    for (int k = 0; k < topk; ++k) weights[k] = original[k] / denom * route_scale;
 }
 
 __global__ void gate_topk_finalize_kernel(const float* original, const float* scored, int64_t* indices, float* weights, int experts, int topk, float route_scale) {
@@ -121,6 +195,20 @@ bool bf16_matvec_cuda(const float* d_x, const uint16_t* d_w_bf16, float* d_y, in
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool bf16_dual_matvec_cuda(const float* d_x, const uint16_t* d_w_a_bf16, const uint16_t* d_w_b_bf16, float* d_y_a, float* d_y_b, int rows, int cols, void* stream) {
+    if (d_x == nullptr || d_w_a_bf16 == nullptr || d_w_b_bf16 == nullptr || d_y_a == nullptr || d_y_b == nullptr || rows <= 0 || cols <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    bf16_dual_matvec_kernel<<<rows, 256, 512 * sizeof(float), cuda_stream>>>(d_x, d_w_a_bf16, d_w_b_bf16, d_y_a, d_y_b, rows, cols);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool bf16_matvec_cpu_order_cuda(const float* d_x, const uint16_t* d_w_bf16, float* d_y, int rows, int cols, void* stream) {
+    if (d_x == nullptr || d_w_bf16 == nullptr || d_y == nullptr || rows <= 0 || cols <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    bf16_matvec_cpu_order_kernel<<<rows, 1, 0, cuda_stream>>>(d_x, d_w_bf16, d_y, rows, cols);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool gate_topk_bf16_cuda_with_buffers(
     const float* d_x,
     const uint16_t* d_w_bf16,
@@ -164,6 +252,26 @@ bool gate_topk_bf16_cuda(
     cudaFree(d_original);
     cudaFree(d_scored);
     return ok;
+}
+
+bool gate_hash_bf16_cuda(
+    const float* d_x,
+    const uint16_t* d_w_bf16,
+    const int64_t* d_tid2eid,
+    float* d_original_scratch,
+    int64_t* d_indices,
+    float* d_weights,
+    int token,
+    int cols,
+    int table_topk,
+    int topk,
+    float route_scale,
+    void* stream) {
+    if (d_x == nullptr || d_w_bf16 == nullptr || d_tid2eid == nullptr || d_original_scratch == nullptr || d_indices == nullptr || d_weights == nullptr || token < 0 || cols <= 0 || table_topk <= 0 || topk <= 0 || topk > table_topk) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    gate_hash_scores_kernel<<<topk, 256, 256 * sizeof(float), cuda_stream>>>(d_x, d_w_bf16, d_tid2eid, d_original_scratch, d_indices, token, cols, table_topk, topk);
+    gate_hash_finalize_kernel<<<1, 1, 0, cuda_stream>>>(d_original_scratch, d_weights, topk, route_scale);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 bool gate_topk_bf16_rows_cuda(

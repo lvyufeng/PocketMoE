@@ -117,6 +117,7 @@ int main() {
         std::vector<std::vector<float>> token_weights(tokens);
         std::vector<std::vector<int>> expert_routes(n_local_experts);
         std::vector<std::vector<float>> expert_token_weights(n_local_experts);
+        std::vector<std::vector<int64_t>> expert_ordinals(n_local_experts);
         for (int t = 0; t < tokens; ++t) {
             std::vector<int> available;
             for (int e = 0; e < n_local_experts; ++e) available.push_back(e);
@@ -128,6 +129,7 @@ int main() {
                 token_weights[t].push_back(w);
                 expert_routes[expert].push_back(t);
                 expert_token_weights[expert].push_back(w);
+                expert_ordinals[expert].push_back(static_cast<int64_t>(t * topk + k));
             }
         }
 
@@ -140,7 +142,7 @@ int main() {
         for (int e = 0; e < n_local_experts; ++e) {
             const int start = seg_starts[e];
             for (size_t i = 0; i < expert_routes[e].size(); ++i) {
-                route_tokens[start + i] = expert_routes[e][i];
+                route_tokens[start + i] = expert_ordinals[e][i];
                 route_weights[start + i] = expert_token_weights[e][i];
             }
             max_count = std::max(max_count, static_cast<int>(expert_routes[e].size()));
@@ -194,6 +196,7 @@ int main() {
                 d_w3s,
                 d_y,
                 tokens,
+                topk,
                 routes,
                 n_local_experts,
                 max_count,

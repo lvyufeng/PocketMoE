@@ -40,6 +40,16 @@ std::vector<float> matvec_ref(const std::vector<float>& x, const uint16_t* w, in
     return y;
 }
 
+std::vector<float> matvec_ref_double(const std::vector<float>& x, const uint16_t* w, int rows, int cols) {
+    std::vector<float> y(rows, 0.0f);
+    for (int r = 0; r < rows; ++r) {
+        double sum = 0.0;
+        for (int c = 0; c < cols; ++c) sum += static_cast<double>(bf16_to_float(w[static_cast<size_t>(r) * cols + c])) * x[c];
+        y[r] = static_cast<float>(sum);
+    }
+    return y;
+}
+
 const dsv4::SafeTensorInfo* require_tensor(const dsv4::SafeTensorsShard& shard, const std::string& name, dsv4::SafeDType dtype) {
     const auto* info = shard.find_tensor(name);
     if (info == nullptr) throw std::runtime_error("missing tensor: " + name);
@@ -77,39 +87,50 @@ int main(int argc, char** argv) {
         auto* head_data = reinterpret_cast<const uint16_t*>(head_shard.tensor_data(*head));
         auto x_ref = row_ref(embed_data, token, dim);
         auto logits_ref = matvec_ref(x_ref, head_data, vocab_rows, dim);
+        auto logits_ref_double = matvec_ref_double(x_ref, head_data, vocab_rows, dim);
 
         uint16_t* d_embed = nullptr;
         uint16_t* d_head = nullptr;
         float* d_x = nullptr;
         float* d_logits = nullptr;
+        float* d_logits_cpu_order = nullptr;
         const uint16_t* token_row = embed_data + static_cast<size_t>(token) * dim;
         check_cuda(cudaMalloc(&d_embed, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc embed");
         check_cuda(cudaMalloc(&d_head, static_cast<size_t>(vocab_rows) * dim * sizeof(uint16_t)), "cudaMalloc head");
         check_cuda(cudaMalloc(&d_x, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc x");
         check_cuda(cudaMalloc(&d_logits, static_cast<size_t>(vocab_rows) * sizeof(float)), "cudaMalloc logits");
+        check_cuda(cudaMalloc(&d_logits_cpu_order, static_cast<size_t>(vocab_rows) * sizeof(float)), "cudaMalloc logits cpu order");
         check_cuda(cudaMemcpy(d_embed, token_row, static_cast<size_t>(dim) * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy embed row");
         check_cuda(cudaMemcpy(d_head, head_data, static_cast<size_t>(vocab_rows) * dim * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy head");
         if (!dsv4::bf16_row_to_float_cuda(d_embed, d_x, 0, dim)) throw std::runtime_error("embed lookup launch failed");
         if (!dsv4::bf16_matvec_cuda(d_x, d_head, d_logits, vocab_rows, dim)) throw std::runtime_error("head matvec launch failed");
+        if (!dsv4::bf16_matvec_cpu_order_cuda(d_x, d_head, d_logits_cpu_order, vocab_rows, dim)) throw std::runtime_error("head cpu-order matvec launch failed");
         check_cuda(cudaDeviceSynchronize(), "sync kernels");
         std::vector<float> x(dim);
         std::vector<float> logits(vocab_rows);
+        std::vector<float> logits_cpu_order(vocab_rows);
         check_cuda(cudaMemcpy(x.data(), d_x, x.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy x");
         check_cuda(cudaMemcpy(logits.data(), d_logits, logits.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy logits");
+        check_cuda(cudaMemcpy(logits_cpu_order.data(), d_logits_cpu_order, logits_cpu_order.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy logits cpu order");
         cudaFree(d_embed);
         cudaFree(d_head);
         cudaFree(d_x);
         cudaFree(d_logits);
+        cudaFree(d_logits_cpu_order);
 
         float max_x = 0.0f;
         for (int i = 0; i < dim; ++i) max_x = std::max(max_x, std::fabs(x[i] - x_ref[i]));
         float max_logits = 0.0f;
-        for (int i = 0; i < vocab_rows; ++i) max_logits = std::max(max_logits, std::fabs(logits[i] - logits_ref[i]));
-        if (max_x > 0.0f || max_logits > 1e-4f) {
-            std::cerr << "[FAIL] embedding_head max_x=" << max_x << " max_logits=" << max_logits << "\n";
+        float max_logits_cpu_order = 0.0f;
+        for (int i = 0; i < vocab_rows; ++i) {
+            max_logits = std::max(max_logits, std::fabs(logits[i] - logits_ref[i]));
+            max_logits_cpu_order = std::max(max_logits_cpu_order, std::fabs(logits_cpu_order[i] - logits_ref_double[i]));
+        }
+        if (max_x > 0.0f || max_logits > 1e-4f || max_logits_cpu_order > 0.0f) {
+            std::cerr << "[FAIL] embedding_head max_x=" << max_x << " max_logits=" << max_logits << " max_logits_cpu_order=" << max_logits_cpu_order << "\n";
             return 1;
         }
-        std::cout << "[PASS] embedding_head max_x=" << max_x << " max_logits=" << max_logits << " token=" << token << " rows=" << vocab_rows << " dim=" << dim << "\n";
+        std::cout << "[PASS] embedding_head max_x=" << max_x << " max_logits=" << max_logits << " max_logits_cpu_order=" << max_logits_cpu_order << " token=" << token << " rows=" << vocab_rows << " dim=" << dim << "\n";
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << "[FAIL] " << ex.what() << "\n";

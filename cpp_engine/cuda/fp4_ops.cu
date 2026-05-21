@@ -120,25 +120,27 @@ __global__ void moe_route_fill_kernel(
     const int expert = static_cast<int>(indices[idx]);
     const int local = expert - experts_start_idx;
     if (local < 0 || local >= n_local_experts) return;
-    const int token = idx / topk;
+    const int ordinal = idx;
     const int out = atomicAdd(offsets + local, 1);
-    route_tokens[out] = static_cast<int64_t>(token);
+    route_tokens[out] = static_cast<int64_t>(ordinal);
     route_weights[out] = weights[idx];
 }
 
 __global__ void gather_routes_float_kernel(
     const float* __restrict__ x,
-    const int64_t* __restrict__ route_tokens,
+    const int64_t* __restrict__ route_ordinals,
     float* __restrict__ x_sorted,
     int routes,
+    int topk,
     int dim) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = routes * dim;
     if (idx >= total) return;
     const int route = idx / dim;
     const int d = idx - route * dim;
-    const int64_t token = route_tokens[route];
-    x_sorted[idx] = x[token * dim + d];
+    const int64_t ordinal = route_ordinals[route];
+    const int token = static_cast<int>(ordinal / topk);
+    x_sorted[idx] = x[static_cast<size_t>(token) * dim + d];
 }
 
 __global__ void quantize_float_rows_kernel(
@@ -508,11 +510,11 @@ __global__ void moe_prefill_swiglu_quant_fp4_kernel(
 __global__ void moe_prefill_fp4_grouped_w2_kernel(
     const int8_t* __restrict__ hidden_q,
     const float* __restrict__ hidden_scale,
-    const int64_t* __restrict__ route_tokens,
+    const int64_t* __restrict__ route_ordinals,
     const int32_t* __restrict__ seg_starts,
     const uint8_t* __restrict__ w2q,
     const uint8_t* __restrict__ w2s,
-    float* __restrict__ y,
+    float* __restrict__ route_y,
     int rows_per_expert,
     int dim,
     int inter_dim) {
@@ -564,19 +566,35 @@ __global__ void moe_prefill_fp4_grouped_w2_kernel(
         const int row = row_base + r;
         if (row < count && row < rows_per_expert) {
             const int route = seg_starts[expert] + row;
-            const int64_t token = route_tokens[route];
-            atomicAdd(y + token * dim + col, acc[r] * hidden_scale[expert * rows_per_expert + row]);
+            const int64_t ordinal = route_ordinals[route];
+            route_y[static_cast<size_t>(ordinal) * dim + col] = acc[r] * hidden_scale[expert * rows_per_expert + row];
         }
     }
 }
 
-__global__ void moe_single_w2_accum_fp4_kernel(
+__global__ void sum_token_topk_kernel(
+    const float* __restrict__ route_y,
+    float* __restrict__ y,
+    int tokens,
+    int topk,
+    int dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = tokens * dim;
+    if (idx >= total) return;
+    const int token = idx / dim;
+    const int col = idx - token * dim;
+    float sum = 0.0f;
+    for (int k = 0; k < topk; ++k) sum += route_y[(static_cast<size_t>(token) * topk + k) * dim + col];
+    y[idx] = sum;
+}
+
+__global__ void moe_single_w2_write_fp4_kernel(
     const int8_t* __restrict__ hidden_q,
     const float* __restrict__ hidden_scale,
     const int64_t* __restrict__ indices,
     const uint8_t* __restrict__ w2q,
     const uint8_t* __restrict__ w2s,
-    float* __restrict__ y,
+    float* __restrict__ route_y,
     int topk,
     int experts_start_idx,
     int n_local_experts,
@@ -586,30 +604,48 @@ __global__ void moe_single_w2_accum_fp4_kernel(
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (route >= topk) return;
     const int local = static_cast<int>(indices[route]) - experts_start_idx;
-    if (local < 0 || local >= n_local_experts) return;
+    const bool valid = local >= 0 && local < n_local_experts;
     const int packs = inter_dim / 4;
     const int blocks_k = inter_dim / 32;
     extern __shared__ int h_shared[];
-    const int* h_i32 = reinterpret_cast<const int*>(hidden_q + route * inter_dim);
-    for (int idx = threadIdx.x; idx < packs; idx += blockDim.x) h_shared[idx] = h_i32[idx];
+    if (valid) {
+        const int* h_i32 = reinterpret_cast<const int*>(hidden_q + route * inter_dim);
+        for (int idx = threadIdx.x; idx < packs; idx += blockDim.x) h_shared[idx] = h_i32[idx];
+    }
     __syncthreads();
     if (col >= dim) return;
-    const uint8_t* w2_row_bytes = w2q + (static_cast<int64_t>(local) * dim + col) * (inter_dim / 2);
-    const uint8_t* w2_scale_row = w2s + (static_cast<int64_t>(local) * dim + col) * blocks_k;
-    const uint16_t* w2_pack_base = reinterpret_cast<const uint16_t*>(w2_row_bytes);
-    float row_acc = 0.0f;
-    for (int kb = 0; kb < blocks_k; ++kb) {
-        const uint16_t* w2_pack = w2_pack_base + kb * 8;
-        const int* h_pack = h_shared + kb * 8;
-        int blk = 0;
-        #pragma unroll
-        for (int ip = 0; ip < 8; ++ip) {
-            const int w_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w2_pack[ip]));
-            blk = dot_i8x4(h_pack[ip], w_p, blk);
+    float value = 0.0f;
+    if (valid) {
+        const uint8_t* w2_row_bytes = w2q + (static_cast<int64_t>(local) * dim + col) * (inter_dim / 2);
+        const uint8_t* w2_scale_row = w2s + (static_cast<int64_t>(local) * dim + col) * blocks_k;
+        const uint16_t* w2_pack_base = reinterpret_cast<const uint16_t*>(w2_row_bytes);
+        float row_acc = 0.0f;
+        for (int kb = 0; kb < blocks_k; ++kb) {
+            const uint16_t* w2_pack = w2_pack_base + kb * 8;
+            const int* h_pack = h_shared + kb * 8;
+            int blk = 0;
+            #pragma unroll
+            for (int ip = 0; ip < 8; ++ip) {
+                const int w_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w2_pack[ip]));
+                blk = dot_i8x4(h_pack[ip], w_p, blk);
+            }
+            row_acc += static_cast<float>(blk) * fp4_block_scale(w2_scale_row[kb]);
         }
-        row_acc += static_cast<float>(blk) * fp4_block_scale(w2_scale_row[kb]);
+        value = row_acc * hidden_scale[route];
     }
-    atomicAdd(y + col, row_acc * hidden_scale[route]);
+    route_y[static_cast<size_t>(route) * dim + col] = value;
+}
+
+__global__ void sum_topk_rows_kernel(
+    const float* __restrict__ route_y,
+    float* __restrict__ y,
+    int topk,
+    int dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= dim) return;
+    float sum = 0.0f;
+    for (int route = 0; route < topk; ++route) sum += route_y[static_cast<size_t>(route) * dim + idx];
+    y[idx] = sum;
 }
 
 }  // namespace
@@ -672,6 +708,7 @@ bool moe_prefill_fp4_grouped_cuda(
     const uint8_t* d_w3s,
     float* d_y,
     int tokens,
+    int topk,
     int routes,
     int n_local_experts,
     int max_count,
@@ -680,7 +717,7 @@ bool moe_prefill_fp4_grouped_cuda(
     float swiglu_limit,
     void* stream) {
     if (d_x == nullptr || d_route_tokens == nullptr || d_route_weights == nullptr || d_seg_starts == nullptr || d_w1q == nullptr || d_w1s == nullptr || d_w2q == nullptr || d_w2s == nullptr || d_w3q == nullptr || d_w3s == nullptr || d_y == nullptr) return false;
-    if (tokens <= 0 || routes < 0 || n_local_experts <= 0 || max_count <= 0 || dim <= 0 || inter_dim <= 0 || (dim % 32) != 0 || (inter_dim % 32) != 0) return false;
+    if (tokens <= 0 || topk <= 0 || routes < 0 || n_local_experts <= 0 || max_count <= 0 || dim <= 0 || inter_dim <= 0 || (dim % 32) != 0 || (inter_dim % 32) != 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     float* d_x_sorted = nullptr;
     int8_t* d_x_q = nullptr;
@@ -691,11 +728,13 @@ bool moe_prefill_fp4_grouped_cuda(
     float* d_up = nullptr;
     int8_t* d_hidden_q = nullptr;
     float* d_hidden_scale = nullptr;
+    float* d_route_y = nullptr;
     if (cudaMemsetAsync(d_y, 0, static_cast<size_t>(tokens) * dim * sizeof(float), cuda_stream) != cudaSuccess) return false;
     if (routes == 0) return cudaGetLastError() == cudaSuccess;
     const size_t routes_dim = static_cast<size_t>(routes) * dim;
     const size_t padded_dim = static_cast<size_t>(n_local_experts) * max_count * dim;
     const size_t padded_inter = static_cast<size_t>(n_local_experts) * max_count * inter_dim;
+    const size_t route_y_dim = static_cast<size_t>(tokens) * topk * dim;
     if (cudaMalloc(&d_x_sorted, routes_dim * sizeof(float)) != cudaSuccess) return false;
     if (cudaMalloc(&d_x_q, routes_dim) != cudaSuccess) goto fail;
     if (cudaMalloc(&d_x_scale, static_cast<size_t>(routes) * sizeof(float)) != cudaSuccess) goto fail;
@@ -705,10 +744,12 @@ bool moe_prefill_fp4_grouped_cuda(
     if (cudaMalloc(&d_up, padded_inter * sizeof(float)) != cudaSuccess) goto fail;
     if (cudaMalloc(&d_hidden_q, padded_inter) != cudaSuccess) goto fail;
     if (cudaMalloc(&d_hidden_scale, static_cast<size_t>(n_local_experts) * max_count * sizeof(float)) != cudaSuccess) goto fail;
+    if (cudaMalloc(&d_route_y, route_y_dim * sizeof(float)) != cudaSuccess) goto fail;
+    if (cudaMemsetAsync(d_route_y, 0, route_y_dim * sizeof(float), cuda_stream) != cudaSuccess) goto fail;
     {
         const int threads = 256;
         const int gather_blocks = static_cast<int>((routes_dim + threads - 1) / threads);
-        gather_routes_float_kernel<<<gather_blocks, threads, 0, cuda_stream>>>(d_x, d_route_tokens, d_x_sorted, routes, dim);
+        gather_routes_float_kernel<<<gather_blocks, threads, 0, cuda_stream>>>(d_x, d_route_tokens, d_x_sorted, routes, topk, dim);
         quantize_float_rows_kernel<<<routes, kQuantThreads, 0, cuda_stream>>>(d_x_sorted, d_x_q, d_x_scale, routes, dim);
         const int pad_blocks = static_cast<int>((padded_dim + threads - 1) / threads);
         pad_q_rows_kernel<<<pad_blocks, threads, 0, cuda_stream>>>(d_x_q, d_x_scale, d_seg_starts, d_x_pad, d_x_scale_pad, n_local_experts, max_count, dim);
@@ -720,7 +761,8 @@ bool moe_prefill_fp4_grouped_cuda(
             d_gate, d_up, d_seg_starts, d_route_weights, d_hidden_q, d_hidden_scale, max_count, inter_dim, swiglu_limit);
         const dim3 w2_grid(ceil_div_int(dim, kGemmThreads), ceil_div_int(max_count, kFp4GroupedRows), n_local_experts);
         moe_prefill_fp4_grouped_w2_kernel<<<w2_grid, gemm_block, static_cast<size_t>(kFp4GroupedRows) * (inter_dim / 4) * sizeof(int), cuda_stream>>>(
-            d_hidden_q, d_hidden_scale, d_route_tokens, d_seg_starts, d_w2q, d_w2s, d_y, max_count, dim, inter_dim);
+            d_hidden_q, d_hidden_scale, d_route_tokens, d_seg_starts, d_w2q, d_w2s, d_route_y, max_count, dim, inter_dim);
+        sum_token_topk_kernel<<<ceil_div_int(static_cast<int>(static_cast<size_t>(tokens) * dim), 256), 256, 0, cuda_stream>>>(d_route_y, d_y, tokens, topk, dim);
     }
     {
         const cudaError_t launch_err = cudaGetLastError();
@@ -733,6 +775,7 @@ bool moe_prefill_fp4_grouped_cuda(
         cudaFree(d_up);
         cudaFree(d_hidden_q);
         cudaFree(d_hidden_scale);
+        cudaFree(d_route_y);
         return launch_err == cudaSuccess;
     }
 fail:
@@ -745,7 +788,47 @@ fail:
     cudaFree(d_up);
     cudaFree(d_hidden_q);
     cudaFree(d_hidden_scale);
+    cudaFree(d_route_y);
     return false;
+}
+
+bool moe_single_token_fp4_cuda_with_workspace(
+    const float* d_x,
+    const int64_t* d_indices,
+    const float* d_weights,
+    const uint8_t* d_w1q,
+    const uint8_t* d_w1s,
+    const uint8_t* d_w2q,
+    const uint8_t* d_w2s,
+    const uint8_t* d_w3q,
+    const uint8_t* d_w3s,
+    float* d_y,
+    int topk,
+    int experts_start_idx,
+    int n_local_experts,
+    int dim,
+    int inter_dim,
+    float swiglu_limit,
+    MoeSingleTokenFp4Workspace workspace,
+    void* stream) {
+    if (d_x == nullptr || d_indices == nullptr || d_weights == nullptr || d_w1q == nullptr || d_w1s == nullptr || d_w2q == nullptr || d_w2s == nullptr || d_w3q == nullptr || d_w3s == nullptr || d_y == nullptr) return false;
+    if (workspace.d_x_q == nullptr || workspace.d_x_scale == nullptr || workspace.d_gate == nullptr || workspace.d_up == nullptr || workspace.d_hidden_q == nullptr || workspace.d_hidden_scale == nullptr || workspace.d_route_y == nullptr) return false;
+    if (topk <= 0 || n_local_experts <= 0 || dim <= 0 || inter_dim <= 0 || (dim % 32) != 0 || (inter_dim % 32) != 0) return false;
+    if (workspace.topk < topk || workspace.dim < dim || workspace.inter_dim < inter_dim) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    cudaMemsetAsync(d_y, 0, static_cast<size_t>(dim) * sizeof(float), cuda_stream);
+    quantize_float_row_kernel<<<1, kQuantThreads, 0, cuda_stream>>>(d_x, workspace.d_x_q, workspace.d_x_scale, dim);
+    const dim3 w1w3_grid(ceil_div_int(inter_dim, kGemmThreads), topk);
+    const dim3 gemm_block(kGemmThreads);
+    moe_single_w1w3_fp4_kernel<<<w1w3_grid, gemm_block, static_cast<size_t>(dim / 4) * sizeof(int), cuda_stream>>>(
+        workspace.d_x_q, workspace.d_x_scale, d_indices, d_w1q, d_w1s, d_w3q, d_w3s, workspace.d_gate, workspace.d_up, topk, experts_start_idx, n_local_experts, dim, inter_dim);
+    moe_single_swiglu_quant_fp4_kernel<<<topk, kQuantThreads, 0, cuda_stream>>>(
+        workspace.d_gate, workspace.d_up, d_indices, d_weights, workspace.d_hidden_q, workspace.d_hidden_scale, topk, experts_start_idx, n_local_experts, inter_dim, swiglu_limit);
+    const dim3 w2_grid(ceil_div_int(dim, kGemmThreads), topk);
+    moe_single_w2_write_fp4_kernel<<<w2_grid, gemm_block, static_cast<size_t>(inter_dim / 4) * sizeof(int), cuda_stream>>>(
+        workspace.d_hidden_q, workspace.d_hidden_scale, d_indices, d_w2q, d_w2s, workspace.d_route_y, topk, experts_start_idx, n_local_experts, dim, inter_dim);
+    sum_topk_rows_kernel<<<ceil_div_int(dim, 256), 256, 0, cuda_stream>>>(workspace.d_route_y, d_y, topk, dim);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 bool moe_single_token_fp4_cuda(
@@ -766,40 +849,27 @@ bool moe_single_token_fp4_cuda(
     int inter_dim,
     float swiglu_limit,
     void* stream) {
-    if (d_x == nullptr || d_indices == nullptr || d_weights == nullptr || d_w1q == nullptr || d_w1s == nullptr || d_w2q == nullptr || d_w2s == nullptr || d_w3q == nullptr || d_w3s == nullptr || d_y == nullptr) return false;
-    if (topk <= 0 || n_local_experts <= 0 || dim <= 0 || inter_dim <= 0 || (dim % 32) != 0 || (inter_dim % 32) != 0) return false;
-    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    int8_t* d_x_q = nullptr;
-    float* d_x_scale = nullptr;
-    float* d_gate = nullptr;
-    float* d_up = nullptr;
-    int8_t* d_hidden_q = nullptr;
-    float* d_hidden_scale = nullptr;
-    if (cudaMalloc(&d_x_q, static_cast<size_t>(dim)) != cudaSuccess) return false;
-    if (cudaMalloc(&d_x_scale, sizeof(float)) != cudaSuccess) return false;
-    if (cudaMalloc(&d_gate, static_cast<size_t>(topk) * inter_dim * sizeof(float)) != cudaSuccess) return false;
-    if (cudaMalloc(&d_up, static_cast<size_t>(topk) * inter_dim * sizeof(float)) != cudaSuccess) return false;
-    if (cudaMalloc(&d_hidden_q, static_cast<size_t>(topk) * inter_dim) != cudaSuccess) return false;
-    if (cudaMalloc(&d_hidden_scale, static_cast<size_t>(topk) * sizeof(float)) != cudaSuccess) return false;
-    cudaMemsetAsync(d_y, 0, static_cast<size_t>(dim) * sizeof(float), cuda_stream);
-    quantize_float_row_kernel<<<1, kQuantThreads, 0, cuda_stream>>>(d_x, d_x_q, d_x_scale, dim);
-    const dim3 w1w3_grid(ceil_div_int(inter_dim, kGemmThreads), topk);
-    const dim3 gemm_block(kGemmThreads);
-    moe_single_w1w3_fp4_kernel<<<w1w3_grid, gemm_block, static_cast<size_t>(dim / 4) * sizeof(int), cuda_stream>>>(
-        d_x_q, d_x_scale, d_indices, d_w1q, d_w1s, d_w3q, d_w3s, d_gate, d_up, topk, experts_start_idx, n_local_experts, dim, inter_dim);
-    moe_single_swiglu_quant_fp4_kernel<<<topk, kQuantThreads, 0, cuda_stream>>>(
-        d_gate, d_up, d_indices, d_weights, d_hidden_q, d_hidden_scale, topk, experts_start_idx, n_local_experts, inter_dim, swiglu_limit);
-    const dim3 w2_grid(ceil_div_int(dim, kGemmThreads), topk);
-    moe_single_w2_accum_fp4_kernel<<<w2_grid, gemm_block, static_cast<size_t>(inter_dim / 4) * sizeof(int), cuda_stream>>>(
-        d_hidden_q, d_hidden_scale, d_indices, d_w2q, d_w2s, d_y, topk, experts_start_idx, n_local_experts, dim, inter_dim);
-    const cudaError_t launch_err = cudaGetLastError();
-    cudaFree(d_x_q);
-    cudaFree(d_x_scale);
-    cudaFree(d_gate);
-    cudaFree(d_up);
-    cudaFree(d_hidden_q);
-    cudaFree(d_hidden_scale);
-    return launch_err == cudaSuccess;
+    if (topk <= 0 || dim <= 0 || inter_dim <= 0) return false;
+    MoeSingleTokenFp4Workspace workspace;
+    workspace.topk = topk;
+    workspace.dim = dim;
+    workspace.inter_dim = inter_dim;
+    if (cudaMalloc(&workspace.d_x_q, static_cast<size_t>(dim)) != cudaSuccess) return false;
+    if (cudaMalloc(&workspace.d_x_scale, sizeof(float)) != cudaSuccess) return false;
+    if (cudaMalloc(&workspace.d_gate, static_cast<size_t>(topk) * inter_dim * sizeof(float)) != cudaSuccess) return false;
+    if (cudaMalloc(&workspace.d_up, static_cast<size_t>(topk) * inter_dim * sizeof(float)) != cudaSuccess) return false;
+    if (cudaMalloc(&workspace.d_hidden_q, static_cast<size_t>(topk) * inter_dim) != cudaSuccess) return false;
+    if (cudaMalloc(&workspace.d_hidden_scale, static_cast<size_t>(topk) * sizeof(float)) != cudaSuccess) return false;
+    if (cudaMalloc(&workspace.d_route_y, static_cast<size_t>(topk) * dim * sizeof(float)) != cudaSuccess) return false;
+    const bool ok = moe_single_token_fp4_cuda_with_workspace(d_x, d_indices, d_weights, d_w1q, d_w1s, d_w2q, d_w2s, d_w3q, d_w3s, d_y, topk, experts_start_idx, n_local_experts, dim, inter_dim, swiglu_limit, workspace, stream);
+    cudaFree(workspace.d_x_q);
+    cudaFree(workspace.d_x_scale);
+    cudaFree(workspace.d_gate);
+    cudaFree(workspace.d_up);
+    cudaFree(workspace.d_hidden_q);
+    cudaFree(workspace.d_hidden_scale);
+    cudaFree(workspace.d_route_y);
+    return ok;
 }
 
 }  // namespace dsv4

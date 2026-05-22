@@ -14,6 +14,22 @@ namespace {
 constexpr int kQuantThreads = 256;
 constexpr int kGemmThreads = 128;
 
+// shared-memory bytes per block for the N-split compact kernels.
+// w13: a_tile (16*16 i8) + 2*WARPS b_tile (i8) + WARPS c_tile (int) + 2*WARPS acc (float).
+// w2 : a_tile (16*16 i8) +   WARPS b_tile (i8) + WARPS c_tile (int) +   WARPS acc (float).
+constexpr size_t TILE_SHARED_NSPLIT_BYTES_W13(int W) {
+    return 16 * 16 * 1
+         + 2 * static_cast<size_t>(W) * 16 * 16 * 1
+         + static_cast<size_t>(W) * 16 * 16 * sizeof(int)
+         + 2 * static_cast<size_t>(W) * 16 * 16 * sizeof(float);
+}
+constexpr size_t TILE_SHARED_NSPLIT_BYTES_W2(int W) {
+    return 16 * 16 * 1
+         + static_cast<size_t>(W) * 16 * 16 * 1
+         + static_cast<size_t>(W) * 16 * 16 * sizeof(int)
+         + static_cast<size_t>(W) * 16 * 16 * sizeof(float);
+}
+
 __device__ __constant__ int8_t fp4_lut_x2[16] = {
     0, 1, 2, 3, 4, 6, 8, 12,
     0, -1, -2, -3, -4, -6, -8, -12
@@ -616,6 +632,138 @@ __global__ void moe_prefill_fp4_grouped_w13_wmma_compact_kernel(
     }
 }
 
+template <int WARPS>
+__global__ void moe_prefill_fp4_grouped_w13_wmma_compact_nsplit_kernel(
+    const int8_t* __restrict__ x_q,
+    const float* __restrict__ x_scale,
+    const int32_t* __restrict__ seg_starts,
+    const int32_t* __restrict__ tile_experts,
+    const int32_t* __restrict__ tile_rows,
+    const uint8_t* __restrict__ w1q,
+    const uint8_t* __restrict__ w1s,
+    const uint8_t* __restrict__ w3q,
+    const uint8_t* __restrict__ w3s,
+    float* __restrict__ gate_f32,
+    float* __restrict__ up_f32,
+    int tile_count,
+    int dim,
+    int inter_dim) {
+    using namespace nvcuda;
+    constexpr int TILE = 16;
+    const int tile_id = blockIdx.y;
+    if (tile_id >= tile_count) return;
+    const int expert = tile_experts[tile_id];
+    const int row_base = tile_rows[tile_id];
+    const int col_base_block = blockIdx.x * (TILE * WARPS);
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int col_base = col_base_block + warp_id * TILE;
+    const int blocks_k = dim / 32;
+    const int count = seg_starts[expert + 1] - seg_starts[expert];
+    extern __shared__ __align__(16) unsigned char smem[];
+    signed char* a_tile = reinterpret_cast<signed char*>(smem);
+    signed char* b_tile_block = a_tile + TILE * TILE;
+    signed char* b_tile_w1 = b_tile_block + warp_id * TILE * TILE;
+    signed char* b_tile_w3 = b_tile_block + (WARPS + warp_id) * TILE * TILE;
+    int* c_tile_block = reinterpret_cast<int*>(b_tile_block + 2 * WARPS * TILE * TILE);
+    int* c_tile_warp = c_tile_block + warp_id * TILE * TILE;
+    float* gate_acc_block = reinterpret_cast<float*>(c_tile_block + WARPS * TILE * TILE);
+    float* gate_acc = gate_acc_block + warp_id * TILE * TILE;
+    float* up_acc = gate_acc_block + (WARPS + warp_id) * TILE * TILE;
+
+    #pragma unroll
+    for (int i = lane; i < TILE * TILE; i += 32) {
+        gate_acc[i] = 0.0f;
+        up_acc[i] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int kb = 0; kb < blocks_k; ++kb) {
+        wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, signed char, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, signed char, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, TILE, TILE, TILE, int> c1_frag;
+        wmma::fragment<wmma::accumulator, TILE, TILE, TILE, int> c3_frag;
+        wmma::fill_fragment(c1_frag, 0);
+        wmma::fill_fragment(c3_frag, 0);
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int k0 = kb * 32 + half * TILE;
+            // load a_tile cooperatively across all warps (32 entries per warp covers all 256)
+            #pragma unroll
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int r = i / TILE;
+                const int k = i - r * TILE;
+                const int row = row_base + r;
+                const int route = seg_starts[expert] + row;
+                a_tile[i] = row < count ? x_q[static_cast<int64_t>(route) * dim + k0 + k] : 0;
+            }
+            // each warp loads its own b_tile slice for its own col range
+            #pragma unroll
+            for (int i = lane; i < TILE * TILE; i += 32) {
+                const int k = i & (TILE - 1);
+                const int n = i >> 4;
+                const int col = col_base + n;
+                signed char v1 = 0;
+                signed char v3 = 0;
+                if (col < inter_dim) {
+                    const int kk = k0 + k;
+                    const uint8_t b1 = w1q[(static_cast<int64_t>(expert) * inter_dim + col) * (dim / 2) + (kk >> 1)];
+                    const uint8_t b3 = w3q[(static_cast<int64_t>(expert) * inter_dim + col) * (dim / 2) + (kk >> 1)];
+                    const uint8_t c1 = (kk & 1) ? (b1 >> 4) : (b1 & 0x0f);
+                    const uint8_t c3 = (kk & 1) ? (b3 >> 4) : (b3 & 0x0f);
+                    v1 = fp4_decode_code_x2(c1);
+                    v3 = fp4_decode_code_x2(c3);
+                }
+                b_tile_w1[k + n * TILE] = v1;
+                b_tile_w3[k + n * TILE] = v3;
+            }
+            __syncthreads();
+            wmma::load_matrix_sync(a_frag, a_tile, TILE);
+            wmma::load_matrix_sync(b_frag, b_tile_w1, TILE);
+            wmma::mma_sync(c1_frag, a_frag, b_frag, c1_frag);
+            wmma::load_matrix_sync(b_frag, b_tile_w3, TILE);
+            wmma::mma_sync(c3_frag, a_frag, b_frag, c3_frag);
+            __syncthreads();
+        }
+        wmma::store_matrix_sync(c_tile_warp, c1_frag, TILE, wmma::mem_row_major);
+        #pragma unroll
+        for (int i = lane; i < TILE * TILE; i += 32) {
+            const int n = i & (TILE - 1);
+            const int col = col_base + n;
+            if (col < inter_dim) {
+                const float s = fp4_block_scale(w1s[(static_cast<int64_t>(expert) * inter_dim + col) * blocks_k + kb]);
+                gate_acc[i] += static_cast<float>(c_tile_warp[i]) * s;
+            }
+        }
+        wmma::store_matrix_sync(c_tile_warp, c3_frag, TILE, wmma::mem_row_major);
+        #pragma unroll
+        for (int i = lane; i < TILE * TILE; i += 32) {
+            const int n = i & (TILE - 1);
+            const int col = col_base + n;
+            if (col < inter_dim) {
+                const float s = fp4_block_scale(w3s[(static_cast<int64_t>(expert) * inter_dim + col) * blocks_k + kb]);
+                up_acc[i] += static_cast<float>(c_tile_warp[i]) * s;
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = lane; i < TILE * TILE; i += 32) {
+        const int r = i / TILE;
+        const int n = i - r * TILE;
+        const int row = row_base + r;
+        const int col = col_base + n;
+        if (row < count && col < inter_dim) {
+            const int route = seg_starts[expert] + row;
+            const float xs = x_scale[route];
+            gate_f32[static_cast<int64_t>(route) * inter_dim + col] = gate_acc[i] * xs;
+            up_f32[static_cast<int64_t>(route) * inter_dim + col] = up_acc[i] * xs;
+        }
+    }
+}
+
 __global__ void moe_prefill_fp4_grouped_w2_wmma_kernel(
     const int8_t* __restrict__ hidden_q,
     const float* __restrict__ hidden_scale,
@@ -788,6 +936,110 @@ __global__ void moe_prefill_fp4_grouped_w2_wmma_compact_kernel(
     }
 
     for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+        const int r = i / TILE;
+        const int n = i - r * TILE;
+        const int row = row_base + r;
+        const int col = col_base + n;
+        if (row < count && col < dim) {
+            const int route = seg_starts[expert] + row;
+            const int64_t token = route_tokens[route];
+            atomicAdd(y + static_cast<size_t>(token) * dim + col,
+                      acc[i] * hidden_scale[route]);
+        }
+    }
+}
+
+template <int WARPS>
+__global__ void moe_prefill_fp4_grouped_w2_wmma_compact_nsplit_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ seg_starts,
+    const int32_t* __restrict__ tile_experts,
+    const int32_t* __restrict__ tile_rows,
+    const uint8_t* __restrict__ w2q,
+    const uint8_t* __restrict__ w2s,
+    float* __restrict__ y,
+    int tile_count,
+    int dim,
+    int inter_dim) {
+    using namespace nvcuda;
+    constexpr int TILE = 16;
+    const int tile_id = blockIdx.y;
+    if (tile_id >= tile_count) return;
+    const int expert = tile_experts[tile_id];
+    const int row_base = tile_rows[tile_id];
+    const int col_base_block = blockIdx.x * (TILE * WARPS);
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int col_base = col_base_block + warp_id * TILE;
+    const int blocks_k = inter_dim / 32;
+    const int count = seg_starts[expert + 1] - seg_starts[expert];
+    extern __shared__ __align__(16) unsigned char smem[];
+    signed char* a_tile = reinterpret_cast<signed char*>(smem);
+    signed char* b_tile_block = a_tile + TILE * TILE;
+    signed char* b_tile_warp = b_tile_block + warp_id * TILE * TILE;
+    int* c_tile_block = reinterpret_cast<int*>(b_tile_block + WARPS * TILE * TILE);
+    int* c_tile_warp = c_tile_block + warp_id * TILE * TILE;
+    float* acc_block = reinterpret_cast<float*>(c_tile_block + WARPS * TILE * TILE);
+    float* acc = acc_block + warp_id * TILE * TILE;
+
+    #pragma unroll
+    for (int i = lane; i < TILE * TILE; i += 32) acc[i] = 0.0f;
+    __syncthreads();
+
+    for (int kb = 0; kb < blocks_k; ++kb) {
+        wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, signed char, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, signed char, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, TILE, TILE, TILE, int> c_frag;
+        wmma::fill_fragment(c_frag, 0);
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int k0 = kb * 32 + half * TILE;
+            #pragma unroll
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int r = i / TILE;
+                const int k = i - r * TILE;
+                const int row = row_base + r;
+                const int route = seg_starts[expert] + row;
+                a_tile[i] = row < count ? hidden_q[static_cast<int64_t>(route) * inter_dim + k0 + k] : 0;
+            }
+            #pragma unroll
+            for (int i = lane; i < TILE * TILE; i += 32) {
+                const int k = i & (TILE - 1);
+                const int n = i >> 4;
+                const int col = col_base + n;
+                signed char v = 0;
+                if (col < dim) {
+                    const int kk = k0 + k;
+                    const uint8_t b = w2q[(static_cast<int64_t>(expert) * dim + col) * (inter_dim / 2) + (kk >> 1)];
+                    const uint8_t c = (kk & 1) ? (b >> 4) : (b & 0x0f);
+                    v = fp4_decode_code_x2(c);
+                }
+                b_tile_warp[k + n * TILE] = v;
+            }
+            __syncthreads();
+            wmma::load_matrix_sync(a_frag, a_tile, TILE);
+            wmma::load_matrix_sync(b_frag, b_tile_warp, TILE);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            __syncthreads();
+        }
+        wmma::store_matrix_sync(c_tile_warp, c_frag, TILE, wmma::mem_row_major);
+        #pragma unroll
+        for (int i = lane; i < TILE * TILE; i += 32) {
+            const int n = i & (TILE - 1);
+            const int col = col_base + n;
+            if (col < dim) {
+                const float s = fp4_block_scale(w2s[(static_cast<int64_t>(expert) * dim + col) * blocks_k + kb]);
+                acc[i] += static_cast<float>(c_tile_warp[i]) * s;
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = lane; i < TILE * TILE; i += 32) {
         const int r = i / TILE;
         const int n = i - r * TILE;
         const int row = row_base + r;
@@ -1074,11 +1326,34 @@ bool moe_prefill_fp4_grouped_cuda_with_workspace(
             cudaStreamSynchronize(cuda_stream);
             after_quant = std::chrono::steady_clock::now();
         }
-        const dim3 fp4_block(128);
+        static const int kMoeWmmaWarps = []() {
+            const char* v = std::getenv("DSV4_CPP_MOE_WMMA_WARPS");
+            int n = (v != nullptr && v[0] != '\0') ? std::atoi(v) : 4;
+            return n > 0 ? n : 4;
+        }();
+        static const int kMoeNSplit = []() {
+            const char* v = std::getenv("DSV4_CPP_MOE_NSPLIT");
+            int n = (v != nullptr && v[0] != '\0') ? std::atoi(v) : 4;
+            return n > 0 ? n : 4;
+        }();
+        const dim3 fp4_block(32 * kMoeWmmaWarps);
+        const dim3 fp4_block_nsplit(32 * kMoeNSplit);
         const size_t x_shared_bytes = 4096;
-        const dim3 w13_grid(ceil_div_int(inter_dim, 16), workspace.tile_count);
-        moe_prefill_fp4_grouped_w13_wmma_compact_kernel<<<w13_grid, fp4_block, x_shared_bytes, cuda_stream>>>(
-            workspace.d_x_q, workspace.d_x_scale, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w1q, d_w1s, d_w3q, d_w3s, workspace.d_gate, workspace.d_up, workspace.tile_count, dim, inter_dim);
+        if (kMoeNSplit == 4) {
+            const dim3 w13_grid(ceil_div_int(inter_dim, 16 * 4), workspace.tile_count);
+            const size_t w13_nsplit_smem = TILE_SHARED_NSPLIT_BYTES_W13(4);
+            moe_prefill_fp4_grouped_w13_wmma_compact_nsplit_kernel<4><<<w13_grid, fp4_block_nsplit, w13_nsplit_smem, cuda_stream>>>(
+                workspace.d_x_q, workspace.d_x_scale, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w1q, d_w1s, d_w3q, d_w3s, workspace.d_gate, workspace.d_up, workspace.tile_count, dim, inter_dim);
+        } else if (kMoeNSplit == 2) {
+            const dim3 w13_grid(ceil_div_int(inter_dim, 16 * 2), workspace.tile_count);
+            const size_t w13_nsplit_smem = TILE_SHARED_NSPLIT_BYTES_W13(2);
+            moe_prefill_fp4_grouped_w13_wmma_compact_nsplit_kernel<2><<<w13_grid, fp4_block_nsplit, w13_nsplit_smem, cuda_stream>>>(
+                workspace.d_x_q, workspace.d_x_scale, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w1q, d_w1s, d_w3q, d_w3s, workspace.d_gate, workspace.d_up, workspace.tile_count, dim, inter_dim);
+        } else {
+            const dim3 w13_grid(ceil_div_int(inter_dim, 16), workspace.tile_count);
+            moe_prefill_fp4_grouped_w13_wmma_compact_kernel<<<w13_grid, fp4_block, x_shared_bytes, cuda_stream>>>(
+                workspace.d_x_q, workspace.d_x_scale, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w1q, d_w1s, d_w3q, d_w3s, workspace.d_gate, workspace.d_up, workspace.tile_count, dim, inter_dim);
+        }
         std::chrono::steady_clock::time_point after_w13;
         if (profile) {
             cudaStreamSynchronize(cuda_stream);
@@ -1091,10 +1366,22 @@ bool moe_prefill_fp4_grouped_cuda_with_workspace(
             cudaStreamSynchronize(cuda_stream);
             after_swiglu = std::chrono::steady_clock::now();
         }
-        const dim3 w2_grid(ceil_div_int(dim, 16), workspace.tile_count);
         const size_t h_shared_bytes = 4096;
-        moe_prefill_fp4_grouped_w2_wmma_compact_kernel<<<w2_grid, fp4_block, h_shared_bytes, cuda_stream>>>(
-            workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w2q, d_w2s, d_y, workspace.tile_count, dim, inter_dim);
+        if (kMoeNSplit == 4) {
+            const dim3 w2_grid(ceil_div_int(dim, 16 * 4), workspace.tile_count);
+            const size_t w2_nsplit_smem = TILE_SHARED_NSPLIT_BYTES_W2(4);
+            moe_prefill_fp4_grouped_w2_wmma_compact_nsplit_kernel<4><<<w2_grid, fp4_block_nsplit, w2_nsplit_smem, cuda_stream>>>(
+                workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w2q, d_w2s, d_y, workspace.tile_count, dim, inter_dim);
+        } else if (kMoeNSplit == 2) {
+            const dim3 w2_grid(ceil_div_int(dim, 16 * 2), workspace.tile_count);
+            const size_t w2_nsplit_smem = TILE_SHARED_NSPLIT_BYTES_W2(2);
+            moe_prefill_fp4_grouped_w2_wmma_compact_nsplit_kernel<2><<<w2_grid, fp4_block_nsplit, w2_nsplit_smem, cuda_stream>>>(
+                workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w2q, d_w2s, d_y, workspace.tile_count, dim, inter_dim);
+        } else {
+            const dim3 w2_grid(ceil_div_int(dim, 16), workspace.tile_count);
+            moe_prefill_fp4_grouped_w2_wmma_compact_kernel<<<w2_grid, fp4_block, h_shared_bytes, cuda_stream>>>(
+                workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w2q, d_w2s, d_y, workspace.tile_count, dim, inter_dim);
+        }
         std::chrono::steady_clock::time_point after_w2;
         if (profile) {
             cudaStreamSynchronize(cuda_stream);

@@ -187,6 +187,18 @@ bool fp8_e4m3_e8m0_matmul_strided_cuda(
     int y_stride,
     void* stream = nullptr);
 
+bool wo_a_int8_decode_cuda(
+    const float* d_x,
+    const int8_t* d_weight_q,
+    const float* d_weight_scale,
+    float* d_y,
+    int groups,
+    int group_rank,
+    int group_dim,
+    int8_t* d_x_q,
+    float* d_x_scale,
+    void* stream = nullptr);
+
 bool rmsnorm_bf16_gamma_cuda(
     const float* d_x,
     const uint16_t* d_gamma_bf16,
@@ -381,6 +393,15 @@ bool build_prefill_window_indices_cuda(
     int tokens,
     int window_size,
     int topk,
+    void* stream = nullptr);
+
+bool build_decode_kv_indices_cuda(
+    int* d_indices,
+    int window_start,
+    int window_len,
+    int window_size,
+    int compressed_count,
+    int compressed_offset,
     void* stream = nullptr);
 
 bool prefill_sparse_attention_headpair_cuda(

@@ -60,6 +60,10 @@ public:
     std::vector<uint64_t> metadata_u64_array(const std::string& key) const;
     std::vector<double> metadata_f64_array(const std::string& key) const;
 
+    // Raw mmap base + size, exposed so callers can cudaHostRegister the
+    // entire file region for pinned async H2D out of GGUF data.
+    const uint8_t* bytes() const { return static_cast<const uint8_t*>(data_); }
+
 private:
     void parse();
     uint8_t read_u8(size_t& cursor) const;
@@ -74,8 +78,6 @@ private:
     double read_f64(size_t& cursor) const;
     std::string read_string(size_t& cursor) const;
     MetadataValue read_metadata_value(size_t& cursor, uint32_t value_type) const;
-
-    const uint8_t* bytes() const { return static_cast<const uint8_t*>(data_); }
 
     std::string path_;
     int fd_ = -1;

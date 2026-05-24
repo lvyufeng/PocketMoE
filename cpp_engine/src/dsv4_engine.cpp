@@ -5830,6 +5830,25 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     GgufForwardContext ctx(ckpt_path);
     GGUFWeightSource& gws = *ctx.weight_source;
 
+    // ===== pin the GGUF mmap region for async H2D out of expert bytes =====
+    // The routed expert per-step staging dominates decode wall time. Pinning
+    // the mmap region lets cudaMemcpyAsync DMA directly from the file pages
+    // at ~10 GB/s instead of the ~4 GB/s pageable+staging-copy path.
+    // ReadOnly avoids any RLIMIT_MEMLOCK pressure on systems that support it
+    // (CUDA 11.4+); fall back to default flags otherwise.
+    void* gguf_base = const_cast<uint8_t*>(gws.file().bytes());
+    const size_t gguf_bytes = gws.file().file_size();
+    bool gguf_registered = false;
+    if (cudaHostRegister(gguf_base, gguf_bytes, cudaHostRegisterReadOnly) == cudaSuccess) {
+        gguf_registered = true;
+    } else if (cudaHostRegister(gguf_base, gguf_bytes, cudaHostRegisterDefault) == cudaSuccess) {
+        gguf_registered = true;
+    } else {
+        // Clear the error and continue with the pageable path; correctness
+        // is unaffected, only bandwidth.
+        cudaGetLastError();
+    }
+
     // ===== model dims =====
     const int n_layers = static_cast<int>(ctx.config.n_layers);
     const int n_hash = static_cast<int>(ctx.config.n_hash_layers);
@@ -6158,12 +6177,12 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 auto wv3 = gws.get_expert(w3_name, w3_name, eid);
                 if (!wv1.found || !wv2.found || !wv3.found)
                     throw std::runtime_error("get_expert failed during decode staging");
-                check_cuda(cudaMemcpy(d_routed_w1 + per_w1_bytes * k, wv1.data, per_w1_bytes,
-                                      cudaMemcpyHostToDevice), "stage routed_w1");
-                check_cuda(cudaMemcpy(d_routed_w2 + per_w2_bytes * k, wv2.data, per_w2_bytes,
-                                      cudaMemcpyHostToDevice), "stage routed_w2");
-                check_cuda(cudaMemcpy(d_routed_w3 + per_w3_bytes * k, wv3.data, per_w3_bytes,
-                                      cudaMemcpyHostToDevice), "stage routed_w3");
+                check_cuda(cudaMemcpyAsync(d_routed_w1 + per_w1_bytes * k, wv1.data, per_w1_bytes,
+                                      cudaMemcpyHostToDevice, 0), "stage routed_w1");
+                check_cuda(cudaMemcpyAsync(d_routed_w2 + per_w2_bytes * k, wv2.data, per_w2_bytes,
+                                      cudaMemcpyHostToDevice, 0), "stage routed_w2");
+                check_cuda(cudaMemcpyAsync(d_routed_w3 + per_w3_bytes * k, wv3.data, per_w3_bytes,
+                                      cudaMemcpyHostToDevice, 0), "stage routed_w3");
             }
             gguf_layer_forward_moe(lw, ls, ld);
         }
@@ -6237,6 +6256,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     cudaFree(d_route_hidden_q); cudaFree(d_route_hidden_scale);
     cudaFree(d_gate_scores_scratch); cudaFree(d_gate_scored_scratch); cudaFree(d_gate_indices);
     cudaFree(d_tid2eid_i64); cudaFree(d_embed_row_f16); cudaFree(d_logits);
+    if (gguf_registered) cudaHostUnregister(gguf_base);
     return r;
 }
 

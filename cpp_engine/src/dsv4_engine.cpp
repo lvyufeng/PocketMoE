@@ -4392,6 +4392,213 @@ GgufRoutedExpertResult run_gguf_routed_expert_smoke(const std::string& ckpt_path
     return r;
 }
 
+GgufRoutedMoeResult run_gguf_routed_moe_smoke(const std::string& ckpt_path, int token) {
+    if (!is_gguf_path(ckpt_path)) {
+        throw std::runtime_error("run_gguf_routed_moe_smoke: not a GGUF path: " + ckpt_path);
+    }
+    if (token < 0) throw std::runtime_error("token must be >= 0");
+
+    GgufForwardContext ctx(ckpt_path);
+    GGUFWeightSource& gws = *ctx.weight_source;
+
+    WeightView embed = gws.require("embed.weight");
+    WeightView ffn_norm = gws.require("layers.0.ffn_norm.weight");
+    if (embed.dtype != DType::F16) throw std::runtime_error("embed dtype");
+    if (ffn_norm.dtype != DType::F32) throw std::runtime_error("ffn_norm dtype");
+
+    // Layer 0 is a hash gate layer: read precomputed expert ids from tid2eid.
+    // GGUF native shape [topk, vocab] = [6, 129280] stored as int32 row-major
+    // where the outer dim (vocab) varies slowest. Per-token row offset:
+    // token * topk * sizeof(int32). Internal-name lookup goes through the
+    // mapping table which Transpose2Ds the shape view to [vocab, topk].
+    WeightView tid2eid = gws.require("layers.0.ffn.gate.tid2eid");
+    // tid2eid dtype is i32 which is not in DType; just verify byte count.
+    const int topk = static_cast<int>(ctx.config.n_activated_experts);
+    const int vocab = static_cast<int>(embed.shape[1]);
+    if (topk <= 0 || topk > 8) {
+        throw std::runtime_error("topk out of supported range (1..8)");
+    }
+    if (token >= vocab) throw std::runtime_error("token id out of vocab range");
+    if (tid2eid.nbytes < static_cast<uint64_t>(token + 1) * topk * sizeof(int32_t)) {
+        throw std::runtime_error("tid2eid too small for requested token");
+    }
+    const int32_t* token_eids =
+        reinterpret_cast<const int32_t*>(tid2eid.data) +
+        static_cast<size_t>(token) * topk;
+    int h_expert_ids[8] = {0};
+    for (int k = 0; k < topk; ++k) h_expert_ids[k] = token_eids[k];
+
+    const int dim = static_cast<int>(embed.shape[0]);
+    const int moe_inter = static_cast<int>(ctx.config.moe_inter_dim);
+
+    // ----- Embed → ffn_norm -----
+    const uint16_t* host_row =
+        reinterpret_cast<const uint16_t*>(embed.data) +
+        static_cast<size_t>(token) * dim;
+    uint16_t* d_row_f16 = nullptr;
+    float* d_x = nullptr;
+    check_cuda(cudaMalloc(&d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
+    check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
+    check_cuda(cudaMemcpy(d_row_f16, host_row, dim * sizeof(uint16_t),
+                          cudaMemcpyHostToDevice), "copy embed row");
+    if (!f16_row_to_float_cuda(d_row_f16, d_x, /*row=*/0, dim)) {
+        throw std::runtime_error("f16 embed failed");
+    }
+    auto ffn_bf16 = f32_to_bf16_host(reinterpret_cast<const float*>(ffn_norm.data), dim);
+    uint16_t* d_ffn_gamma = nullptr;
+    check_cuda(cudaMalloc(&d_ffn_gamma, dim * sizeof(uint16_t)), "alloc d_ffn_gamma");
+    check_cuda(cudaMemcpy(d_ffn_gamma, ffn_bf16.data(), dim * sizeof(uint16_t),
+                          cudaMemcpyHostToDevice), "copy ffn_gamma");
+    float* d_x_normed = nullptr;
+    check_cuda(cudaMalloc(&d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
+    if (!rmsnorm_bf16_gamma_cuda(d_x, d_ffn_gamma, d_x_normed, dim, 1e-6f)) {
+        throw std::runtime_error("ffn_norm failed");
+    }
+
+    // ----- Active expert staging: pack topk experts' w1/w2/w3 bytes -----
+    // Use the first expert's view to learn per-expert sizes. Each routed
+    // tensor has shape [inner=4096, mid=2048, n_experts=256] (or w2 variant
+    // with mid=4096, inner=2048); per-expert byte size is total_nbytes / 256.
+    auto first_w1 = gws.get_expert("layers.0.ffn.experts.routed.w1",
+                                    "layers.0.ffn.experts.routed.w1", 0);
+    auto first_w2 = gws.get_expert("layers.0.ffn.experts.routed.w2",
+                                    "layers.0.ffn.experts.routed.w2", 0);
+    auto first_w3 = gws.get_expert("layers.0.ffn.experts.routed.w3",
+                                    "layers.0.ffn.experts.routed.w3", 0);
+    if (!first_w1.found || !first_w2.found || !first_w3.found) {
+        throw std::runtime_error("get_expert(0) failed");
+    }
+    const uint64_t per_w1_bytes = first_w1.nbytes;
+    const uint64_t per_w2_bytes = first_w2.nbytes;
+    const uint64_t per_w3_bytes = first_w3.nbytes;
+    const uint64_t staged_w1_bytes = per_w1_bytes * static_cast<uint64_t>(topk);
+    const uint64_t staged_w2_bytes = per_w2_bytes * static_cast<uint64_t>(topk);
+    const uint64_t staged_w3_bytes = per_w3_bytes * static_cast<uint64_t>(topk);
+    uint8_t* d_w1 = nullptr;
+    uint8_t* d_w2 = nullptr;
+    uint8_t* d_w3 = nullptr;
+    check_cuda(cudaMalloc(&d_w1, staged_w1_bytes), "alloc staged d_w1");
+    check_cuda(cudaMalloc(&d_w2, staged_w2_bytes), "alloc staged d_w2");
+    check_cuda(cudaMalloc(&d_w3, staged_w3_bytes), "alloc staged d_w3");
+    for (int k = 0; k < topk; ++k) {
+        const int eid = h_expert_ids[k];
+        auto wv1 = gws.get_expert("layers.0.ffn.experts.routed.w1",
+                                   "layers.0.ffn.experts.routed.w1", eid);
+        auto wv2 = gws.get_expert("layers.0.ffn.experts.routed.w2",
+                                   "layers.0.ffn.experts.routed.w2", eid);
+        auto wv3 = gws.get_expert("layers.0.ffn.experts.routed.w3",
+                                   "layers.0.ffn.experts.routed.w3", eid);
+        if (!wv1.found || !wv2.found || !wv3.found) {
+            throw std::runtime_error("get_expert failed for active expert");
+        }
+        check_cuda(cudaMemcpy(d_w1 + per_w1_bytes * k, wv1.data, per_w1_bytes,
+                              cudaMemcpyHostToDevice), "stage w1");
+        check_cuda(cudaMemcpy(d_w2 + per_w2_bytes * k, wv2.data, per_w2_bytes,
+                              cudaMemcpyHostToDevice), "stage w2");
+        check_cuda(cudaMemcpy(d_w3 + per_w3_bytes * k, wv3.data, per_w3_bytes,
+                              cudaMemcpyHostToDevice), "stage w3");
+    }
+
+    // ----- Routes / quant buffers -----
+    const int routes = topk;
+    const int x_groups = (dim + 31) / 32;
+    const int hidden_groups = (moe_inter + 15) / 16;
+    int8_t* d_x_q = nullptr;
+    float* d_x_scale = nullptr;
+    int64_t* d_route_slots = nullptr;
+    float* d_route_weights = nullptr;
+    float* d_gate = nullptr;
+    float* d_up = nullptr;
+    int8_t* d_hidden_q = nullptr;
+    float* d_hidden_scale = nullptr;
+    float* d_y = nullptr;
+    check_cuda(cudaMalloc(&d_x_q, dim), "alloc d_x_q");
+    check_cuda(cudaMalloc(&d_x_scale, x_groups * sizeof(float)), "alloc d_x_scale");
+    check_cuda(cudaMalloc(&d_route_slots, routes * sizeof(int64_t)), "alloc slots");
+    check_cuda(cudaMalloc(&d_route_weights, routes * sizeof(float)), "alloc weights");
+    // Per-route gate / up / hidden buffers (kernel addresses by route).
+    check_cuda(cudaMalloc(&d_gate, static_cast<size_t>(routes) * moe_inter * sizeof(float)),
+               "alloc d_gate");
+    check_cuda(cudaMalloc(&d_up, static_cast<size_t>(routes) * moe_inter * sizeof(float)),
+               "alloc d_up");
+    check_cuda(cudaMalloc(&d_hidden_q, static_cast<size_t>(routes) * moe_inter),
+               "alloc d_hidden_q");
+    check_cuda(cudaMalloc(&d_hidden_scale,
+                          static_cast<size_t>(routes) * hidden_groups * sizeof(float)),
+               "alloc d_hidden_scale");
+    check_cuda(cudaMalloc(&d_y, dim * sizeof(float)), "alloc d_y");
+    check_cuda(cudaMemset(d_y, 0, dim * sizeof(float)), "zero d_y");
+
+    // Staged expert buffer holds K experts back-to-back; slots index 0..K-1.
+    std::vector<int64_t> h_slots(routes);
+    for (int k = 0; k < routes; ++k) h_slots[k] = k;
+    std::vector<float> h_weights(routes, 1.0f / static_cast<float>(routes));
+    check_cuda(cudaMemcpy(d_route_slots, h_slots.data(), routes * sizeof(int64_t),
+                          cudaMemcpyHostToDevice), "copy slots");
+    check_cuda(cudaMemcpy(d_route_weights, h_weights.data(), routes * sizeof(float),
+                          cudaMemcpyHostToDevice), "copy weights");
+
+    // ----- Quantize x once (the w13 kernel reads x_q without per-route stride) -----
+    if (!q2_quantize_x_q8_1_cuda(d_x_normed, d_x_q, d_x_scale, /*routes=*/1, dim)) {
+        throw std::runtime_error("q2_quantize_x_q8_1 failed");
+    }
+
+    // ----- Batched IQ2_XXS w1/w3 across all active experts -----
+    if (!q2_moe_single_w13_iq2_xxs_cuda(d_x_q, d_x_scale, d_route_slots,
+                                         d_w1, d_w3, d_gate, d_up,
+                                         routes, /*n_experts=*/routes,
+                                         dim, moe_inter)) {
+        throw std::runtime_error("q2 w13 iq2_xxs failed");
+    }
+
+    // ----- SwiGLU + route weight + Q8_1 quantize hidden per-route -----
+    const float swiglu_limit = static_cast<float>(ctx.config.swiglu_limit);
+    if (!q2_route_swiglu_quantize_hidden_q8_1_cuda(d_gate, d_up, d_route_weights,
+                                                   d_hidden_q, d_hidden_scale,
+                                                   routes, moe_inter, swiglu_limit)) {
+        throw std::runtime_error("q2 swiglu + quantize failed");
+    }
+
+    // ----- Batched Q2_K w2 (accumulates into d_y via atomicAdd) -----
+    if (!q2_moe_single_w2_q2k_cuda(d_hidden_q, d_hidden_scale, d_route_slots,
+                                    d_w2, d_y,
+                                    routes, /*n_experts=*/routes,
+                                    dim, moe_inter)) {
+        throw std::runtime_error("q2 w2 q2k failed");
+    }
+    check_cuda(cudaDeviceSynchronize(), "sync after routed moe");
+
+    GgufRoutedMoeResult r;
+    r.dim = dim;
+    r.moe_inter_dim = moe_inter;
+    r.n_active = topk;
+    for (int k = 0; k < topk; ++k) r.expert_ids[k] = h_expert_ids[k];
+    r.ffn_normed_rms = device_vector_rms(d_x_normed, dim);
+    r.moe_out_rms = device_vector_rms(d_y, dim);
+    std::vector<float> first(4);
+    check_cuda(cudaMemcpy(first.data(), d_y, 4 * sizeof(float),
+                          cudaMemcpyDeviceToHost), "copy moe_out first");
+    for (int i = 0; i < 4; ++i) r.moe_out_first[i] = first[i];
+
+    cudaFree(d_row_f16);
+    cudaFree(d_x);
+    cudaFree(d_ffn_gamma);
+    cudaFree(d_x_normed);
+    cudaFree(d_w1);
+    cudaFree(d_w2);
+    cudaFree(d_w3);
+    cudaFree(d_x_q);
+    cudaFree(d_x_scale);
+    cudaFree(d_route_slots);
+    cudaFree(d_route_weights);
+    cudaFree(d_gate);
+    cudaFree(d_up);
+    cudaFree(d_hidden_q);
+    cudaFree(d_hidden_scale);
+    cudaFree(d_y);
+    return r;
+}
+
 // --- PersistentEngine implementation ---------------------------------------
 
 struct PersistentEngine::State {

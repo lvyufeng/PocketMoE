@@ -192,4 +192,23 @@ struct GgufRoutedExpertResult {
 
 GgufRoutedExpertResult run_gguf_routed_expert_smoke(const std::string& ckpt_path, int token, int expert_id);
 
+// Phase 3 step: multi-active-expert routed Q2 MoE smoke for layer 0.
+// Embed -> ffn_norm -> hash-gate lookup (tid2eid for hash layers) producing
+// top-k expert ids and uniform 1/k weights -> stage top-k experts' bytes
+// (w1/w3 IQ2_XXS + w2 Q2_K) into packed device buffers -> q8_1 quantize x
+// broadcast to routes -> batched IQ2_XXS w1/w3 matvec -> SwiGLU+route_weight
+// -> Q2_K w2 matvec accumulated across routes. Output: MoE contribution
+// (length dim) summed over the top-k active experts for this token.
+struct GgufRoutedMoeResult {
+    int dim = 0;
+    int moe_inter_dim = 0;
+    int n_active = 0;          // number of active experts (top-k)
+    int expert_ids[8] = {0,0,0,0,0,0,0,0};
+    float ffn_normed_rms = 0.0f;
+    float moe_out_rms = 0.0f;
+    float moe_out_first[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+};
+
+GgufRoutedMoeResult run_gguf_routed_moe_smoke(const std::string& ckpt_path, int token);
+
 }  // namespace dsv4

@@ -139,6 +139,10 @@ add_executable(test_gguf_layer0_full tests/test_gguf_layer0_full.cpp)
 target_link_libraries(test_gguf_layer0_full PRIVATE dsv4_cpp_core)
 set_target_properties(test_gguf_layer0_full PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(test_gguf_full_forward tests/test_gguf_full_forward.cpp)
+target_link_libraries(test_gguf_full_forward PRIVATE dsv4_cpp_core)
+set_target_properties(test_gguf_full_forward PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(test_quant_gemm tests/test_quant_gemm.cpp)
 target_link_libraries(test_quant_gemm PRIVATE dsv4_cpp_core)
 set_target_properties(test_quant_gemm PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

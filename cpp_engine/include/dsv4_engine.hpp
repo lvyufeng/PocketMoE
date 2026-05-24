@@ -243,4 +243,26 @@ struct GgufLayer0FullResult {
 
 GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path, int token, int position);
 
+// Phase 3 step: 43-layer GGUF forward + final norm + Q8_0 head + argmax.
+// Loads all dense weights resident on device, per-layer stages top-k routed
+// Q2 experts (hash-gate layers use tid2eid lookup; non-hash layers compute
+// the gate then D2H copy expert ids back to host for staging), runs the
+// layer-forward helper across all 43 layers, applies output_norm RMSNorm,
+// runs the Q8_0 head matvec, and reports the argmax token + top logit + a
+// debug checksum.
+struct GgufFullForwardResult {
+    int n_layers = 0;
+    int dim = 0;
+    int vocab = 0;
+    int top_token = 0;
+    float top_logit = 0.0f;
+    float checksum = 0.0f;       // sum of logits, like FP4 path
+    float final_x_rms = 0.0f;
+    float final_normed_rms = 0.0f;
+    float logits_rms = 0.0f;
+    float logits_first[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+};
+
+GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path, int token, int position);
+
 }  // namespace dsv4

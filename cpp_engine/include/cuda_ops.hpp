@@ -15,6 +15,74 @@ bool q8_0_matvec_cuda(
     int cols,
     void* stream = nullptr);
 
+// --- IQ2_XXS / Q2_K single-token MoE decode kernels (cuda/q2_ops.cu). ---
+
+// Returns a device pointer to the lazy-initialized signed_grid lookup table
+// (shape [256, 128, 8] int8, ~256 KiB). Returns nullptr on allocation failure.
+const int8_t* q2_signed_grid_device();
+
+// Quantize fp32 activations to Q8_1 with 32-element groups (one row per launch).
+bool q2_quantize_x_q8_1_cuda(
+    const float* d_x,
+    int8_t* d_x_q,
+    float* d_x_scale,
+    int rows,
+    int row_elems,
+    void* stream = nullptr);
+
+// Quantize fp32 hidden activations to Q8_1 with 16-element groups (post-SwiGLU).
+bool q2_quantize_hidden_q8_1_cuda(
+    const float* d_hidden,
+    int8_t* d_hidden_q,
+    float* d_hidden_scale,
+    int routes,
+    int inter_dim,
+    void* stream = nullptr);
+
+// Fused: SwiGLU(gate, up) * route_weight -> Q8_1 with 16-element groups.
+bool q2_route_swiglu_quantize_hidden_q8_1_cuda(
+    const float* d_gate,
+    const float* d_up,
+    const float* d_route_weights,
+    int8_t* d_hidden_q,
+    float* d_hidden_scale,
+    int routes,
+    int inter_dim,
+    float swiglu_limit,
+    void* stream = nullptr);
+
+// IQ2_XXS W1+W3 single-token matvec (per-route gate/up outputs).
+// d_w1_blocks/d_w3_blocks layout: per-expert [inter_dim, blocks_per_row*66] flat bytes
+// where blocks_per_row = dim / 256. Output: d_gate/d_up [routes, inter_dim].
+bool q2_moe_single_w13_iq2_xxs_cuda(
+    const int8_t* d_x_q,
+    const float* d_x_scale,
+    const int64_t* d_route_slots,
+    const uint8_t* d_w1_blocks,
+    const uint8_t* d_w3_blocks,
+    float* d_gate,
+    float* d_up,
+    int routes,
+    int n_experts,
+    int dim,
+    int inter_dim,
+    void* stream = nullptr);
+
+// Q2_K W2 single-token matvec. Accumulates onto d_y (caller must zero beforehand).
+// d_w2_blocks layout: per-expert [dim, blocks_per_row*84] flat bytes
+// where blocks_per_row = inter_dim / 256.
+bool q2_moe_single_w2_q2k_cuda(
+    const int8_t* d_hidden_q,
+    const float* d_hidden_scale,
+    const int64_t* d_route_slots,
+    const uint8_t* d_w2_blocks,
+    float* d_y,
+    int routes,
+    int n_experts,
+    int dim,
+    int inter_dim,
+    void* stream = nullptr);
+
 bool fp4_e2m1_e8m0_matvec_cuda(
     const float* d_x,
     const uint8_t* d_weight,

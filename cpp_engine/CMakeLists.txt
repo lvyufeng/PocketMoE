@@ -51,6 +51,7 @@ add_library(dsv4_cpp_core STATIC
     cuda/quant_gemm.cu
     cuda/fp4_ops.cu
     cuda/fp8_ops.cu
+    cuda/q2_ops.cu
     cuda/rmsnorm_rope.cu
 )
 
@@ -93,6 +94,10 @@ set_target_properties(test_safetensors_model PROPERTIES RUNTIME_OUTPUT_DIRECTORY
 add_executable(test_weight_source tests/test_weight_source.cpp)
 target_link_libraries(test_weight_source PRIVATE dsv4_cpp_core)
 set_target_properties(test_weight_source PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_q2_matvec tests/test_q2_matvec.cpp)
+target_link_libraries(test_q2_matvec PRIVATE dsv4_cpp_core)
+set_target_properties(test_q2_matvec PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_quant_gemm tests/test_quant_gemm.cpp)
 target_link_libraries(test_quant_gemm PRIVATE dsv4_cpp_core)

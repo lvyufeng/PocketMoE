@@ -154,4 +154,22 @@ struct GgufAttnFullResult {
 
 GgufAttnFullResult run_gguf_attn_full_smoke(const std::string& ckpt_path, int token, int position);
 
+// Phase 3 step: shared-expert FFN smoke for layer 0.
+// Embed -> ffn_norm RMSNorm -> shared w1 / w3 Q8_0 matvec -> silu_mul ->
+// shared w2 Q8_0 matvec. All three shared-expert projections are stored as
+// Q8_0 in the GGUF model. Output is the shared-expert contribution to the
+// FFN residual (length dim).
+struct GgufSharedExpertResult {
+    int dim = 0;
+    int moe_inter_dim = 0;
+    float ffn_normed_rms = 0.0f;
+    float gate_rms = 0.0f;
+    float up_rms = 0.0f;
+    float hidden_rms = 0.0f;   // after silu_mul
+    float shared_out_rms = 0.0f;
+    float shared_out_first[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+};
+
+GgufSharedExpertResult run_gguf_shared_expert_smoke(const std::string& ckpt_path, int token);
+
 }  // namespace dsv4

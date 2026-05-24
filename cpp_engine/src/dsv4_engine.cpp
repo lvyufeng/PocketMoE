@@ -4086,6 +4086,130 @@ GgufAttnFullResult run_gguf_attn_full_smoke(const std::string& ckpt_path,
     return r;
 }
 
+GgufSharedExpertResult run_gguf_shared_expert_smoke(const std::string& ckpt_path,
+                                                     int token) {
+    if (!is_gguf_path(ckpt_path)) {
+        throw std::runtime_error("run_gguf_shared_expert_smoke: not a GGUF path: " + ckpt_path);
+    }
+    if (token < 0) throw std::runtime_error("token must be >= 0");
+
+    GgufForwardContext ctx(ckpt_path);
+    WeightSource& ws = *ctx.weight_source;
+
+    WeightView embed = ws.require("embed.weight");
+    WeightView ffn_norm = ws.require("layers.0.ffn_norm.weight");
+    WeightView w1 = ws.require("layers.0.ffn.shared_experts.w1.weight");
+    WeightView w2 = ws.require("layers.0.ffn.shared_experts.w2.weight");
+    WeightView w3 = ws.require("layers.0.ffn.shared_experts.w3.weight");
+
+    if (embed.dtype != DType::F16) throw std::runtime_error("embed dtype");
+    if (ffn_norm.dtype != DType::F32) throw std::runtime_error("ffn_norm dtype");
+    if (w1.dtype != DType::Q8_0 || w2.dtype != DType::Q8_0 || w3.dtype != DType::Q8_0) {
+        throw std::runtime_error("shared expert projections must be Q8_0");
+    }
+
+    const int dim = static_cast<int>(embed.shape[0]);
+    const int moe_inter = static_cast<int>(ctx.config.moe_inter_dim);
+    if (static_cast<int>(w1.shape[0]) != dim ||
+        static_cast<int>(w1.shape[1]) != moe_inter) {
+        throw std::runtime_error("shared w1 shape mismatch");
+    }
+    if (static_cast<int>(w3.shape[0]) != dim ||
+        static_cast<int>(w3.shape[1]) != moe_inter) {
+        throw std::runtime_error("shared w3 shape mismatch");
+    }
+    if (static_cast<int>(w2.shape[0]) != moe_inter ||
+        static_cast<int>(w2.shape[1]) != dim) {
+        throw std::runtime_error("shared w2 shape mismatch");
+    }
+
+    // ----- Embed -----
+    const uint16_t* host_row =
+        reinterpret_cast<const uint16_t*>(embed.data) +
+        static_cast<size_t>(token) * dim;
+    uint16_t* d_row_f16 = nullptr;
+    float* d_x = nullptr;
+    check_cuda(cudaMalloc(&d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
+    check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
+    check_cuda(cudaMemcpy(d_row_f16, host_row, dim * sizeof(uint16_t),
+                          cudaMemcpyHostToDevice), "copy embed row");
+    if (!f16_row_to_float_cuda(d_row_f16, d_x, /*row=*/0, dim)) {
+        throw std::runtime_error("f16_row_to_float_cuda failed");
+    }
+
+    // ----- ffn_norm -----
+    auto ffn_bf16 = f32_to_bf16_host(reinterpret_cast<const float*>(ffn_norm.data), dim);
+    uint16_t* d_ffn_gamma = nullptr;
+    check_cuda(cudaMalloc(&d_ffn_gamma, dim * sizeof(uint16_t)), "alloc d_ffn_gamma");
+    check_cuda(cudaMemcpy(d_ffn_gamma, ffn_bf16.data(), dim * sizeof(uint16_t),
+                          cudaMemcpyHostToDevice), "copy ffn_gamma");
+    float* d_x_normed = nullptr;
+    check_cuda(cudaMalloc(&d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
+    if (!rmsnorm_bf16_gamma_cuda(d_x, d_ffn_gamma, d_x_normed, dim, 1e-6f)) {
+        throw std::runtime_error("ffn_norm failed");
+    }
+
+    // ----- Shared expert chain: silu(w1(x)) * w3(x), then w2 -----
+    uint8_t* d_w1 = nullptr;
+    uint8_t* d_w2 = nullptr;
+    uint8_t* d_w3 = nullptr;
+    check_cuda(cudaMalloc(&d_w1, w1.nbytes), "alloc d_w1");
+    check_cuda(cudaMalloc(&d_w2, w2.nbytes), "alloc d_w2");
+    check_cuda(cudaMalloc(&d_w3, w3.nbytes), "alloc d_w3");
+    check_cuda(cudaMemcpy(d_w1, w1.data, w1.nbytes, cudaMemcpyHostToDevice), "copy w1");
+    check_cuda(cudaMemcpy(d_w2, w2.data, w2.nbytes, cudaMemcpyHostToDevice), "copy w2");
+    check_cuda(cudaMemcpy(d_w3, w3.data, w3.nbytes, cudaMemcpyHostToDevice), "copy w3");
+
+    float* d_gate = nullptr;
+    float* d_up = nullptr;
+    float* d_hidden = nullptr;
+    float* d_shared_out = nullptr;
+    check_cuda(cudaMalloc(&d_gate, moe_inter * sizeof(float)), "alloc d_gate");
+    check_cuda(cudaMalloc(&d_up, moe_inter * sizeof(float)), "alloc d_up");
+    check_cuda(cudaMalloc(&d_hidden, moe_inter * sizeof(float)), "alloc d_hidden");
+    check_cuda(cudaMalloc(&d_shared_out, dim * sizeof(float)), "alloc d_shared_out");
+
+    if (!q8_0_matvec_cuda(d_x_normed, d_w1, d_gate, moe_inter, dim)) {
+        throw std::runtime_error("shared w1 failed");
+    }
+    if (!q8_0_matvec_cuda(d_x_normed, d_w3, d_up, moe_inter, dim)) {
+        throw std::runtime_error("shared w3 failed");
+    }
+    if (!silu_mul_cuda(d_gate, d_up, d_hidden, moe_inter)) {
+        throw std::runtime_error("silu_mul failed");
+    }
+    if (!q8_0_matvec_cuda(d_hidden, d_w2, d_shared_out, dim, moe_inter)) {
+        throw std::runtime_error("shared w2 failed");
+    }
+    check_cuda(cudaDeviceSynchronize(), "sync after shared expert");
+
+    GgufSharedExpertResult r;
+    r.dim = dim;
+    r.moe_inter_dim = moe_inter;
+    r.ffn_normed_rms = device_vector_rms(d_x_normed, dim);
+    r.gate_rms = device_vector_rms(d_gate, moe_inter);
+    r.up_rms = device_vector_rms(d_up, moe_inter);
+    r.hidden_rms = device_vector_rms(d_hidden, moe_inter);
+    r.shared_out_rms = device_vector_rms(d_shared_out, dim);
+    std::vector<float> first(4);
+    check_cuda(cudaMemcpy(first.data(), d_shared_out, 4 * sizeof(float),
+                          cudaMemcpyDeviceToHost), "copy shared_out first");
+    for (int i = 0; i < 4; ++i) r.shared_out_first[i] = first[i];
+
+    cudaFree(d_row_f16);
+    cudaFree(d_x);
+    cudaFree(d_ffn_gamma);
+    cudaFree(d_x_normed);
+    cudaFree(d_w1);
+    cudaFree(d_w2);
+    cudaFree(d_w3);
+    cudaFree(d_gate);
+    cudaFree(d_up);
+    cudaFree(d_hidden);
+    cudaFree(d_shared_out);
+    return r;
+}
+
 // --- PersistentEngine implementation ---------------------------------------
 
 struct PersistentEngine::State {

@@ -265,4 +265,26 @@ struct GgufFullForwardResult {
 
 GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path, int token, int position);
 
+// Phase 3 step: multi-token greedy decode smoke. Loads all dense weights once,
+// allocates a per-layer KV cache sized for the full sequence (seeds + decode),
+// then runs forward once per position. The token at position p is either the
+// seed at p (when p < seeds.size()) or the argmax from position p-1. Returns
+// the full sequence of generated tokens after the seeds, plus per-step top
+// logits and rough timing breakdown.
+struct GgufDecodeResult {
+    int n_layers = 0;
+    int dim = 0;
+    int vocab = 0;
+    std::vector<int> generated_tokens;  // length = max_new_tokens
+    std::vector<float> top_logits;      // length = seeds.size() + max_new_tokens
+    double load_seconds = 0.0;
+    double forward_seconds = 0.0;       // total time across all forward steps
+    int prompt_tokens = 0;
+    int decode_tokens = 0;
+};
+
+GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
+                                          const std::vector<int>& seed_tokens,
+                                          int max_new_tokens);
+
 }  // namespace dsv4

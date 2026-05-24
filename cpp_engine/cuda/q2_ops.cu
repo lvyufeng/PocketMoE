@@ -546,4 +546,33 @@ bool q2_moe_single_w2_q2k_cuda(
     return cudaGetLastError() == cudaSuccess;
 }
 
+// --- Generic F16 row dequant ------------------------------------------------
+// GGUF stores `token_embd.weight` and `output.weight` as F16. The layout is
+// row-major [vocab, dim] (per-token row is contiguous), matching the FP4 path's
+// BF16 embed/head layout. We provide the F16 counterpart of
+// `bf16_row_to_float_cuda` so the GGUF dense path can lift one token's
+// embedding into fp32 with a single 8 KiB H2D + a tiny kernel.
+
+__global__ void f16_row_to_float_kernel(
+    const uint16_t* matrix, float* y, int row, int cols) {
+    const int out_row = blockIdx.x;
+    const uint16_t* src = matrix + static_cast<size_t>(row + out_row) * cols;
+    float* dst = y + static_cast<size_t>(out_row) * cols;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        dst[c] = __half2float(__ushort_as_half(src[c]));
+    }
+}
+
+bool f16_row_to_float_cuda(
+    const uint16_t* d_matrix_f16,
+    float* d_y,
+    int row,
+    int cols,
+    void* stream) {
+    if (cols <= 0) return true;
+    cudaStream_t cs = static_cast<cudaStream_t>(stream);
+    f16_row_to_float_kernel<<<1, 256, 0, cs>>>(d_matrix_f16, d_y, row, cols);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 }  // namespace dsv4

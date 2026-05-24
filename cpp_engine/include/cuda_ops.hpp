@@ -314,6 +314,15 @@ bool bf16_row_to_float_cuda(
     int cols,
     void* stream = nullptr);
 
+// GGUF embed/head are stored F16 (IEEE half), not BF16. This is the F16
+// counterpart of bf16_row_to_float_cuda for the GGUF dense path.
+bool f16_row_to_float_cuda(
+    const uint16_t* d_matrix_f16,
+    float* d_y,
+    int row,
+    int cols,
+    void* stream = nullptr);
+
 bool bf16_rows_to_float_cuda(
     const uint16_t* d_matrix_bf16,
     const int* d_rows,

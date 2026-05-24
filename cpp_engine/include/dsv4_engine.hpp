@@ -172,4 +172,24 @@ struct GgufSharedExpertResult {
 
 GgufSharedExpertResult run_gguf_shared_expert_smoke(const std::string& ckpt_path, int token);
 
+// Phase 3 step: single routed expert smoke for layer 0.
+// Embed -> ffn_norm -> q8_1 quantize -> IQ2_XXS w1/w3 matvec -> SwiGLU
+// (clamped + route-weight) -> q8_1 quantize hidden -> Q2_K w2 matvec.
+// Loads only the single expert's slice from the routed 3D GGUF tensor, so
+// the kernel sees n_experts=1 + route_slots=[0]. This wires real GGUF
+// per-expert byte offsets into the existing Q2 single-token kernels.
+struct GgufRoutedExpertResult {
+    int dim = 0;
+    int moe_inter_dim = 0;
+    int expert_id = 0;
+    float ffn_normed_rms = 0.0f;
+    float gate_rms = 0.0f;
+    float up_rms = 0.0f;
+    float hidden_rms = 0.0f; // after SwiGLU + route weight (post quantize-dequantize)
+    float route_out_rms = 0.0f;
+    float route_out_first[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+};
+
+GgufRoutedExpertResult run_gguf_routed_expert_smoke(const std::string& ckpt_path, int token, int expert_id);
+
 }  // namespace dsv4

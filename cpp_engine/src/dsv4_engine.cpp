@@ -3448,6 +3448,130 @@ GgufSmokeResult run_gguf_min_layer_smoke(const std::string& ckpt_path) {
     return r;
 }
 
+namespace {
+
+// Convert host F32 array to BF16 by truncating the low 16 bits of the IEEE
+// 754 binary32 representation. Matches the round-down-to-bf16 convention
+// used by the safetensors loader's BF16 norm gammas, so the GGUF F32-gamma
+// path produces RMSNorm output bit-equivalent to a BF16-gamma checkpoint.
+std::vector<uint16_t> f32_to_bf16_host(const float* src, size_t n) {
+    std::vector<uint16_t> out(n);
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t bits;
+        std::memcpy(&bits, &src[i], sizeof(bits));
+        out[i] = static_cast<uint16_t>(bits >> 16);
+    }
+    return out;
+}
+
+float device_vector_rms(const float* d_x, int n) {
+    std::vector<float> h(n);
+    check_cuda(cudaMemcpy(h.data(), d_x, n * sizeof(float), cudaMemcpyDeviceToHost),
+               "device_vector_rms memcpy");
+    double s = 0.0;
+    for (float v : h) s += static_cast<double>(v) * static_cast<double>(v);
+    return n > 0 ? static_cast<float>(std::sqrt(s / n)) : 0.0f;
+}
+
+}  // namespace
+
+GgufAttnNormWqaResult run_gguf_attn_norm_wq_a_smoke(const std::string& ckpt_path, int token) {
+    if (!is_gguf_path(ckpt_path)) {
+        throw std::runtime_error("run_gguf_attn_norm_wq_a_smoke: not a GGUF path: " + ckpt_path);
+    }
+    if (token < 0) {
+        throw std::runtime_error("run_gguf_attn_norm_wq_a_smoke: token must be >= 0");
+    }
+    GgufForwardContext ctx(ckpt_path);
+    WeightSource& ws = *ctx.weight_source;
+
+    WeightView embed = ws.require("embed.weight");
+    WeightView attn_norm = ws.require("layers.0.attn_norm.weight");
+    WeightView wq_a = ws.require("layers.0.attn.wq_a.weight");
+
+    if (embed.dtype != DType::F16 || embed.shape.size() != 2) {
+        throw std::runtime_error("embed.weight is not 2D F16");
+    }
+    if (attn_norm.dtype != DType::F32 || attn_norm.shape.size() != 1) {
+        throw std::runtime_error("layers.0.attn_norm.weight is not 1D F32");
+    }
+    if (wq_a.dtype != DType::Q8_0 || wq_a.shape.size() != 2) {
+        throw std::runtime_error("layers.0.attn.wq_a.weight is not 2D Q8_0");
+    }
+
+    const int dim = static_cast<int>(embed.shape[0]);
+    const int vocab = static_cast<int>(embed.shape[1]);
+    if (token >= vocab) throw std::runtime_error("token id out of vocab range");
+    if (static_cast<int>(attn_norm.shape[0]) != dim) {
+        throw std::runtime_error("attn_norm shape mismatch with dim");
+    }
+    // GGUF wq_a shape [cols=dim, rows=q_a_dim] with cols fastest varying.
+    if (static_cast<int>(wq_a.shape[0]) != dim) {
+        throw std::runtime_error("wq_a inner dim != dim");
+    }
+    const int q_a_dim = static_cast<int>(wq_a.shape[1]);
+
+    // 1. Upload one token's F16 embedding row and dequantize to fp32.
+    const uint16_t* host_embed_row =
+        reinterpret_cast<const uint16_t*>(embed.data) +
+        static_cast<size_t>(token) * dim;
+    uint16_t* d_row_f16 = nullptr;
+    float* d_x = nullptr;
+    check_cuda(cudaMalloc(&d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
+    check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
+    check_cuda(cudaMemcpy(d_row_f16, host_embed_row, dim * sizeof(uint16_t),
+                          cudaMemcpyHostToDevice), "copy embed row");
+    if (!f16_row_to_float_cuda(d_row_f16, d_x, /*row=*/0, dim)) {
+        throw std::runtime_error("f16_row_to_float_cuda failed");
+    }
+
+    // 2. Convert attn_norm F32 gamma to BF16 (host-side) and upload.
+    auto bf16 = f32_to_bf16_host(reinterpret_cast<const float*>(attn_norm.data), dim);
+    uint16_t* d_attn_gamma = nullptr;
+    check_cuda(cudaMalloc(&d_attn_gamma, dim * sizeof(uint16_t)), "alloc d_attn_gamma");
+    check_cuda(cudaMemcpy(d_attn_gamma, bf16.data(), dim * sizeof(uint16_t),
+                          cudaMemcpyHostToDevice), "copy attn_norm gamma");
+
+    // 3. RMSNorm.
+    float* d_x_normed = nullptr;
+    check_cuda(cudaMalloc(&d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
+    if (!rmsnorm_bf16_gamma_cuda(d_x, d_attn_gamma, d_x_normed, dim, 1e-6f)) {
+        throw std::runtime_error("rmsnorm_bf16_gamma_cuda failed");
+    }
+
+    // 4. Upload wq_a Q8_0 blocks and run matvec.
+    uint8_t* d_wq_a = nullptr;
+    check_cuda(cudaMalloc(&d_wq_a, wq_a.nbytes), "alloc d_wq_a");
+    check_cuda(cudaMemcpy(d_wq_a, wq_a.data, wq_a.nbytes, cudaMemcpyHostToDevice),
+               "copy wq_a");
+    float* d_q_a = nullptr;
+    check_cuda(cudaMalloc(&d_q_a, q_a_dim * sizeof(float)), "alloc d_q_a");
+    if (!q8_0_matvec_cuda(d_x_normed, d_wq_a, d_q_a, q_a_dim, dim)) {
+        throw std::runtime_error("q8_0_matvec_cuda failed");
+    }
+    check_cuda(cudaDeviceSynchronize(), "sync after wq_a");
+
+    // 5. Collect diagnostics.
+    GgufAttnNormWqaResult r;
+    r.dim = dim;
+    r.q_a_dim = q_a_dim;
+    r.embed_rms = device_vector_rms(d_x, dim);
+    r.normed_rms = device_vector_rms(d_x_normed, dim);
+    r.q_a_rms = device_vector_rms(d_q_a, q_a_dim);
+    std::vector<float> first(4);
+    check_cuda(cudaMemcpy(first.data(), d_q_a, 4 * sizeof(float),
+                          cudaMemcpyDeviceToHost), "copy q_a first");
+    for (int i = 0; i < 4; ++i) r.q_a_first[i] = first[i];
+
+    cudaFree(d_row_f16);
+    cudaFree(d_x);
+    cudaFree(d_attn_gamma);
+    cudaFree(d_x_normed);
+    cudaFree(d_wq_a);
+    cudaFree(d_q_a);
+    return r;
+}
+
 // --- PersistentEngine implementation ---------------------------------------
 
 struct PersistentEngine::State {

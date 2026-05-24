@@ -79,4 +79,19 @@ struct GgufSmokeResult {
 
 GgufSmokeResult run_gguf_min_layer_smoke(const std::string& ckpt_path);
 
+// Phase 3 step: exercise the dense input chain for layer 0 attention's
+// q_a branch. Embed F16 lookup -> attn_norm F32->BF16 RMSNorm -> wq_a Q8_0
+// matvec. Validates the F32 norm gamma conversion path and the first
+// Q8_0 attention projection against real GGUF data.
+struct GgufAttnNormWqaResult {
+    int dim = 0;
+    int q_a_dim = 0;
+    float embed_rms = 0.0f;
+    float normed_rms = 0.0f;
+    float q_a_rms = 0.0f;
+    float q_a_first[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+};
+
+GgufAttnNormWqaResult run_gguf_attn_norm_wq_a_smoke(const std::string& ckpt_path, int token);
+
 }  // namespace dsv4

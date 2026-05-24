@@ -107,6 +107,10 @@ add_executable(test_gguf_min_layer_smoke tests/test_gguf_min_layer_smoke.cpp)
 target_link_libraries(test_gguf_min_layer_smoke PRIVATE dsv4_cpp_core)
 set_target_properties(test_gguf_min_layer_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(test_gguf_attn_norm_wqa tests/test_gguf_attn_norm_wqa.cpp)
+target_link_libraries(test_gguf_attn_norm_wqa PRIVATE dsv4_cpp_core)
+set_target_properties(test_gguf_attn_norm_wqa PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(test_quant_gemm tests/test_quant_gemm.cpp)
 target_link_libraries(test_quant_gemm PRIVATE dsv4_cpp_core)
 set_target_properties(test_quant_gemm PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

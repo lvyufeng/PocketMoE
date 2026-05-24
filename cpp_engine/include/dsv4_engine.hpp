@@ -59,4 +59,24 @@ std::vector<ForwardSmokeResult> run_safetensors_generate_tokens(const std::strin
 std::vector<ForwardSmokeResult> run_safetensors_generate_tokens_with_options(const std::string& ckpt_dir, const std::vector<int>& seed_tokens, int layer_count, int max_new_tokens, const ForwardSmokeOptions& options);
 GenerateSmokeResult run_safetensors_generate_tokens_timed_with_options(const std::string& ckpt_dir, const std::vector<int>& seed_tokens, int layer_count, int max_new_tokens, const ForwardSmokeOptions& options);
 
+// --- GGUF Q2 forward entry points ------------------------------------------
+//
+// Sibling to the safetensors path. The full forward chain isn't wired in yet
+// (Phase 3); this initial entry point only verifies that we can construct a
+// GgufForwardContext and that the GGUF mapping table resolves the dense
+// metadata we'll need. Implementation is in dsv4_engine.cpp alongside the
+// safetensors path so future GGUF forward operators can share helpers.
+
+struct GgufSmokeResult {
+    int n_layers = 0;
+    int n_hash_layers = 0;
+    int dim = 0;
+    int moe_inter_dim = 0;
+    int n_routed_experts = 0;
+    int n_activated_experts = 0;
+    int vocab = 0;
+};
+
+GgufSmokeResult run_gguf_min_layer_smoke(const std::string& ckpt_path);
+
 }  // namespace dsv4

@@ -3406,6 +3406,48 @@ ForwardSmokeResult run_safetensors_token_forward_with_options(const std::string&
     return run_safetensors_token_forward_impl(ctx, token, layer_count, position);
 }
 
+// --- GGUF Q2 forward path (Phase 3, work in progress) ---------------------
+
+namespace {
+
+// Parallels SafeForwardContext for the GGUF Q2 path. Currently a minimal
+// shell that owns the GGUF mmap + WeightSource + ModelConfig; per-layer
+// caches and forward state will be added as dense/MoE operators are wired
+// in. Lives in the anonymous namespace because external callers go through
+// the run_gguf_* entry points.
+struct GgufForwardContext {
+    std::string ckpt_path;
+    std::unique_ptr<GGUFWeightSource> weight_source;
+    ModelConfig config;
+
+    explicit GgufForwardContext(const std::string& path)
+        : ckpt_path(path),
+          weight_source(std::make_unique<GGUFWeightSource>(path)),
+          config(ModelConfig::from_gguf(weight_source->file())) {}
+};
+
+}  // namespace
+
+GgufSmokeResult run_gguf_min_layer_smoke(const std::string& ckpt_path) {
+    if (!is_gguf_path(ckpt_path)) {
+        throw std::runtime_error("run_gguf_min_layer_smoke: not a GGUF path: " + ckpt_path);
+    }
+    GgufForwardContext ctx(ckpt_path);
+    WeightView embed = ctx.weight_source->require("embed.weight");
+    if (embed.shape.size() != 2) {
+        throw std::runtime_error("gguf embed.weight rank != 2");
+    }
+    GgufSmokeResult r;
+    r.n_layers = static_cast<int>(ctx.config.n_layers);
+    r.n_hash_layers = static_cast<int>(ctx.config.n_hash_layers);
+    r.dim = static_cast<int>(ctx.config.dim);
+    r.moe_inter_dim = static_cast<int>(ctx.config.moe_inter_dim);
+    r.n_routed_experts = static_cast<int>(ctx.config.n_routed_experts);
+    r.n_activated_experts = static_cast<int>(ctx.config.n_activated_experts);
+    r.vocab = static_cast<int>(embed.shape[1]);
+    return r;
+}
+
 // --- PersistentEngine implementation ---------------------------------------
 
 struct PersistentEngine::State {

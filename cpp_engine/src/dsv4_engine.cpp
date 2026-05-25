@@ -6277,6 +6277,11 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             lw.is_hash = is_hash;
             lw.d_routed_w1 = d_routed_w1; lw.d_routed_w2 = d_routed_w2; lw.d_routed_w3 = d_routed_w3;
             ls.d_kv_cache = d_kv_cache[L];
+            const std::string lp = "layers." + std::to_string(L);
+            const std::string w1_name = lp + ".ffn.experts.routed.w1";
+            const std::string w2_name = lp + ".ffn.experts.routed.w2";
+            const std::string w3_name = lp + ".ffn.experts.routed.w3";
+            bool hash_prestaged = false;
             if (is_hash) {
                 const int32_t* row = h_tid2eid_table[L] + static_cast<size_t>(token) * topk;
                 int64_t h_slice[8];
@@ -6285,45 +6290,77 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                                       cudaMemcpyHostToDevice), "copy tid2eid slice");
                 lw.d_tid2eid_i64 = d_tid2eid_i64;
                 lw.d_gate_bias_f32 = nullptr;
+                // Hash-layer expert ids come straight from the deterministic
+                // tid2eid table -- no dependency on the gate matvec. Pre-stage
+                // the routed experts on copy_stream NOW so the H2D overlaps
+                // with attention compute on the default stream below.
+                if (moe_copy_stream_enabled) {
+                    for (int k = 0; k < topk; ++k) {
+                        const int eid = static_cast<int>(h_slice[k]);
+                        if (eid < 0 || eid >= n_experts)
+                            throw std::runtime_error("hash table produced out-of-range expert id");
+                        const bool is_local = (eid >= expert_start && eid < expert_end);
+                        h_route_slots[k] = is_local ? static_cast<int64_t>(k) : -1;
+                        if (!is_local) continue;
+                        auto wv1 = gws.get_expert(w1_name, w1_name, eid);
+                        auto wv2 = gws.get_expert(w2_name, w2_name, eid);
+                        auto wv3 = gws.get_expert(w3_name, w3_name, eid);
+                        if (!wv1.found || !wv2.found || !wv3.found)
+                            throw std::runtime_error("get_expert failed during hash prestaging");
+                        check_cuda(cudaMemcpyAsync(d_routed_w1 + per_w1_bytes * k, wv1.data, per_w1_bytes,
+                                              cudaMemcpyHostToDevice, gguf_moe_copy_stream), "prestage routed_w1");
+                        check_cuda(cudaMemcpyAsync(d_routed_w2 + per_w2_bytes * k, wv2.data, per_w2_bytes,
+                                              cudaMemcpyHostToDevice, gguf_moe_copy_stream), "prestage routed_w2");
+                        check_cuda(cudaMemcpyAsync(d_routed_w3 + per_w3_bytes * k, wv3.data, per_w3_bytes,
+                                              cudaMemcpyHostToDevice, gguf_moe_copy_stream), "prestage routed_w3");
+                    }
+                    check_cuda(cudaMemcpyAsync(d_route_slots, h_route_slots.data(),
+                                               topk * sizeof(int64_t),
+                                               cudaMemcpyHostToDevice, gguf_moe_copy_stream),
+                               "prestage d_route_slots");
+                    check_cuda(cudaEventRecord(gguf_moe_stage_event, gguf_moe_copy_stream),
+                               "record gguf moe stage event (hash prestage)");
+                    hash_prestaged = true;
+                }
             } else {
                 lw.d_tid2eid_i64 = nullptr;
                 lw.d_gate_bias_f32 = d_gate_bias[L];
             }
             gguf_layer_forward_attn_to_gate(lw, ls, ld, position, reduce_ctx_ptr);
-            check_cuda(cudaMemcpy(h_gate_indices.data(), d_gate_indices, topk * sizeof(int64_t),
-                                  cudaMemcpyDeviceToHost), "copy gate indices");
             auto t_attn_end = std::chrono::steady_clock::now();
             if (profile_gguf) prof_attn_ms += elapsed_ms(t_layer_start, t_attn_end);
-            const std::string lp = "layers." + std::to_string(L);
-            const std::string w1_name = lp + ".ffn.experts.routed.w1";
-            const std::string w2_name = lp + ".ffn.experts.routed.w2";
-            const std::string w3_name = lp + ".ffn.experts.routed.w3";
-            for (int k = 0; k < topk; ++k) {
-                const int eid = static_cast<int>(h_gate_indices[k]);
-                if (eid < 0 || eid >= n_experts)
-                    throw std::runtime_error("gate produced out-of-range expert id");
-                const bool is_local = (eid >= expert_start && eid < expert_end);
-                h_route_slots[k] = is_local ? static_cast<int64_t>(k) : -1;
-                if (!is_local) continue;
-                auto wv1 = gws.get_expert(w1_name, w1_name, eid);
-                auto wv2 = gws.get_expert(w2_name, w2_name, eid);
-                auto wv3 = gws.get_expert(w3_name, w3_name, eid);
-                if (!wv1.found || !wv2.found || !wv3.found)
-                    throw std::runtime_error("get_expert failed during decode staging");
-                check_cuda(cudaMemcpyAsync(d_routed_w1 + per_w1_bytes * k, wv1.data, per_w1_bytes,
-                                      cudaMemcpyHostToDevice, gguf_moe_copy_stream), "stage routed_w1");
-                check_cuda(cudaMemcpyAsync(d_routed_w2 + per_w2_bytes * k, wv2.data, per_w2_bytes,
-                                      cudaMemcpyHostToDevice, gguf_moe_copy_stream), "stage routed_w2");
-                check_cuda(cudaMemcpyAsync(d_routed_w3 + per_w3_bytes * k, wv3.data, per_w3_bytes,
-                                      cudaMemcpyHostToDevice, gguf_moe_copy_stream), "stage routed_w3");
+            if (!hash_prestaged) {
+                check_cuda(cudaMemcpy(h_gate_indices.data(), d_gate_indices, topk * sizeof(int64_t),
+                                      cudaMemcpyDeviceToHost), "copy gate indices");
+                for (int k = 0; k < topk; ++k) {
+                    const int eid = static_cast<int>(h_gate_indices[k]);
+                    if (eid < 0 || eid >= n_experts)
+                        throw std::runtime_error("gate produced out-of-range expert id");
+                    const bool is_local = (eid >= expert_start && eid < expert_end);
+                    h_route_slots[k] = is_local ? static_cast<int64_t>(k) : -1;
+                    if (!is_local) continue;
+                    auto wv1 = gws.get_expert(w1_name, w1_name, eid);
+                    auto wv2 = gws.get_expert(w2_name, w2_name, eid);
+                    auto wv3 = gws.get_expert(w3_name, w3_name, eid);
+                    if (!wv1.found || !wv2.found || !wv3.found)
+                        throw std::runtime_error("get_expert failed during decode staging");
+                    check_cuda(cudaMemcpyAsync(d_routed_w1 + per_w1_bytes * k, wv1.data, per_w1_bytes,
+                                          cudaMemcpyHostToDevice, gguf_moe_copy_stream), "stage routed_w1");
+                    check_cuda(cudaMemcpyAsync(d_routed_w2 + per_w2_bytes * k, wv2.data, per_w2_bytes,
+                                          cudaMemcpyHostToDevice, gguf_moe_copy_stream), "stage routed_w2");
+                    check_cuda(cudaMemcpyAsync(d_routed_w3 + per_w3_bytes * k, wv3.data, per_w3_bytes,
+                                          cudaMemcpyHostToDevice, gguf_moe_copy_stream), "stage routed_w3");
+                }
+                check_cuda(cudaMemcpyAsync(d_route_slots, h_route_slots.data(),
+                                           topk * sizeof(int64_t),
+                                           cudaMemcpyHostToDevice, gguf_moe_copy_stream),
+                           "copy d_route_slots");
+                if (moe_copy_stream_enabled) {
+                    check_cuda(cudaEventRecord(gguf_moe_stage_event, gguf_moe_copy_stream),
+                               "record gguf moe stage event");
+                }
             }
-            check_cuda(cudaMemcpyAsync(d_route_slots, h_route_slots.data(),
-                                       topk * sizeof(int64_t),
-                                       cudaMemcpyHostToDevice, gguf_moe_copy_stream),
-                       "copy d_route_slots");
             if (moe_copy_stream_enabled) {
-                check_cuda(cudaEventRecord(gguf_moe_stage_event, gguf_moe_copy_stream),
-                           "record gguf moe stage event");
                 check_cuda(cudaStreamWaitEvent(nullptr, gguf_moe_stage_event, 0),
                            "default stream wait stage event");
             }

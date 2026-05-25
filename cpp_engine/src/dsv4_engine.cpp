@@ -6180,6 +6180,22 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     check_cuda(cudaMalloc(&d_embed_row_f16, dim * sizeof(uint16_t)), "alloc d_embed_row_f16");
     check_cuda(cudaMalloc(&d_logits, local_vocab * sizeof(float)), "alloc d_logits");
 
+    // Dedicated copy stream for staging (H2D for routed Q2 experts). Currently
+    // neutral in wall-time (staging is on the critical path between gate D2H
+    // and MoE compute; nothing on default stream can overlap with it within a
+    // layer) but kept so future cross-step prefetch can issue early stages on
+    // copy_stream while the prior step's MoE drains on default.
+    const bool moe_copy_stream_enabled =
+        env_int_or_default("DSV4_GGUF_MOE_COPY_STREAM", 1) != 0;
+    cudaStream_t gguf_moe_copy_stream = nullptr;
+    cudaEvent_t gguf_moe_stage_event = nullptr;
+    if (moe_copy_stream_enabled) {
+        check_cuda(cudaStreamCreateWithFlags(&gguf_moe_copy_stream, cudaStreamNonBlocking),
+                   "create gguf moe copy stream");
+        check_cuda(cudaEventCreateWithFlags(&gguf_moe_stage_event, cudaEventDisableTiming),
+                   "create gguf moe stage event");
+    }
+
 #ifdef DSV4_HAVE_NCCL
     BF16AllReduceScratch bf16_reduce_scratch;
 #endif
@@ -6225,10 +6241,19 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     auto t_load_end = std::chrono::steady_clock::now();
 
     // ===== per-step forward (embed + 43 layers + final norm + head + argmax) =====
+    const bool profile_gguf = env_int_or_default("DSV4_GGUF_PROFILE", 0) != 0;
+    double prof_attn_ms = 0.0, prof_stage_ms = 0.0, prof_moe_ms = 0.0;
+    double prof_embed_ms = 0.0, prof_head_ms = 0.0;
+    int prof_steps = 0;
+    auto sync_now = [&]() {
+        if (profile_gguf) check_cuda(cudaDeviceSynchronize(), "profile sync");
+        return std::chrono::steady_clock::now();
+    };
     std::vector<int64_t> h_gate_indices(topk);
     std::vector<int64_t> h_route_slots(topk);
     std::vector<float> h_logits(local_vocab);
     auto run_step = [&](int token, int position) -> std::pair<int, float> {
+        auto t_embed_start = sync_now();
         const uint16_t* host_embed_row =
             reinterpret_cast<const uint16_t*>(embed.data) +
             static_cast<size_t>(token) * dim;
@@ -6236,7 +6261,10 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                               cudaMemcpyHostToDevice), "copy embed row");
         if (!f16_row_to_float_cuda(d_embed_row_f16, d_x, /*row=*/0, dim))
             throw std::runtime_error("f16 embed failed");
+        auto t_embed_end = sync_now();
+        if (profile_gguf) prof_embed_ms += elapsed_ms(t_embed_start, t_embed_end);
         for (int L = 0; L < n_layers; ++L) {
+            auto t_layer_start = sync_now();
             const bool is_hash = (L < n_hash);
             GgufLayerDeviceWeights lw;
             lw.d_attn_gamma = d_attn_gamma[L]; lw.d_q_gamma = d_q_gamma[L]; lw.d_kv_gamma = d_kv_gamma[L];
@@ -6264,6 +6292,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             gguf_layer_forward_attn_to_gate(lw, ls, ld, position, reduce_ctx_ptr);
             check_cuda(cudaMemcpy(h_gate_indices.data(), d_gate_indices, topk * sizeof(int64_t),
                                   cudaMemcpyDeviceToHost), "copy gate indices");
+            auto t_attn_end = std::chrono::steady_clock::now();
+            if (profile_gguf) prof_attn_ms += elapsed_ms(t_layer_start, t_attn_end);
             const std::string lp = "layers." + std::to_string(L);
             const std::string w1_name = lp + ".ffn.experts.routed.w1";
             const std::string w2_name = lp + ".ffn.experts.routed.w2";
@@ -6281,18 +6311,29 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 if (!wv1.found || !wv2.found || !wv3.found)
                     throw std::runtime_error("get_expert failed during decode staging");
                 check_cuda(cudaMemcpyAsync(d_routed_w1 + per_w1_bytes * k, wv1.data, per_w1_bytes,
-                                      cudaMemcpyHostToDevice, 0), "stage routed_w1");
+                                      cudaMemcpyHostToDevice, gguf_moe_copy_stream), "stage routed_w1");
                 check_cuda(cudaMemcpyAsync(d_routed_w2 + per_w2_bytes * k, wv2.data, per_w2_bytes,
-                                      cudaMemcpyHostToDevice, 0), "stage routed_w2");
+                                      cudaMemcpyHostToDevice, gguf_moe_copy_stream), "stage routed_w2");
                 check_cuda(cudaMemcpyAsync(d_routed_w3 + per_w3_bytes * k, wv3.data, per_w3_bytes,
-                                      cudaMemcpyHostToDevice, 0), "stage routed_w3");
+                                      cudaMemcpyHostToDevice, gguf_moe_copy_stream), "stage routed_w3");
             }
             check_cuda(cudaMemcpyAsync(d_route_slots, h_route_slots.data(),
                                        topk * sizeof(int64_t),
-                                       cudaMemcpyHostToDevice, 0),
+                                       cudaMemcpyHostToDevice, gguf_moe_copy_stream),
                        "copy d_route_slots");
+            if (moe_copy_stream_enabled) {
+                check_cuda(cudaEventRecord(gguf_moe_stage_event, gguf_moe_copy_stream),
+                           "record gguf moe stage event");
+                check_cuda(cudaStreamWaitEvent(nullptr, gguf_moe_stage_event, 0),
+                           "default stream wait stage event");
+            }
+            auto t_stage_end = sync_now();
+            if (profile_gguf) prof_stage_ms += elapsed_ms(t_attn_end, t_stage_end);
             gguf_layer_forward_moe(lw, ls, ld, reduce_ctx_ptr);
+            auto t_moe_end = sync_now();
+            if (profile_gguf) prof_moe_ms += elapsed_ms(t_stage_end, t_moe_end);
         }
+        auto t_head_start = sync_now();
         if (!rmsnorm_bf16_gamma_cuda(d_x, d_final_norm_gamma, d_x_normed, dim, 1e-6f))
             throw std::runtime_error("final norm failed");
         if (!q8_0_matvec_cuda(d_x_normed, d_head, d_logits, local_vocab, dim))
@@ -6316,6 +6357,11 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             top_l = global.logit;
         }
 #endif
+        if (profile_gguf) {
+            auto t_head_end = std::chrono::steady_clock::now();
+            prof_head_ms += elapsed_ms(t_head_start, t_head_end);
+            ++prof_steps;
+        }
         return {top_t, top_l};
     };
 
@@ -6348,6 +6394,18 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     r.load_seconds = std::chrono::duration<double>(t_load_end - t_load_start).count();
     r.forward_seconds = std::chrono::duration<double>(t_forward_end - t_forward_start).count();
 
+    if (profile_gguf && prof_steps > 0 && tp_rank == 0) {
+        const double inv = 1.0 / static_cast<double>(prof_steps);
+        const double per_layer_attn = prof_attn_ms * inv / static_cast<double>(n_layers);
+        const double per_layer_stage = prof_stage_ms * inv / static_cast<double>(n_layers);
+        const double per_layer_moe = prof_moe_ms * inv / static_cast<double>(n_layers);
+        const double per_step_total = (prof_embed_ms + prof_attn_ms + prof_stage_ms + prof_moe_ms + prof_head_ms) * inv;
+        std::printf("[gguf_profile steps=%d n_layers=%d] per_step: embed=%.2f attn+gate=%.2f stage=%.2f moe=%.2f head=%.2f total=%.2f ms; per_layer: attn+gate=%.3f stage=%.3f moe=%.3f ms\n",
+                    prof_steps, n_layers,
+                    prof_embed_ms * inv, prof_attn_ms * inv, prof_stage_ms * inv, prof_moe_ms * inv, prof_head_ms * inv,
+                    per_step_total, per_layer_attn, per_layer_stage, per_layer_moe);
+    }
+
     // ===== cleanup =====
     auto free_vec_u8 = [](std::vector<uint8_t*>& v) { for (auto* p : v) cudaFree(p); };
     auto free_vec_u16 = [](std::vector<uint16_t*>& v) { for (auto* p : v) cudaFree(p); };
@@ -6374,6 +6432,10 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     cudaFree(d_route_hidden_q); cudaFree(d_route_hidden_scale);
     cudaFree(d_gate_scores_scratch); cudaFree(d_gate_scored_scratch); cudaFree(d_gate_indices);
     cudaFree(d_tid2eid_i64); cudaFree(d_embed_row_f16); cudaFree(d_logits);
+    if (moe_copy_stream_enabled) {
+        cudaEventDestroy(gguf_moe_stage_event);
+        cudaStreamDestroy(gguf_moe_copy_stream);
+    }
     if (gguf_registered) cudaHostUnregister(gguf_base);
     return r;
 }

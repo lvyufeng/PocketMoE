@@ -83,6 +83,72 @@ bool q2_moe_single_w2_q2k_cuda(
     int inter_dim,
     void* stream = nullptr);
 
+// --- IQ1_M single-token MoE decode kernels (cuda/iq1_ops.cu). ---
+
+bool iq1_moe_single_w13_cuda(
+    const float* d_x,
+    const int64_t* d_route_slots,
+    const uint8_t* d_w1_blocks,
+    const uint8_t* d_w3_blocks,
+    float* d_gate,
+    float* d_up,
+    int routes,
+    int n_experts,
+    int dim,
+    int inter_dim,
+    void* stream = nullptr);
+
+// Fused IQ1_M W1/W3 matvec + SwiGLU + route weight for decode.
+// Writes d_hidden [routes, inter_dim] directly and avoids gate/up intermediates.
+bool iq1_moe_single_w13_swiglu_cuda(
+    const float* d_x,
+    const int64_t* d_route_slots,
+    const float* d_route_weights,
+    const uint8_t* d_w1_blocks,
+    const uint8_t* d_w3_blocks,
+    float* d_hidden,
+    int routes,
+    int n_experts,
+    int dim,
+    int inter_dim,
+    float swiglu_limit,
+    void* stream = nullptr);
+
+bool iq1_route_swiglu_cuda(
+    const float* d_gate,
+    const float* d_up,
+    const float* d_route_weights,
+    float* d_hidden,
+    int routes,
+    int inter_dim,
+    float swiglu_limit,
+    void* stream = nullptr);
+
+bool iq1_moe_single_w2_cuda(
+    const float* d_hidden,
+    const int64_t* d_route_slots,
+    const uint8_t* d_w2_blocks,
+    float* d_y,
+    int routes,
+    int n_experts,
+    int dim,
+    int inter_dim,
+    void* stream = nullptr);
+
+// IQ1_M W2 specialization for small top-k decode (routes <= 8): one CTA per
+// output column reduces all active routes and writes d_y directly, avoiding
+// per-route atomics.
+bool iq1_moe_single_w2_reduce_cuda(
+    const float* d_hidden,
+    const int64_t* d_route_slots,
+    const uint8_t* d_w2_blocks,
+    float* d_y,
+    int routes,
+    int n_experts,
+    int dim,
+    int inter_dim,
+    void* stream = nullptr);
+
 bool fp4_e2m1_e8m0_matvec_cuda(
     const float* d_x,
     const uint8_t* d_weight,
@@ -349,6 +415,19 @@ bool bf16_dual_matvec_cuda(
     int cols,
     void* stream = nullptr);
 
+// Same as bf16_dual_matvec_cuda, but the activation vector is already BF16
+// encoded. This avoids a BF16->FP32 restore kernel for compressor paths that
+// intentionally round activations to BF16 before matvec.
+bool bf16_dual_matvec_bf16_x_cuda(
+    const uint16_t* d_x_bf16,
+    const uint16_t* d_w_a_bf16,
+    const uint16_t* d_w_b_bf16,
+    float* d_y_a,
+    float* d_y_b,
+    int rows,
+    int cols,
+    void* stream = nullptr);
+
 bool bf16_matvec_cpu_order_cuda(
     const float* d_x,
     const uint16_t* d_w_bf16,
@@ -422,6 +501,26 @@ bool gate_hash_bf16_cuda(
     int table_topk,
     int topk,
     float route_scale,
+    void* stream = nullptr);
+
+// Map global routed expert ids to this TP rank's resident-local expert slots.
+// Experts outside [expert_start, expert_start + experts_per_rank) become -1.
+bool gguf_route_slots_from_indices_cuda(
+    const int64_t* d_indices,
+    int64_t* d_route_slots,
+    int topk,
+    int expert_start,
+    int experts_per_rank,
+    void* stream = nullptr);
+
+// Greedy top-1 over fp32 logits on device. Writes the global token id
+// (local_vocab_start + local index) and its logit to one-element device outputs.
+bool argmax_fp32_cuda(
+    const float* d_logits,
+    int* d_token,
+    float* d_logit,
+    int count,
+    int token_offset,
     void* stream = nullptr);
 
 bool vector_add_cuda(
@@ -509,6 +608,20 @@ bool cached_single_token_attention_cuda(
     const float* d_q,
     const float* d_kv_cache,
     const float* d_attn_sink,
+    float* d_y,
+    int heads,
+    int head_dim,
+    int cache_len,
+    float scale,
+    void* stream = nullptr);
+
+// Cached single-token attention using caller-provided global weight scratch
+// [heads, cache_len]. Avoids dynamic shared memory growth with context length.
+bool cached_single_token_attention_workspace_cuda(
+    const float* d_q,
+    const float* d_kv_cache,
+    const float* d_attn_sink,
+    float* d_weight_scratch,
     float* d_y,
     int heads,
     int head_dim,

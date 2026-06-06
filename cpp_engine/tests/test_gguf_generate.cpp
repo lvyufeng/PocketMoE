@@ -15,10 +15,28 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+namespace {
+
+void append_seed_file(const std::string& path, std::vector<int>& seeds) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("failed to open --seed-file: " + path);
+    long long value = 0;
+    while (in >> value) {
+        if (value < 0 || value > 2147483647LL)
+            throw std::runtime_error("seed token out of int range in --seed-file");
+        seeds.push_back(static_cast<int>(value));
+        if (in.peek() == ',') in.get();
+    }
+    if (!in.eof()) throw std::runtime_error("failed to parse integer token ids from --seed-file: " + path);
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
     dsv4::ForwardSmokeOptions opts;
@@ -37,11 +55,12 @@ int main(int argc, char** argv) {
         else if (a == "--tp-rank") opts.tp_rank = std::stoi(need("--tp-rank"));
         else if (a == "--device") opts.device = std::stoi(need("--device"));
         else if (a == "--nccl-id-path") opts.nccl_id_path = need("--nccl-id-path");
+        else if (a == "--seed-file") append_seed_file(need("--seed-file"), seeds);
         else positional.push_back(a);
     }
     if (positional.empty()) {
         std::cerr << "usage: test_gguf_generate <model.gguf> [max_new_tokens] [seed1 seed2 ...] "
-                     "[--tp-world W --tp-rank R --nccl-id-path PATH --device D]\n";
+                     "[--seed-file PATH] [--tp-world W --tp-rank R --nccl-id-path PATH --device D]\n";
         return 2;
     }
     ckpt = positional[0];
@@ -53,6 +72,30 @@ int main(int argc, char** argv) {
         auto r = dsv4::run_gguf_generate_smoke(ckpt, seeds, max_new, opts);
         const bool is_root = (opts.tp_rank == 0);
         if (is_root) {
+            auto print_int_vector = [](const char* label, const std::vector<int>& values) {
+                std::printf("%s = [", label);
+                const size_t n = values.size();
+                if (n <= 32) {
+                    for (size_t i = 0; i < n; ++i) std::printf("%s%d", i ? ", " : "", values[i]);
+                } else {
+                    for (size_t i = 0; i < 16; ++i) std::printf("%s%d", i ? ", " : "", values[i]);
+                    std::printf(", ...");
+                    for (size_t i = n - 16; i < n; ++i) std::printf(", %d", values[i]);
+                }
+                std::printf("] (count=%zu)\n", n);
+            };
+            auto print_float_vector = [](const char* label, const std::vector<float>& values) {
+                std::printf("%s = ", label);
+                const size_t n = values.size();
+                if (n <= 32) {
+                    for (size_t i = 0; i < n; ++i) std::printf("%s%.3f", i ? ", " : "", values[i]);
+                } else {
+                    for (size_t i = 0; i < 16; ++i) std::printf("%s%.3f", i ? ", " : "", values[i]);
+                    std::printf(", ...");
+                    for (size_t i = n - 16; i < n; ++i) std::printf(", %.3f", values[i]);
+                }
+                std::printf(" (count=%zu)\n", n);
+            };
             std::printf("n_layers=%d dim=%d vocab=%d prompt_tokens=%d decode_tokens=%d\n",
                         r.n_layers, r.dim, r.vocab, r.prompt_tokens, r.decode_tokens);
             std::printf("load_seconds   = %.3f\n", r.load_seconds);
@@ -62,25 +105,24 @@ int main(int argc, char** argv) {
                         r.top_logits.empty() ? 0.0
                                              : 1000.0 * r.forward_seconds /
                                                    static_cast<double>(r.top_logits.size()));
+            if (r.prefill_seconds > 0.0) {
+                std::printf("prefill_seconds= %.3f (%d tokens; %.2f tok/s)\n",
+                            r.prefill_seconds,
+                            r.prompt_tokens,
+                            static_cast<double>(r.prompt_tokens) / r.prefill_seconds);
+            }
             if (r.decode_tokens > 0) {
-                const double tps = static_cast<double>(r.decode_tokens) / r.forward_seconds;
-                std::printf("decode_tps     = %.2f (decode_tokens / total_forward)\n", tps);
+                const double decode_den = r.decode_seconds > 0.0 ? r.decode_seconds : r.forward_seconds;
+                const double tps = static_cast<double>(r.decode_tokens) / decode_den;
+                std::printf("decode_seconds = %.3f (%d tokens; %.2f tok/s; %.1f ms/token)\n",
+                            r.decode_seconds,
+                            r.decode_tokens,
+                            tps,
+                            1000.0 * decode_den / static_cast<double>(r.decode_tokens));
             }
-            std::printf("seeds          = [");
-            for (size_t i = 0; i < seeds.size(); ++i) {
-                std::printf("%s%d", i ? ", " : "", seeds[i]);
-            }
-            std::printf("]\n");
-            std::printf("generated      = [");
-            for (size_t i = 0; i < r.generated_tokens.size(); ++i) {
-                std::printf("%s%d", i ? ", " : "", r.generated_tokens[i]);
-            }
-            std::printf("]\n");
-            std::printf("top_logits[first..last] = ");
-            for (size_t i = 0; i < r.top_logits.size(); ++i) {
-                std::printf("%s%.3f", i ? ", " : "", r.top_logits[i]);
-            }
-            std::printf("\n");
+            print_int_vector("seeds", seeds);
+            print_int_vector("generated", r.generated_tokens);
+            print_float_vector("top_logits[first..last]", r.top_logits);
         }
 
         if (static_cast<int>(r.generated_tokens.size()) != max_new) {

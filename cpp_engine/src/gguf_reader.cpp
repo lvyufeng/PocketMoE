@@ -357,6 +357,7 @@ std::string ggml_type_name(uint32_t ggml_type) {
         case 8: return "q8_0";
         case 10: return "q2_k";
         case 16: return "iq2_xxs";
+        case 29: return "iq1_m";
         case 19: return "iq3_s";
         case 26: return "i32";
         default: return "ggml_type_" + std::to_string(ggml_type);
@@ -371,6 +372,7 @@ DType ggml_type_to_dtype(uint32_t ggml_type) {
         case 8: return DType::Q8_0;
         case 10: return DType::Q2_K;
         case 16: return DType::IQ2_XXS;
+        case 29: return DType::IQ1_M;
         default: return DType::Unknown;
     }
 }
@@ -384,6 +386,7 @@ uint64_t ggml_tensor_nbytes(uint32_t ggml_type, const std::vector<uint64_t>& sha
         case 8: return block_count(elems, 32) * 34;
         case 10: return block_count(elems, 256) * 84;
         case 16: return block_count(elems, 256) * 66;
+        case 29: return block_count(elems, 256) * 56;
         case 26: return elems * 4;
         default: return 0;
     }

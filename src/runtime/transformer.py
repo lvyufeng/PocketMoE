@@ -576,6 +576,27 @@ class GGUFExpertRawBacking:
     expert_id: int
 
 
+def _routed_imatrix_capture_enabled(layer_id: int | None, role: str) -> bool:
+    if layer_id is None or os.getenv("DEEPSEEK_IMATRIX_CAPTURE", "0").lower() not in {"1", "true", "yes"}:
+        return False
+    try:
+        from src.gguf.imatrix import collector
+        return collector().should_capture(int(layer_id), role)
+    except Exception:
+        return False
+
+
+def _maybe_capture_routed_imatrix(layer_id: int | None, expert_id: int | None, role: str, x: torch.Tensor) -> None:
+    if not _routed_imatrix_capture_enabled(layer_id, role):
+        return
+    try:
+        from src.gguf.imatrix import capture_routed_expert
+        capture_routed_expert(layer_id, expert_id, role, x)
+    except Exception as exc:
+        if os.getenv("DEEPSEEK_IMATRIX_VERBOSE", "0").lower() in {"1", "true", "yes"}:
+            print(f"imatrix_capture_skip layer={layer_id} expert={expert_id} role={role} error={exc}", flush=True)
+
+
 class ParallelEmbedding(nn.Module):
     """Embedding sharded along the vocab dimension. Each rank holds vocab_size // tp_world_size rows.
     Out-of-range indices are zero-masked before all_reduce to combine partial embeddings."""
@@ -1734,6 +1755,7 @@ class Expert(nn.Module):
         self._gguf_cuda_mod = None
         self._gguf_iq2_grid = None
         self._gguf_cuda_iq2_grid = None
+        self._gguf_cuda_iq1_grid = None
         self._gguf_cuda_prefetch_enabled = _env_enabled("DEEPSEEK_GGUF_GPU_PREFETCH")
         self._gguf_cuda_profile_enabled = _env_enabled("DEEPSEEK_GGUF_GPU_PROFILE")
         self._gguf_cuda_profile_limit = max(0, int(os.getenv("DEEPSEEK_GGUF_GPU_PROFILE_LIMIT", "32")))
@@ -1745,6 +1767,7 @@ class Expert(nn.Module):
         self._gguf_cuda_prefetch_pending: set[tuple[str, int, int]] = set()
         self._gguf_profile_count = 0
         self._profile_layer_idx: int | None = None
+        self._profile_expert_idx: int | None = None
         self.shared_expert_int8_enabled = shared_int8_enabled
         self.shared_expert_fp16_enabled = _env_enabled("DEEPSEEK_SHARED_EXPERT_FP16")
         self.shared_expert_phase_fp16_enabled = _env_enabled("DEEPSEEK_PD_SHARED_EXPERT_FP16")
@@ -1832,8 +1855,14 @@ class Expert(nn.Module):
         gguf_path = self._gguf_raw_backing.gguf_path if self._gguf_raw_backing is not None else ""
         return gguf_path, name, expert_id, dev_index
 
-    def _gguf_type_id(self, type_name: str) -> int:
-        return 0 if type_name == "iq2_xxs" else 1
+    def _gguf_type_id(self, type_name: str) -> int | None:
+        if type_name == "iq2_xxs":
+            return 0
+        if type_name == "q2_k":
+            return 1
+        if type_name == "iq1_m":
+            return 2
+        return None
 
     def _gguf_cuda_grid(self, device: torch.device) -> torch.Tensor:
         from src.gguf.tensor_reader import get_iq2xxs_signed_grid_tensor
@@ -1841,6 +1870,42 @@ class Expert(nn.Module):
         if self._gguf_cuda_iq2_grid is None or self._gguf_cuda_iq2_grid.device != device:
             self._gguf_cuda_iq2_grid = get_iq2xxs_signed_grid_tensor().to(device=device, non_blocking=False).contiguous()
         return self._gguf_cuda_iq2_grid
+
+    def _gguf_cuda_iq1_grid_tensor(self, device: torch.device) -> torch.Tensor:
+        from src.gguf.tensor_reader import get_iq1_grid_tensor
+
+        if self._gguf_cuda_iq1_grid is None or self._gguf_cuda_iq1_grid.device != device:
+            self._gguf_cuda_iq1_grid = get_iq1_grid_tensor().to(device=device, non_blocking=False).contiguous()
+        return self._gguf_cuda_iq1_grid
+
+    def _gguf_cuda_quant_grid(self, type_name: str, device: torch.device) -> torch.Tensor:
+        """Return the codebook tensor a kernel needs for ``type_name``.
+
+        iq2_xxs and iq1_m use different grids; q2_k uses none.  Passing the
+        wrong grid would silently corrupt output, so this is the single source
+        of truth for grid selection.
+        """
+        if type_name == "iq2_xxs":
+            return self._gguf_cuda_grid(device)
+        if type_name == "iq1_m":
+            return self._gguf_cuda_iq1_grid_tensor(device)
+        return torch.empty(0, dtype=torch.int8, device=device)
+
+    def _gguf_cuda_group_grid(self, type_names: tuple[str, ...], device: torch.device) -> torch.Tensor:
+        """Pick the single grid a paired/grouped kernel call needs.
+
+        The CUDA kernels accept one grid argument shared across w1/w3/w2, so the
+        weight types may not mix iq2_xxs with iq1_m.  q2_k contributes no grid.
+        """
+        has_iq2 = "iq2_xxs" in type_names
+        has_iq1 = "iq1_m" in type_names
+        if has_iq2 and has_iq1:
+            raise RuntimeError("cannot mix iq2_xxs and iq1_m in one GGUF CUDA grouped/pair call")
+        if has_iq2:
+            return self._gguf_cuda_grid(device)
+        if has_iq1:
+            return self._gguf_cuda_iq1_grid_tensor(device)
+        return torch.empty(0, dtype=torch.int8, device=device)
 
     def _gguf_cuda_read_blocks(self, reader, name: str) -> tuple[torch.Tensor, str, int] | None:
         if self._gguf_raw_backing is None:
@@ -1966,35 +2031,39 @@ class Expert(nn.Module):
             w1_gpu.record_stream(current_stream)
             w3_gpu.record_stream(current_stream)
             w2_gpu.record_stream(current_stream)
+            w1_type_id = self._gguf_type_id(w1_type)
+            w3_type_id = self._gguf_type_id(w3_type)
+            w2_type_id = self._gguf_type_id(w2_type)
+            if w1_type_id is None or w3_type_id is None or w2_type_id is None:
+                return None
             if profile:
                 torch.cuda.synchronize(x.device)
                 t_copy = time.perf_counter()
             x_contig = x.contiguous()
-            iq2_grid = self._gguf_cuda_grid(x.device)
-            empty_grid = torch.empty(0, dtype=torch.int8, device=x.device)
-            if hasattr(cuda_mod, "gguf_quant_gemm_pair_forward") and w1_in_dim == w3_in_dim:
+            if hasattr(cuda_mod, "gguf_quant_gemm_pair_forward") and w1_in_dim == w3_in_dim and w1_type == w3_type:
+                pair_grid = self._gguf_cuda_quant_grid(w1_type, x.device)
                 pair = cuda_mod.gguf_quant_gemm_pair_forward(
                     x_contig,
                     w1_gpu,
                     int(self.w1.in_features),
-                    0 if w1_type == "iq2_xxs" else 1,
+                    w1_type_id,
                     w3_gpu,
                     int(self.w3.in_features),
-                    0 if w3_type == "iq2_xxs" else 1,
-                    iq2_grid,
+                    w3_type_id,
+                    pair_grid,
                 )
                 gate = pair[0].float()
                 up = pair[1].float()
             else:
-                gate = cuda_mod.gguf_quant_gemm_forward(x_contig, w1_gpu, int(self.w1.in_features), 0 if w1_type == "iq2_xxs" else 1, iq2_grid if w1_type == "iq2_xxs" else empty_grid).float()
-                up = cuda_mod.gguf_quant_gemm_forward(x_contig, w3_gpu, int(self.w3.in_features), 0 if w3_type == "iq2_xxs" else 1, iq2_grid if w3_type == "iq2_xxs" else empty_grid).float()
+                gate = cuda_mod.gguf_quant_gemm_forward(x_contig, w1_gpu, int(self.w1.in_features), w1_type_id, self._gguf_cuda_quant_grid(w1_type, x.device)).float()
+                up = cuda_mod.gguf_quant_gemm_forward(x_contig, w3_gpu, int(self.w3.in_features), w3_type_id, self._gguf_cuda_quant_grid(w3_type, x.device)).float()
             if self.swiglu_limit > 0:
                 up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
                 gate = torch.clamp(gate, max=self.swiglu_limit)
             hidden = torch.nn.functional.silu(gate) * up
             if weights is not None:
                 hidden = hidden * weights.to(device=x.device, dtype=torch.float32)
-            out = cuda_mod.gguf_quant_gemm_forward(hidden, w2_gpu, int(self.w2.in_features), 0 if w2_type == "iq2_xxs" else 1, iq2_grid if w2_type == "iq2_xxs" else empty_grid).float()
+            out = cuda_mod.gguf_quant_gemm_forward(hidden, w2_gpu, int(self.w2.in_features), w2_type_id, self._gguf_cuda_quant_grid(w2_type, x.device)).float()
             if profile:
                 torch.cuda.synchronize(x.device)
                 t_done = time.perf_counter()
@@ -2047,6 +2116,11 @@ class Expert(nn.Module):
             )
             if w1_in_dim != self.w1.in_features or w3_in_dim != self.w3.in_features or w2_in_dim != self.w2.in_features:
                 return None
+            w1_type_id = self._gguf_type_id(w1_type)
+            w3_type_id = self._gguf_type_id(w3_type)
+            w2_type_id = self._gguf_type_id(w2_type)
+            if w1_type_id is None or w3_type_id is None or w2_type_id is None:
+                return None
             x_contig = x_cpu.contiguous().to(device="cpu", dtype=torch.float32)
             weights_contig = weights.detach().cpu().to(torch.float32).contiguous() if weights is not None else torch.empty(0, dtype=torch.float32, device="cpu")
             out = torch.empty((x_contig.shape[0], self.w2.out_features), dtype=torch.float32, device="cpu")
@@ -2064,13 +2138,13 @@ class Expert(nn.Module):
                 self.w1.out_features,
                 w1_blocks.shape[1],
                 w1_blocks.shape[2],
-                0 if w1_type == "iq2_xxs" else 1,
+                w1_type_id,
                 w3_blocks.shape[1],
                 w3_blocks.shape[2],
-                0 if w3_type == "iq2_xxs" else 1,
+                w3_type_id,
                 w2_blocks.shape[1],
                 w2_blocks.shape[2],
-                0 if w2_type == "iq2_xxs" else 1,
+                w2_type_id,
                 float(self.swiglu_limit),
                 self._gguf_iq2_grid.data_ptr(),
             )
@@ -2100,6 +2174,9 @@ class Expert(nn.Module):
             )
             x_contig = x_cpu.contiguous().to(device="cpu", dtype=torch.float32)
             out = torch.empty((x_contig.shape[0], rows), dtype=torch.float32, device="cpu")
+            type_id = self._gguf_type_id(type_name)
+            if type_id is None:
+                return None
             if type_name == "iq2_xxs":
                 if self._gguf_iq2_grid is None:
                     self._gguf_iq2_grid = get_iq2xxs_signed_grid_tensor()
@@ -2115,7 +2192,7 @@ class Expert(nn.Module):
                 rows,
                 blocks.shape[1],
                 blocks.shape[2],
-                0 if type_name == "iq2_xxs" else 1,
+                type_id,
                 grid.data_ptr(),
             )
             return out
@@ -2128,15 +2205,27 @@ class Expert(nn.Module):
         from src.gguf.tensor_reader import get_cached_gguf_tensor_reader
 
         profile = self._gguf_profile_enabled and self._gguf_profile_count < self._gguf_profile_limit
+        # imatrix capture only *records* the w1/w3 input (x_cpu) and the w2 input
+        # (post-SwiGLU hidden y); both are available regardless of which GEMM path
+        # runs, so we keep the fast native/fused matmul and just observe alongside it.
+        capture_w13 = _routed_imatrix_capture_enabled(self._profile_layer_idx, "ffn_gate_exps") or _routed_imatrix_capture_enabled(self._profile_layer_idx, "ffn_up_exps")
+        capture_w2 = _routed_imatrix_capture_enabled(self._profile_layer_idx, "ffn_down_exps")
         t0 = time.perf_counter() if profile else 0.0
         read_w13_s = 0.0
         linear_w13_s = 0.0
         read_w2_s = 0.0
         linear_w2_s = 0.0
         reader = get_cached_gguf_tensor_reader(self._gguf_raw_backing.gguf_path)
-        fused = self._gguf_native_fused_forward(reader, x_cpu, weights)
-        if fused is not None:
-            return fused
+        if capture_w13:
+            _maybe_capture_routed_imatrix(self._profile_layer_idx, self._gguf_raw_backing.expert_id, "ffn_gate_exps", x_cpu)
+            _maybe_capture_routed_imatrix(self._profile_layer_idx, self._gguf_raw_backing.expert_id, "ffn_up_exps", x_cpu)
+        # The fused kernel returns the final expert output directly and never
+        # exposes the post-SwiGLU hidden, so only take it when we do not need the
+        # w2 input for capture.
+        if not capture_w2:
+            fused = self._gguf_native_fused_forward(reader, x_cpu, weights)
+            if fused is not None:
+                return fused
         chunk = self._gguf_raw_chunk_rows if self._gguf_raw_matmul_enabled else self._gguf_chunk_rows
         gate_parts = []
         up_parts = []
@@ -2173,6 +2262,7 @@ class Expert(nn.Module):
         y = torch.nn.functional.silu(gate) * up
         if weights is not None:
             y = weights.detach().cpu().to(torch.float32) * y
+        _maybe_capture_routed_imatrix(self._profile_layer_idx, self._gguf_raw_backing.expert_id, "ffn_down_exps", y)
         if profile:
             act_s = time.perf_counter() - t_cat
         else:
@@ -2400,31 +2490,35 @@ class Expert(nn.Module):
             w2_gpu, w2_type, w2_in_dim = w2_packed
             if w1_in_dim != self.w1.in_features or w3_in_dim != self.w3.in_features or w2_in_dim != self.w2.in_features:
                 return None
+            w1_type_id = self._gguf_type_id(w1_type)
+            w3_type_id = self._gguf_type_id(w3_type)
+            w2_type_id = self._gguf_type_id(w2_type)
+            if w1_type_id is None or w3_type_id is None or w2_type_id is None:
+                return None
             current_stream = torch.cuda.current_stream(x.device)
             w1_gpu.record_stream(current_stream)
             w3_gpu.record_stream(current_stream)
             w2_gpu.record_stream(current_stream)
             x_contig = x.contiguous()
-            iq2_grid = self._gguf_cuda_grid(x.device)
-            empty_grid = torch.empty(0, dtype=torch.int8, device=x.device)
             use_prefill_gemm = self._gguf_cuda_prefill_gemm_enabled and x_contig.shape[0] > 1 and hasattr(cuda_mod, "gguf_quant_gemm_prefill_forward")
-            if hasattr(cuda_mod, "gguf_quant_gemm_pair_forward") and not use_prefill_gemm and w1_in_dim == w3_in_dim:
+            if hasattr(cuda_mod, "gguf_quant_gemm_pair_forward") and not use_prefill_gemm and w1_in_dim == w3_in_dim and w1_type == w3_type:
+                pair_grid = self._gguf_cuda_quant_grid(w1_type, x.device)
                 pair = cuda_mod.gguf_quant_gemm_pair_forward(
                     x_contig,
                     w1_gpu,
                     int(self.w1.in_features),
-                    0 if w1_type == "iq2_xxs" else 1,
+                    w1_type_id,
                     w3_gpu,
                     int(self.w3.in_features),
-                    0 if w3_type == "iq2_xxs" else 1,
-                    iq2_grid,
+                    w3_type_id,
+                    pair_grid,
                 )
                 gate = pair[0].float()
                 up = pair[1].float()
             else:
                 gemm = cuda_mod.gguf_quant_gemm_prefill_forward if use_prefill_gemm else cuda_mod.gguf_quant_gemm_forward
-                gate = gemm(x_contig, w1_gpu, int(self.w1.in_features), 0 if w1_type == "iq2_xxs" else 1, iq2_grid if w1_type == "iq2_xxs" else empty_grid).float()
-                up = gemm(x_contig, w3_gpu, int(self.w3.in_features), 0 if w3_type == "iq2_xxs" else 1, iq2_grid if w3_type == "iq2_xxs" else empty_grid).float()
+                gate = gemm(x_contig, w1_gpu, int(self.w1.in_features), w1_type_id, self._gguf_cuda_quant_grid(w1_type, x.device)).float()
+                up = gemm(x_contig, w3_gpu, int(self.w3.in_features), w3_type_id, self._gguf_cuda_quant_grid(w3_type, x.device)).float()
             if self.swiglu_limit > 0:
                 up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
                 gate = torch.clamp(gate, max=self.swiglu_limit)
@@ -2432,7 +2526,7 @@ class Expert(nn.Module):
             if weights is not None:
                 hidden = hidden * weights.to(device=x.device, dtype=torch.float32)
             w2_gemm = cuda_mod.gguf_quant_gemm_prefill_forward if use_prefill_gemm else cuda_mod.gguf_quant_gemm_forward
-            return w2_gemm(hidden, w2_gpu, int(self.w2.in_features), 0 if w2_type == "iq2_xxs" else 1, iq2_grid if w2_type == "iq2_xxs" else empty_grid).float()
+            return w2_gemm(hidden, w2_gpu, int(self.w2.in_features), w2_type_id, self._gguf_cuda_quant_grid(w2_type, x.device)).float()
         except Exception as exc:
             if self._gguf_cuda_profile_enabled and self._gguf_cuda_profile_count < self._gguf_cuda_profile_limit:
                 self._gguf_cuda_profile_count += 1
@@ -2501,6 +2595,8 @@ class Expert(nn.Module):
             w1 = self._cpu_w1
             w2 = self._cpu_w2
             w3 = self._cpu_w3
+        _maybe_capture_routed_imatrix(self._profile_layer_idx, self._profile_expert_idx, "ffn_gate_exps", x_cpu)
+        _maybe_capture_routed_imatrix(self._profile_layer_idx, self._profile_expert_idx, "ffn_up_exps", x_cpu)
         gate = F.linear(x_cpu, w1, None)
         up = F.linear(x_cpu, w3, None)
         if self.swiglu_limit > 0:
@@ -2509,6 +2605,7 @@ class Expert(nn.Module):
         y = F.silu(gate) * up
         if weights is not None:
             y = weights.detach().cpu().to(torch.float32) * y
+        _maybe_capture_routed_imatrix(self._profile_layer_idx, self._profile_expert_idx, "ffn_down_exps", y)
         y = F.linear(y, w2, None)
         return y
 
@@ -2583,10 +2680,11 @@ class MoE(nn.Module):
                         if self.experts_start_idx <= i < self.experts_end_idx else None
                         for i in range(self.n_routed_experts)
                     ])
-                    for expert in self.experts:
+                    for expert_id, expert in enumerate(self.experts):
                         if expert is not None:
                             expert.preload_fp4_dequant = args.preload_routed_fp4_dequant
                             expert._profile_layer_idx = self.layer_id
+                            expert._profile_expert_idx = expert_id
                 self.cpu_backend = CPURoutedExpertsBackend(
                     layer_idx=self.layer_id,
                     experts=self.experts,
@@ -2601,6 +2699,10 @@ class MoE(nn.Module):
                 if self.experts_start_idx <= i < self.experts_end_idx else None
                 for i in range(self.n_routed_experts)
             ])
+            for expert_id, expert in enumerate(self.experts):
+                if expert is not None:
+                    expert._profile_layer_idx = self.layer_id
+                    expert._profile_expert_idx = expert_id
             self.cpu_backend = None
         assert args.n_shared_experts == 1
         self.shared_experts = Expert(
@@ -3256,7 +3358,31 @@ class MoE(nn.Module):
                     iq2_grid,
                     float(self.cpu_backend._swiglu_limit),
                 )
+            elif (
+                route_slots is not None
+                and self.gpu_gguf_decode_single_token_enabled
+                and hasattr(cuda_mod, "gguf_moe_single_token_iq1m_forward")
+                and w1_type == "iq1_m"
+                and w3_type == "iq1_m"
+                and w2_type == "iq1_m"
+            ):
+                y = cuda_mod.gguf_moe_single_token_iq1m_forward(
+                    x.contiguous(),
+                    route_slots,
+                    route_weights.contiguous(),
+                    w1_blocks,
+                    w3_blocks,
+                    w2_blocks,
+                    first_expert._gguf_cuda_iq1_grid_tensor(x.device),
+                    float(self.cpu_backend._swiglu_limit),
+                )
             else:
+                w1_type_id = first_expert._gguf_type_id(w1_type)
+                w3_type_id = first_expert._gguf_type_id(w3_type)
+                w2_type_id = first_expert._gguf_type_id(w2_type)
+                if w1_type_id is None or w3_type_id is None or w2_type_id is None:
+                    return None
+                quant_grid = first_expert._gguf_cuda_group_grid((w1_type, w3_type, w2_type), x.device)
                 y = cuda_mod.gguf_moe_prefill_grouped_forward(
                     x.contiguous(),
                     route_tokens,
@@ -3266,12 +3392,12 @@ class MoE(nn.Module):
                     w3_blocks,
                     w2_blocks,
                     w1_in_dim,
-                    0 if w1_type == "iq2_xxs" else 1,
+                    w1_type_id,
                     w3_in_dim,
-                    0 if w3_type == "iq2_xxs" else 1,
+                    w3_type_id,
                     w2_in_dim,
-                    0 if w2_type == "iq2_xxs" else 1,
-                    iq2_grid,
+                    w2_type_id,
+                    quant_grid,
                     float(self.cpu_backend._swiglu_limit),
                 )
             if profile:
@@ -3628,9 +3754,15 @@ class MoE(nn.Module):
                 try:
                     first_expert = next((expert for expert in self.experts if expert is not None and expert._gguf_raw_backing is not None), None)
                     if first_expert is not None:
-                        iq2_grid = first_expert._gguf_cuda_grid(x.device)
+                        w1_type_id = first_expert._gguf_type_id(w1_layer[1])
+                        w3_type_id = first_expert._gguf_type_id(w3_layer[1])
+                        w2_type_id = first_expert._gguf_type_id(w2_layer[1])
+                        quant_grid = first_expert._gguf_cuda_group_grid((w1_layer[1], w3_layer[1], w2_layer[1]), x.device)
                     else:
-                        iq2_grid = torch.empty(0, dtype=torch.int8, device=x.device)
+                        w1_type_id = w3_type_id = w2_type_id = None
+                        quant_grid = torch.empty(0, dtype=torch.int8, device=x.device)
+                    if w1_type_id is None or w3_type_id is None or w2_type_id is None:
+                        raise RuntimeError("unsupported GGUF staged quant type")
                     w1_blocks = w1_layer[0]
                     w3_blocks = w3_layer[0]
                     w2_blocks = w2_layer[0]
@@ -3643,12 +3775,12 @@ class MoE(nn.Module):
                         w3_blocks,
                         w2_blocks,
                         int(w1_layer[2]),
-                        0 if w1_layer[1] == "iq2_xxs" else 1,
+                        w1_type_id,
                         int(w3_layer[2]),
-                        0 if w3_layer[1] == "iq2_xxs" else 1,
+                        w3_type_id,
                         int(w2_layer[2]),
-                        0 if w2_layer[1] == "iq2_xxs" else 1,
-                        iq2_grid,
+                        w2_type_id,
+                        quant_grid,
                         float(self.cpu_backend._swiglu_limit),
                     )
                     used_grouped_gguf = True

@@ -9,13 +9,24 @@ BIN="${BIN:-/mnt/data1/dsv4_inference/build/cpp_engine/tests/test_gguf_generate}
 LOG_DIR="${LOG_DIR:-/tmp}"
 MAX_NEW="${MAX_NEW:-8}"
 SEED="${SEED:-1234}"
+SEED_FILE="${SEED_FILE:-}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
+if [ "$#" -gt 0 ]; then
+  EXTRA_ARGS="$EXTRA_ARGS $*"
+fi
 EXTRA_ENV="${EXTRA_ENV:-}"
 
 rm -f "$NCCL_ID"
 
+if [ -n "$SEED_FILE" ]; then
+  SEED_ARGS="--seed-file $SEED_FILE"
+else
+  SEED_ARGS="$SEED"
+fi
+
 for rank in 0 1 2 3; do
-  eval "$EXTRA_ENV CUDA_VISIBLE_DEVICES=$rank $BIN $CKPT $MAX_NEW $SEED \
-        --tp-world 4 --tp-rank $rank --device 0 --nccl-id-path $NCCL_ID \
+  eval "$EXTRA_ENV CUDA_VISIBLE_DEVICES=$rank $BIN $CKPT $MAX_NEW $SEED_ARGS \
+        --tp-world 4 --tp-rank $rank --device 0 --nccl-id-path $NCCL_ID $EXTRA_ARGS \
         > $LOG_DIR/dsv4_gguf_tp4_rank${rank}.log 2>&1 &"
 done
 

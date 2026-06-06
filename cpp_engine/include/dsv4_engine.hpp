@@ -276,9 +276,11 @@ struct GgufDecodeResult {
     int dim = 0;
     int vocab = 0;
     std::vector<int> generated_tokens;  // length = max_new_tokens
-    std::vector<float> top_logits;      // length = seeds.size() + max_new_tokens
+    std::vector<float> top_logits;      // length = seeds.size() + max(0, max_new_tokens - 1)
     double load_seconds = 0.0;
     double forward_seconds = 0.0;       // total time across all forward steps
+    double prefill_seconds = 0.0;       // current GGUF path: one forward per prompt token
+    double decode_seconds = 0.0;        // current GGUF path: one forward per generated step
     int prompt_tokens = 0;
     int decode_tokens = 0;
 };

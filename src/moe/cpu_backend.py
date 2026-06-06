@@ -61,6 +61,31 @@ def _env_enabled_default_on(name: str) -> bool:
     return val.lower() not in {"0", "false", "no", "off"}
 
 
+def _native_gguf_type_id(type_name: str) -> int | None:
+    if type_name == "iq2_xxs":
+        return 0
+    if type_name == "q2_k":
+        return 1
+    return None
+
+
+def _layer_imatrix_capture_enabled(layer_idx: int | None) -> bool:
+    if layer_idx is None or not _env_enabled("DEEPSEEK_IMATRIX_CAPTURE"):
+        return False
+    try:
+        from src.gguf.imatrix import collector
+
+        c = collector()
+        layer = int(layer_idx)
+        return (
+            c.should_capture(layer, "ffn_gate_exps")
+            or c.should_capture(layer, "ffn_up_exps")
+            or c.should_capture(layer, "ffn_down_exps")
+        )
+    except Exception:
+        return False
+
+
 def _apply_native_runtime_config(module) -> None:
     if module is None or _RUNTIME_OMP_THREADS is None:
         return
@@ -1088,6 +1113,12 @@ class CPURoutedExpertsBackend:
         return self.dispatch_forward(hidden_states, expert_ids, route_weights)
 
     def _ensure_native_ready(self) -> bool:
+        if _layer_imatrix_capture_enabled(self.layer_idx):
+            self._native_ready = True
+            self._native_enabled = False
+            self._native_int8_enabled = False
+            self._native_fp4_raw_enabled = False
+            return False
         if self.has_gguf_raw_experts():
             self._native_ready = True
             self._native_enabled = False
@@ -1242,7 +1273,8 @@ class CPURoutedExpertsBackend:
 
     def _should_run_gguf_grouped_expert_prefill(self, batch_size: int) -> bool:
         return (
-            self._gguf_grouped_expert_enabled
+            not _layer_imatrix_capture_enabled(self.layer_idx)
+            and self._gguf_grouped_expert_enabled
             and batch_size > self._gguf_routes_native_max_batch
             and self.has_gguf_raw_experts()
         )
@@ -1290,7 +1322,8 @@ class CPURoutedExpertsBackend:
 
     def _should_run_gguf_routes_native(self, batch_size: int) -> bool:
         return (
-            self._gguf_routes_native_enabled
+            not _layer_imatrix_capture_enabled(self.layer_idx)
+            and self._gguf_routes_native_enabled
             and batch_size <= self._gguf_routes_native_max_batch
             and self.has_gguf_raw_experts()
         )
@@ -1370,10 +1403,18 @@ class CPURoutedExpertsBackend:
                 w1, w1_type, w1_in_dim, w3, w3_type, w3_in_dim, w2, w2_type, w2_in_dim = blocks
                 if w1_in_dim != expert.w1.in_features or w3_in_dim != expert.w3.in_features or w2_in_dim != expert.w2.in_features:
                     return self._run_reference_forward(input_cpu, expert_ids_cpu, weights_cpu, output_cpu)
+                w1_type_id = _native_gguf_type_id(w1_type)
+                w3_type_id = _native_gguf_type_id(w3_type)
+                w2_type_id = _native_gguf_type_id(w2_type)
+                if w1_type_id is None or w3_type_id is None or w2_type_id is None:
+                    # The native kernel only implements iq2_xxs/q2_k; iq1_m (and any
+                    # other type) must fall back to the reference decode rather than
+                    # being silently treated as q2_k.
+                    return self._run_reference_forward(input_cpu, expert_ids_cpu, weights_cpu, output_cpu)
                 current_meta = (
-                    w1.shape[1], w1.shape[2], 0 if w1_type == "iq2_xxs" else 1,
-                    w3.shape[1], w3.shape[2], 0 if w3_type == "iq2_xxs" else 1,
-                    w2.shape[1], w2.shape[2], 0 if w2_type == "iq2_xxs" else 1,
+                    w1.shape[1], w1.shape[2], w1_type_id,
+                    w3.shape[1], w3.shape[2], w3_type_id,
+                    w2.shape[1], w2.shape[2], w2_type_id,
                     expert.w1.in_features, expert.w1.out_features,
                 )
                 if type_meta is None:

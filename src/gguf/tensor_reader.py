@@ -91,6 +91,21 @@ _DENSE_DTYPES = {
     "i32": ("<i4", torch.int32, 4),
 }
 
+# Quantized routed/matrix block geometry: type_name -> (block_elems, block_bytes).
+# Mirrors GGML_QUANT_SIZES for the types we decode in pure Python.
+_QUANT_BLOCK_META = {
+    "q2_k": (256, 84),
+    "iq2_xxs": (256, 66),
+    "iq1_m": (256, 56),
+}
+
+
+def _quant_block_meta(type_name: str) -> tuple[int, int]:
+    try:
+        return _QUANT_BLOCK_META[type_name]
+    except KeyError as exc:
+        raise NotImplementedError(f"no block geometry for quant type {type_name}") from exc
+
 
 def _product(values: Iterable[int]) -> int:
     total = 1
@@ -123,6 +138,13 @@ def _iq2xxs_signed_grid() -> np.ndarray:
 @lru_cache(maxsize=1)
 def get_iq2xxs_signed_grid_tensor() -> torch.Tensor:
     return torch.from_numpy(_iq2xxs_signed_grid().copy()).contiguous().to(device="cpu")
+
+
+@lru_cache(maxsize=1)
+def get_iq1_grid_tensor() -> torch.Tensor:
+    from src.gguf.iq1_grid import iq1_grid_i8
+
+    return torch.from_numpy(iq1_grid_i8().copy()).contiguous().to(device="cpu")
 
 
 @lru_cache(maxsize=4)
@@ -174,7 +196,7 @@ class GGUFTensorDataReader:
             return self._read_dense_tensor(tensor)
         if tensor.type_name == "q8_0":
             return self._read_q8_0_tensor(tensor)
-        if tensor.type_name in {"q2_k", "iq2_xxs"} and len(tensor.dimensions) == 2:
+        if tensor.type_name in {"q2_k", "iq2_xxs", "iq1_m"} and len(tensor.dimensions) == 2:
             return self._read_quantized_matrix(tensor, tensor.absolute_offset, int(tensor.dimensions[0]), int(tensor.dimensions[1]), tensor.type_name)
         raise NotImplementedError(f"payload decode for {tensor.name} ({tensor.type_name}) is not supported by read_tensor")
 
@@ -203,10 +225,9 @@ class GGUFTensorDataReader:
         in_dim, out_dim, n_experts = (int(dim) for dim in tensor.dimensions)
         if expert < 0 or expert >= n_experts:
             raise ValueError(f"expert {expert} is outside {tensor.name} expert count {n_experts}")
-        if tensor.type_name not in {"q2_k", "iq2_xxs"}:
+        if tensor.type_name not in _QUANT_BLOCK_META:
             raise NotImplementedError(f"routed expert decode for {tensor.type_name} is not supported")
-        block_elems = 256
-        block_bytes = 84 if tensor.type_name == "q2_k" else 66
+        block_elems, block_bytes = _quant_block_meta(tensor.type_name)
         blocks_per_row = math.ceil(in_dim / block_elems)
         row_bytes = blocks_per_row * block_bytes
         row_count = out_dim - row_start if row_count is None else int(row_count)
@@ -229,10 +250,9 @@ class GGUFTensorDataReader:
         in_dim, out_dim, n_experts = (int(dim) for dim in tensor.dimensions)
         if expert < 0 or expert >= n_experts:
             raise ValueError(f"expert {expert} is outside {tensor.name} expert count {n_experts}")
-        if tensor.type_name not in {"q2_k", "iq2_xxs"}:
+        if tensor.type_name not in _QUANT_BLOCK_META:
             raise NotImplementedError(f"routed expert raw blocks for {tensor.type_name} are not supported")
-        block_elems = 256
-        block_bytes = 84 if tensor.type_name == "q2_k" else 66
+        block_elems, block_bytes = _quant_block_meta(tensor.type_name)
         if in_dim % block_elems != 0:
             raise ValueError(f"{tensor.name} in_dim={in_dim} is not divisible by {block_elems}")
         blocks_per_row = in_dim // block_elems
@@ -271,10 +291,9 @@ class GGUFTensorDataReader:
         if len(tensor.dimensions) != 3:
             raise ValueError(f"{tensor.name} is not a routed expert tensor")
         in_dim, out_dim, n_experts = (int(dim) for dim in tensor.dimensions)
-        if tensor.type_name not in {"q2_k", "iq2_xxs"}:
+        if tensor.type_name not in _QUANT_BLOCK_META:
             raise NotImplementedError(f"routed expert raw blocks for {tensor.type_name} are not supported")
-        block_elems = 256
-        block_bytes = 84 if tensor.type_name == "q2_k" else 66
+        block_elems, block_bytes = _quant_block_meta(tensor.type_name)
         if in_dim % block_elems != 0:
             raise ValueError(f"{tensor.name} in_dim={in_dim} is not divisible by {block_elems}")
         blocks_per_row = in_dim // block_elems
@@ -386,6 +405,8 @@ class GGUFTensorDataReader:
             values = self._read_q2_k_rows(offset, out_dim, blocks_per_row)
         elif type_name == "iq2_xxs":
             values = self._read_iq2_xxs_rows(offset, out_dim, blocks_per_row)
+        elif type_name == "iq1_m":
+            values = self._read_iq1_m_rows(offset, out_dim, blocks_per_row)
         else:
             raise NotImplementedError(type_name)
         return torch.from_numpy(values.reshape(out_dim, blocks_per_row * 256)[:, :in_dim].copy())
@@ -456,6 +477,60 @@ class GGUFTensorDataReader:
             _GGUF_READER_PROFILE_COUNT += 1
             print(
                 f"gguf_reader_profile type=iq2_xxs rows={rows} blocks_per_row={blocks_per_row} bytes={nbytes} "
+                f"read={t_read - t0:.6f}s decode={t_done - t_read:.6f}s total={t_done - t0:.6f}s",
+                flush=True,
+            )
+        return out
+
+    def _read_iq1_m_rows(self, offset: int, rows: int, blocks_per_row: int) -> np.ndarray:
+        """Decode IQ1_M rows to float32.
+
+        IQ1_M block layout is 56 bytes for 256 values:
+        ``qs[32] + qh[16] + scales[8]``.  The formula mirrors llama.cpp
+        gguf-py ``IQ1_M.dequantize_blocks``; imatrix is only needed while
+        producing IQ1_M, not while decoding it.
+        """
+        global _GGUF_READER_PROFILE_COUNT
+        profile = _GGUF_READER_PROFILE and _GGUF_READER_PROFILE_COUNT < _GGUF_READER_PROFILE_LIMIT
+        t0 = time.perf_counter() if profile else 0.0
+        nbytes = rows * blocks_per_row * 56
+        data = self._read_at(offset, nbytes)
+        if profile:
+            t_read = time.perf_counter()
+
+        n_blocks = rows * blocks_per_row
+        blocks = np.frombuffer(data, dtype=np.uint8).reshape(n_blocks, 56)
+        qs = blocks[:, :32]
+        qh = blocks[:, 32:48]
+        scales = blocks[:, 48:56].view(np.uint16)
+
+        # Reconstruct the shared f16 super-block scale from the high nibbles of
+        # four uint16 scale words.
+        d = (scales.reshape((n_blocks, 4)) & np.uint16(0xF000)) >> np.array([12, 8, 4, 0], dtype=np.uint16).reshape((1, 4))
+        d = d[:, 0] | d[:, 1] | d[:, 2] | d[:, 3]
+        d = d.view(np.float16).astype(np.float32).reshape((n_blocks, 1))
+
+        # Low 12 bits of the scale words contain 4 packed 3-bit local scales.
+        local_scales = scales.reshape(n_blocks, -1, 1) >> np.array([0, 3, 6, 9], dtype=np.uint16).reshape((1, 1, 4))
+        local_scales = (local_scales & 0x07).reshape((n_blocks, -1))
+        dl = d * (2 * local_scales + 1)
+        dl = dl.reshape((n_blocks, -1, 2, 1, 1))
+
+        qh_parts = qh.reshape((n_blocks, -1, 1)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2))
+        qidx = qs.astype(np.uint16) | ((qh_parts & 0x07).astype(np.uint16) << 8).reshape((n_blocks, -1))
+
+        delta = np.where(qh_parts & 0x08 == 0, np.float32(0.125), np.float32(-0.125))
+        delta = delta.reshape((n_blocks, -1, 2, 2, 1))
+
+        from src.gguf.iq1_grid import iq1_grid_i8
+
+        grid = iq1_grid_i8().astype(np.float32, copy=False)[qidx.reshape(-1)].reshape((n_blocks, -1, 2, 2, 8))
+        out = (dl * (grid + delta)).reshape((rows, blocks_per_row, 256))
+        if profile:
+            t_done = time.perf_counter()
+            _GGUF_READER_PROFILE_COUNT += 1
+            print(
+                f"gguf_reader_profile type=iq1_m rows={rows} blocks_per_row={blocks_per_row} bytes={nbytes} "
                 f"read={t_read - t0:.6f}s decode={t_done - t_read:.6f}s total={t_done - t0:.6f}s",
                 flush=True,
             )

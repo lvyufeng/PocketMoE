@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <chrono>
 #include <random>
+#include <sstream>
 #include <string>
 #include <list>
 #include <unordered_map>
@@ -831,6 +832,126 @@ int env_int_or_default(const char* name, int fallback) {
         return fallback;
     }
 }
+
+int gguf_indexed_attn_mode_from_env() {
+    const char* value = std::getenv("DSV4_GGUF_INDEXED_ATTN");
+    if (value == nullptr || *value == '\0') return 0;
+    const std::string s(value);
+    if (s == "auto" || s == "AUTO") return 2;
+    try {
+        return std::stoi(s);
+    } catch (...) {
+        return 0;
+    }
+}
+
+void gguf_log_mem(const char* tag, int tp_rank) {
+    size_t free_bytes = 0, total_bytes = 0;
+    check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), tag);
+    std::cout << "gguf_mem tag=" << tag
+              << " tp_rank=" << tp_rank
+              << " free_gib=" << (static_cast<double>(free_bytes) / (1024.0 * 1024.0 * 1024.0))
+              << " total_gib=" << (static_cast<double>(total_bytes) / (1024.0 * 1024.0 * 1024.0))
+              << " used_gib=" << (static_cast<double>(total_bytes - free_bytes) / (1024.0 * 1024.0 * 1024.0))
+              << "\n";
+}
+
+void gguf_check_min_free(const char* tag, int tp_rank, int min_free_mib) {
+    if (min_free_mib <= 0) return;
+    size_t free_bytes = 0, total_bytes = 0;
+    check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), tag);
+    const size_t min_bytes = static_cast<size_t>(min_free_mib) * 1024ULL * 1024ULL;
+    if (free_bytes < min_bytes) {
+        std::ostringstream oss;
+        oss << "GGUF free memory below guard after " << tag
+            << ": tp_rank=" << tp_rank
+            << " free_mib=" << (static_cast<double>(free_bytes) / (1024.0 * 1024.0))
+            << " min_free_mib=" << min_free_mib;
+        throw std::runtime_error(oss.str());
+    }
+}
+
+struct GgufPinnedStageSlot {
+    uint8_t* ptr = nullptr;
+    size_t capacity = 0;
+    cudaEvent_t done = nullptr;
+    bool in_flight = false;
+};
+
+struct GgufPinnedStagingRing {
+    std::vector<GgufPinnedStageSlot> slots;
+    size_t next = 0;
+
+    ~GgufPinnedStagingRing() { release(); }
+
+    bool enabled() const { return !slots.empty(); }
+
+    void init(size_t slot_bytes, int requested_slots, int cap_mib, int tp_rank) {
+        release();
+        if (slot_bytes == 0 || requested_slots <= 0 || cap_mib <= 0) return;
+        const size_t cap_bytes = static_cast<size_t>(cap_mib) * 1024ULL * 1024ULL;
+        if (slot_bytes > cap_bytes) {
+            if (tp_rank == 0) {
+                std::cout << "gguf_pinned_staging=0 reason=slot_exceeds_cap"
+                          << " slot_bytes=" << slot_bytes
+                          << " cap_mib=" << cap_mib << "\n";
+            }
+            return;
+        }
+        const size_t max_slots_by_cap = std::max<size_t>(1, cap_bytes / slot_bytes);
+        const int slots_to_alloc = static_cast<int>(std::min<size_t>(
+            static_cast<size_t>(requested_slots), max_slots_by_cap));
+        slots.resize(static_cast<size_t>(slots_to_alloc));
+        for (auto& slot : slots) {
+            slot.capacity = slot_bytes;
+            check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&slot.ptr), slot.capacity, cudaHostAllocDefault),
+                       "cudaHostAlloc GGUF pinned staging slot");
+            check_cuda(cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming),
+                       "create GGUF pinned staging event");
+        }
+        next = 0;
+        if (tp_rank == 0) {
+            const double total_mib = static_cast<double>(slot_bytes) * static_cast<double>(slots_to_alloc) /
+                (1024.0 * 1024.0);
+            std::cout << "gguf_pinned_staging=1"
+                      << " slot_bytes=" << slot_bytes
+                      << " slots=" << slots_to_alloc
+                      << " total_mib=" << total_mib
+                      << " cap_mib=" << cap_mib << "\n";
+        }
+    }
+
+    void copy_async(uint8_t* dst, const uint8_t* src, size_t bytes, cudaStream_t stream, const char* label) {
+        if (!enabled()) {
+            check_cuda(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream), label);
+            return;
+        }
+        GgufPinnedStageSlot& slot = slots[next];
+        if (bytes > slot.capacity) {
+            throw std::runtime_error("GGUF pinned staging slot too small");
+        }
+        if (slot.in_flight) {
+            check_cuda(cudaEventSynchronize(slot.done), "wait GGUF pinned staging slot");
+            slot.in_flight = false;
+        }
+        std::memcpy(slot.ptr, src, bytes);
+        check_cuda(cudaMemcpyAsync(dst, slot.ptr, bytes, cudaMemcpyHostToDevice, stream), label);
+        check_cuda(cudaEventRecord(slot.done, stream), "record GGUF pinned staging slot");
+        slot.in_flight = true;
+        next = (next + 1) % slots.size();
+    }
+
+    void release() {
+        for (auto& slot : slots) {
+            if (slot.in_flight && slot.done != nullptr) cudaEventSynchronize(slot.done);
+            if (slot.ptr != nullptr) cudaFreeHost(slot.ptr);
+            if (slot.done != nullptr) cudaEventDestroy(slot.done);
+            slot = GgufPinnedStageSlot{};
+        }
+        slots.clear();
+        next = 0;
+    }
+};
 
 struct ActiveArenaDeviceBuffers {
     uint8_t* w1 = nullptr;
@@ -3526,35 +3647,47 @@ std::vector<uint16_t> f32_to_bf16_host(const float* src, size_t n) {
 // F16 (IEEE binary16) -> BF16 via F32 intermediate. F16 has 10-bit mantissa,
 // BF16 has 7-bit mantissa, so this drops 3 bits of fraction. Used for staging
 // GGUF F16 weights into the existing BF16 matvec kernels (e.g., gate scoring).
+float f16_bits_to_float(uint16_t h) {
+    const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+    const uint32_t exp16 = (h >> 10) & 0x1Fu;
+    const uint32_t man16 = h & 0x3FFu;
+    uint32_t f32_bits;
+    if (exp16 == 0) {
+        if (man16 == 0) {
+            f32_bits = sign;
+        } else {
+            uint32_t m = man16;
+            int e = -1;
+            while ((m & 0x400u) == 0) { m <<= 1; --e; }
+            m &= 0x3FFu;
+            const uint32_t exp32 = static_cast<uint32_t>(127 - 15 + e);
+            f32_bits = sign | (exp32 << 23) | (m << 13);
+        }
+    } else if (exp16 == 0x1Fu) {
+        f32_bits = sign | (0xFFu << 23) | (man16 << 13);
+    } else {
+        const uint32_t exp32 = exp16 + (127 - 15);
+        f32_bits = sign | (exp32 << 23) | (man16 << 13);
+    }
+    float out;
+    std::memcpy(&out, &f32_bits, sizeof(out));
+    return out;
+}
+
 std::vector<uint16_t> f16_to_bf16_host(const uint16_t* src, size_t n) {
     std::vector<uint16_t> out(n);
     for (size_t i = 0; i < n; ++i) {
-        const uint16_t h = src[i];
-        const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
-        const uint32_t exp16 = (h >> 10) & 0x1Fu;
-        const uint32_t man16 = h & 0x3FFu;
-        uint32_t f32_bits;
-        if (exp16 == 0) {
-            if (man16 == 0) {
-                f32_bits = sign;
-            } else {
-                // Subnormal F16 -> normalized F32: shift mantissa until top bit is set.
-                uint32_t m = man16;
-                int e = -1;
-                while ((m & 0x400u) == 0) { m <<= 1; --e; }
-                m &= 0x3FFu;
-                const uint32_t exp32 = static_cast<uint32_t>(127 - 15 + e);
-                f32_bits = sign | (exp32 << 23) | (m << 13);
-            }
-        } else if (exp16 == 0x1Fu) {
-            // Inf or NaN.
-            f32_bits = sign | (0xFFu << 23) | (man16 << 13);
-        } else {
-            const uint32_t exp32 = exp16 + (127 - 15);
-            f32_bits = sign | (exp32 << 23) | (man16 << 13);
-        }
-        out[i] = static_cast<uint16_t>(f32_bits >> 16);
+        const float f = f16_bits_to_float(src[i]);
+        uint32_t bits;
+        std::memcpy(&bits, &f, sizeof(bits));
+        out[i] = static_cast<uint16_t>(bits >> 16);
     }
+    return out;
+}
+
+std::vector<float> f16_to_f32_host(const uint16_t* src, size_t n) {
+    std::vector<float> out(n);
+    for (size_t i = 0; i < n; ++i) out[i] = f16_bits_to_float(src[i]);
     return out;
 }
 
@@ -3581,6 +3714,36 @@ float device_vector_rms(const float* d_x, int n) {
 // In-place: reads s.d_x [dim], writes back s.d_x [dim] after both residuals.
 // For non-hash layers, the chosen expert ids land in s.d_gate_indices.
 
+struct GgufCompressorDeviceWeights {
+    const uint16_t* wkv = nullptr;
+    const uint16_t* wgate = nullptr;
+    const float* ape = nullptr;
+    const uint16_t* norm = nullptr;
+    int cols = 0;
+    int state_cols = 0;
+    int slots = 0;
+    int ratio = 0;
+    bool overlap = false;
+    bool present = false;
+};
+
+struct GgufIndexerDeviceWeights {
+    const uint16_t* wq_b = nullptr;
+    const uint16_t* weights_proj = nullptr;
+    GgufCompressorDeviceWeights comp;
+    int heads = 0;
+    int head_dim = 0;
+    bool present = false;
+};
+
+struct GgufSparseLayerState {
+    float* compressor_kv = nullptr;
+    float* compressor_score = nullptr;
+    float* indexer_kv_cache = nullptr;
+    float* indexer_comp_kv = nullptr;
+    float* indexer_comp_score = nullptr;
+};
+
 struct GgufLayerDeviceWeights {
     const uint16_t* d_attn_gamma = nullptr;
     const uint16_t* d_q_gamma = nullptr;
@@ -3605,6 +3768,24 @@ struct GgufLayerDeviceWeights {
     const uint8_t* d_routed_w1 = nullptr;
     const uint8_t* d_routed_w2 = nullptr;
     const uint8_t* d_routed_w3 = nullptr;
+    // Hash layers can either pass a one-token tid2eid slice (hash_token=0,
+    // hash_table_topk=topk) or a full resident [vocab, topk] table
+    // (hash_token=real token id).
+    int hash_token = 0;
+    int hash_table_topk = 0;
+    // Number of expert slots in d_routed_w*. Legacy staging uses top-k slots;
+    // resident TP mode uses experts_per_rank local-expert slots.
+    int routed_n_experts = 0;
+    DType routed_w1_dtype = DType::Unknown;
+    DType routed_w2_dtype = DType::Unknown;
+    DType routed_w3_dtype = DType::Unknown;
+    const GgufCompressorDeviceWeights* compressor = nullptr;
+    const GgufIndexerDeviceWeights* indexer = nullptr;
+    GgufSparseLayerState* sparse_state = nullptr;
+    int compress_ratio = 0;
+    int sparse_window_size = 0;
+    int sparse_attn_threshold = 0;
+    int index_topk = 0;
 };
 
 struct GgufLayerDims {
@@ -3623,6 +3804,7 @@ struct GgufLayerDims {
     int n_experts = 0;
     int topk = 0;
     float rope_theta = 0.0f;
+    float compress_rope_theta = 0.0f;
     float swiglu_limit = 0.0f;
     float route_scale = 0.0f;
 };
@@ -3659,17 +3841,32 @@ struct GgufLayerScratch {
     float* d_route_up = nullptr;          // [topk, moe_inter]
     int8_t* d_route_hidden_q = nullptr;   // [topk, moe_inter]
     float* d_route_hidden_scale = nullptr; // [topk, hidden_groups]
+    float* d_route_hidden = nullptr;      // [topk, moe_inter] for IQ1_M path
     // gate scratch
     float* d_gate_scores_scratch = nullptr; // hash:[topk]; non-hash:[n_experts]
     float* d_gate_scored_scratch = nullptr; // non-hash only: [n_experts]
     int64_t* d_gate_indices = nullptr;    // [topk]
     // Per-layer KV cache [cache_capacity, head_dim] float. If non-null, the
     // attention helper writes the current step's kv_norm into slot `position`
-    // and runs cached_single_token_attention on the [0..cache_len) prefix.
-    // If null, falls back to single_token_sparse_attention on d_kv only
-    // (legacy path used by the layer-0 smoke).
+    // and runs cached attention over the [0..cache_len) prefix. If
+    // d_attn_weight_scratch is non-null, cached attention uses it as global
+    // [heads, cache_capacity] softmax scratch so long contexts are not limited
+    // by dynamic shared-memory size.
+    int* d_kv_indices = nullptr;
+    int kv_index_count = 0;
+    int sparse_kv_index_count = 0;
+    bool sparse_attn_used = false;
+    float* d_attn_weight_scratch = nullptr;
     float* d_kv_cache = nullptr;
     int cache_capacity = 0;
+    uint16_t* d_compressor_input_bf16 = nullptr;
+    float* d_compressor_input_rounded = nullptr;
+    float* d_compressor_kv = nullptr;
+    float* d_compressor_score = nullptr;
+    float* d_indexer_comp_kv = nullptr;
+    float* d_indexer_comp_score = nullptr;
+    float* d_index_q = nullptr;
+    float* d_index_scores = nullptr;
 };
 
 // Phase 1: attention residual + ffn_norm + shared expert + gate scoring.
@@ -3686,10 +3883,121 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
                           cudaMemcpyDeviceToDevice), "save x_pre_attn");
     if (!rmsnorm_bf16_gamma_cuda(s.d_x, w.d_attn_gamma, s.d_x_normed, d.dim, 1e-6f))
         throw std::runtime_error("attn_norm failed");
+    const bool use_sparse_compressor =
+        w.compressor != nullptr && w.compressor->present && w.sparse_state != nullptr &&
+        w.compress_ratio > 0 && w.sparse_window_size > 0 && s.d_kv_cache != nullptr &&
+        s.d_kv_indices != nullptr && s.d_compressor_input_bf16 != nullptr &&
+        s.d_compressor_kv != nullptr && s.d_compressor_score != nullptr;
+    const bool use_sparse_attention = use_sparse_compressor &&
+        (w.sparse_attn_threshold <= 0 || (position + 1) > w.sparse_attn_threshold);
+    if (use_sparse_compressor) {
+        const auto& comp = *w.compressor;
+        if (!fp32_to_bf16_cuda(s.d_x_normed, s.d_compressor_input_bf16, d.dim))
+            throw std::runtime_error("GGUF sparse compressor input bf16 failed");
+        if (!bf16_dual_matvec_bf16_x_cuda(s.d_compressor_input_bf16, comp.wkv, comp.wgate,
+                                          s.d_compressor_kv, s.d_compressor_score,
+                                          comp.cols, d.dim))
+            throw std::runtime_error("GGUF sparse compressor matvec failed");
+        const int offset = position % comp.ratio;
+        const float* ape = comp.ape + static_cast<size_t>(offset) * comp.cols;
+        const int write_slot = comp.overlap ? comp.ratio + offset : offset;
+        if (!compressor_update_state_cuda(s.d_compressor_kv, s.d_compressor_score, ape,
+                                          w.sparse_state->compressor_kv,
+                                          w.sparse_state->compressor_score,
+                                          offset, write_slot, comp.state_cols))
+            throw std::runtime_error("GGUF sparse compressor state update failed");
+        if ((position + 1) % comp.ratio == 0) {
+            const int compressed_slot = w.sparse_window_size + position / comp.ratio;
+            if (compressed_slot < s.cache_capacity) {
+                float* d_pooled_slot = s.d_kv_cache + static_cast<size_t>(compressed_slot) * d.kv_dim;
+                if (!compressor_pool_cuda(w.sparse_state->compressor_kv,
+                                          w.sparse_state->compressor_score,
+                                          d_pooled_slot, comp.ratio, d.head_dim,
+                                          comp.state_cols, comp.overlap))
+                    throw std::runtime_error("GGUF sparse compressor pool failed");
+                if (!rmsnorm_bf16_gamma_cuda(d_pooled_slot, comp.norm, d_pooled_slot,
+                                             d.head_dim, 1e-6f))
+                    throw std::runtime_error("GGUF sparse compressed kv norm failed");
+                const float comp_theta = d.compress_rope_theta > 0.0f ? d.compress_rope_theta : d.rope_theta;
+                if (!head_rmsnorm_rope_cuda(d_pooled_slot, /*heads=*/1, d.head_dim,
+                                            d.rope_dim, position + 1 - comp.ratio,
+                                            comp_theta, false, 0.0f))
+                    throw std::runtime_error("GGUF sparse compressed kv rope failed");
+                if (d.head_dim > d.rope_dim &&
+                    !fp8_act_quant_dequant_cuda(d_pooled_slot, d.head_dim - d.rope_dim, 64))
+                    throw std::runtime_error("GGUF sparse compressed kv act quant failed");
+            }
+            if (comp.overlap && !compressor_shift_overlap_state_cuda(
+                    w.sparse_state->compressor_kv, w.sparse_state->compressor_score,
+                    comp.ratio, comp.state_cols))
+                throw std::runtime_error("GGUF sparse compressor overlap shift failed");
+        }
+        if (use_sparse_compressor && w.indexer != nullptr && w.indexer->present && w.indexer->comp.present &&
+            w.sparse_state->indexer_comp_kv != nullptr &&
+            w.sparse_state->indexer_comp_score != nullptr &&
+            w.sparse_state->indexer_kv_cache != nullptr &&
+            s.d_indexer_comp_kv != nullptr && s.d_indexer_comp_score != nullptr) {
+            const auto& ic = w.indexer->comp;
+            if (!bf16_dual_matvec_bf16_x_cuda(s.d_compressor_input_bf16, ic.wkv, ic.wgate,
+                                              s.d_indexer_comp_kv, s.d_indexer_comp_score,
+                                              ic.cols, d.dim))
+                throw std::runtime_error("GGUF sparse indexer compressor matvec failed");
+            const int idx_offset = position % ic.ratio;
+            const float* idx_ape = ic.ape + static_cast<size_t>(idx_offset) * ic.cols;
+            const int idx_write_slot = ic.overlap ? ic.ratio + idx_offset : idx_offset;
+            if (!compressor_update_state_cuda(s.d_indexer_comp_kv, s.d_indexer_comp_score,
+                                              idx_ape,
+                                              w.sparse_state->indexer_comp_kv,
+                                              w.sparse_state->indexer_comp_score,
+                                              idx_offset, idx_write_slot, ic.state_cols))
+                throw std::runtime_error("GGUF sparse indexer compressor state update failed");
+            if ((position + 1) % ic.ratio == 0) {
+                float* d_idx_slot = w.sparse_state->indexer_kv_cache +
+                    static_cast<size_t>(position / ic.ratio) * w.indexer->head_dim;
+                if (!compressor_pool_cuda(w.sparse_state->indexer_comp_kv,
+                                          w.sparse_state->indexer_comp_score,
+                                          d_idx_slot, ic.ratio, w.indexer->head_dim,
+                                          ic.state_cols, ic.overlap))
+                    throw std::runtime_error("GGUF sparse indexer compressor pool failed");
+                if (!rmsnorm_bf16_gamma_cuda(d_idx_slot, ic.norm, d_idx_slot,
+                                             w.indexer->head_dim, 1e-6f))
+                    throw std::runtime_error("GGUF sparse indexer compressed kv norm failed");
+                const float comp_theta = d.compress_rope_theta > 0.0f ? d.compress_rope_theta : d.rope_theta;
+                if (!head_rmsnorm_rope_cuda(d_idx_slot, /*heads=*/1, w.indexer->head_dim,
+                                            d.rope_dim, position + 1 - ic.ratio,
+                                            comp_theta, false, 0.0f))
+                    throw std::runtime_error("GGUF sparse indexer compressed kv rope failed");
+                if (!hadamard128_rows_cuda(d_idx_slot, d_idx_slot, 1))
+                    throw std::runtime_error("GGUF sparse indexer compressed kv hadamard failed");
+                if (!fp4_fake_quant128_rows_cuda(d_idx_slot, 1))
+                    throw std::runtime_error("GGUF sparse indexer compressed kv fp4 failed");
+                if (ic.overlap && !compressor_shift_overlap_state_cuda(
+                        w.sparse_state->indexer_comp_kv,
+                        w.sparse_state->indexer_comp_score,
+                        ic.ratio, ic.state_cols))
+                    throw std::runtime_error("GGUF sparse indexer compressor overlap shift failed");
+            }
+        }
+    }
     if (!q8_0_matvec_cuda(s.d_x_normed, w.d_wq_a, s.d_q_a, d.q_a_dim, d.dim))
         throw std::runtime_error("wq_a failed");
     if (!rmsnorm_bf16_gamma_cuda(s.d_q_a, w.d_q_gamma, s.d_q_normed, d.q_a_dim, 1e-6f))
         throw std::runtime_error("q_norm failed");
+    if (use_sparse_attention && w.indexer != nullptr && w.indexer->present &&
+        s.d_index_q != nullptr) {
+        const int index_q_dim = w.indexer->heads * w.indexer->head_dim;
+        if (!bf16_matvec_cuda(s.d_q_normed, w.indexer->wq_b, s.d_index_q,
+                              index_q_dim, d.q_a_dim))
+            throw std::runtime_error("GGUF sparse indexer q matvec failed");
+        if (!head_rmsnorm_rope_cuda(s.d_index_q, w.indexer->heads,
+                                    w.indexer->head_dim, d.rope_dim, position,
+                                    d.rope_theta, false, 0.0f))
+            throw std::runtime_error("GGUF sparse indexer q rope failed");
+        if (!hadamard128_rows_cuda(s.d_index_q, s.d_index_q, w.indexer->heads))
+            throw std::runtime_error("GGUF sparse indexer q hadamard failed");
+        if (!fp4_fake_quant128_rows_cuda(s.d_index_q, w.indexer->heads))
+            throw std::runtime_error("GGUF sparse indexer q fp4 failed");
+    }
     if (!q8_0_matvec_cuda(s.d_q_normed, w.d_wq_b, s.d_q, d.q_full, d.q_a_dim))
         throw std::runtime_error("wq_b failed");
     if (!head_rmsnorm_rope_cuda(s.d_q, d.heads, d.head_dim, d.rope_dim, position,
@@ -3703,18 +4011,85 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
                                 d.rope_theta, false, 0.0f))
         throw std::runtime_error("kv head rope failed");
     const float scale = 1.0f / std::sqrt(static_cast<float>(d.head_dim));
+    s.sparse_kv_index_count = 0;
+    s.sparse_attn_used = false;
     if (s.d_kv_cache != nullptr) {
-        if (position < 0 || position >= s.cache_capacity)
-            throw std::runtime_error("position out of KV cache capacity");
-        // Write current step's MLA latent K/V into the per-layer cache at slot
-        // `position`, then run cached attention over [0..position] + attn_sink.
-        check_cuda(cudaMemcpy(s.d_kv_cache + static_cast<size_t>(position) * d.kv_dim,
-                              s.d_kv, static_cast<size_t>(d.kv_dim) * sizeof(float),
-                              cudaMemcpyDeviceToDevice), "write kv to cache");
-        if (!cached_single_token_attention_cuda(s.d_q, s.d_kv_cache, w.d_attn_sink,
-                                                s.d_attn_value, d.heads, d.head_dim,
-                                                position + 1, scale))
-            throw std::runtime_error("cached attention failed");
+        if (use_sparse_attention) {
+            const int window = w.sparse_window_size;
+            if (position < 0 || s.cache_capacity <= window)
+                throw std::runtime_error("invalid GGUF sparse KV cache capacity");
+            const int write_pos = position % window;
+            check_cuda(cudaMemcpy(s.d_kv_cache + static_cast<size_t>(write_pos) * d.kv_dim,
+                                  s.d_kv, static_cast<size_t>(d.kv_dim) * sizeof(float),
+                                  cudaMemcpyDeviceToDevice), "write sparse kv to cache");
+            const int window_len = std::min(position + 1, window);
+            const int window_start = std::max(0, position - window_len + 1);
+            if (!build_decode_kv_indices_cuda(s.d_kv_indices, window_start, window_len,
+                                              window, /*compressed_count=*/0,
+                                              /*compressed_offset=*/window))
+                throw std::runtime_error("build GGUF sparse window indices failed");
+            const int compressed_ready = (position + 1) / w.compress_ratio;
+            const int compressed_cap = std::max(0, s.cache_capacity - window);
+            int extra_count = 0;
+            if (w.indexer != nullptr && w.indexer->present && compressed_ready > 0 &&
+                w.sparse_state->indexer_kv_cache != nullptr && s.d_index_scores != nullptr &&
+                s.d_index_q != nullptr && w.index_topk > 0) {
+                const int available = std::min(compressed_ready, compressed_cap);
+                const int keep = std::min(available, w.index_topk);
+                if (!indexer_select_topk_cuda(s.d_index_q,
+                                              w.sparse_state->indexer_kv_cache,
+                                              w.indexer->weights_proj,
+                                              s.d_x,
+                                              s.d_index_scores,
+                                              s.d_kv_indices + window_len,
+                                              available,
+                                              keep,
+                                              w.indexer->heads,
+                                              w.indexer->head_dim,
+                                              d.dim,
+                                              window))
+                    throw std::runtime_error("GGUF sparse indexer topk failed");
+                extra_count = keep;
+            } else {
+                extra_count = std::min(compressed_ready, compressed_cap);
+                if (extra_count > 0 && !build_decode_kv_indices_cuda(
+                        s.d_kv_indices + window_len, /*window_start=*/0, /*window_len=*/0,
+                        window, extra_count, window))
+                    throw std::runtime_error("build GGUF sparse compressed indices failed");
+            }
+            const int index_count = window_len + extra_count;
+            s.sparse_kv_index_count = index_count;
+            s.sparse_attn_used = true;
+            if (!indexed_cached_single_token_attention_cuda(s.d_q, s.d_kv_cache, s.d_kv_indices,
+                                                            w.d_attn_sink, s.d_attn_value,
+                                                            d.heads, d.head_dim,
+                                                            index_count, scale))
+                throw std::runtime_error("GGUF sparse indexed attention failed");
+        } else {
+            if (position < 0 || position >= s.cache_capacity)
+                throw std::runtime_error("position out of KV cache capacity");
+            // Write current step's MLA latent K/V into the per-layer cache at slot
+            // `position`, then run cached attention over [0..position] + attn_sink.
+            check_cuda(cudaMemcpy(s.d_kv_cache + static_cast<size_t>(position) * d.kv_dim,
+                                  s.d_kv, static_cast<size_t>(d.kv_dim) * sizeof(float),
+                                  cudaMemcpyDeviceToDevice), "write kv to cache");
+            if (s.d_kv_indices != nullptr && s.kv_index_count > 0) {
+                if (!indexed_cached_single_token_attention_cuda(s.d_q, s.d_kv_cache, s.d_kv_indices,
+                                                                w.d_attn_sink, s.d_attn_value,
+                                                                d.heads, d.head_dim,
+                                                                s.kv_index_count, scale))
+                    throw std::runtime_error("indexed cached attention failed");
+            } else if (s.d_attn_weight_scratch != nullptr) {
+                if (!cached_single_token_attention_workspace_cuda(s.d_q, s.d_kv_cache, w.d_attn_sink,
+                                                                  s.d_attn_weight_scratch,
+                                                                  s.d_attn_value, d.heads, d.head_dim,
+                                                                  position + 1, scale))
+                    throw std::runtime_error("cached attention workspace failed");
+            } else if (!cached_single_token_attention_cuda(s.d_q, s.d_kv_cache, w.d_attn_sink,
+                                                           s.d_attn_value, d.heads, d.head_dim,
+                                                           position + 1, scale))
+                throw std::runtime_error("cached attention failed");
+        }
     } else {
         if (!single_token_sparse_attention_cuda(s.d_q, s.d_kv, w.d_attn_sink,
                                                 s.d_attn_value, d.heads, d.head_dim, scale))
@@ -3761,11 +4136,12 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
 
     // Gate scoring → route weights + indices.
     if (w.is_hash) {
+        const int table_topk = w.hash_table_topk > 0 ? w.hash_table_topk : d.topk;
         if (!gate_hash_bf16_cuda(s.d_x_normed_ffn, w.d_gate_w_bf16, w.d_tid2eid_i64,
                                  s.d_gate_scores_scratch, s.d_gate_indices,
                                  s.d_route_weights,
-                                 /*token=*/0, /*cols=*/d.dim,
-                                 /*table_topk=*/d.topk, /*topk=*/d.topk,
+                                 w.hash_token, /*cols=*/d.dim,
+                                 table_topk, /*topk=*/d.topk,
                                  d.route_scale))
             throw std::runtime_error("gate_hash_bf16_cuda failed");
     } else {
@@ -3788,25 +4164,94 @@ void gguf_layer_forward_moe(const GgufLayerDeviceWeights& w,
     const int routes = d.topk;
 
     check_cuda(cudaMemset(s.d_moe_out, 0, d.dim * sizeof(float)), "zero moe_out");
-    if (!q2_quantize_x_q8_1_cuda(s.d_x_normed_ffn, s.d_x_q, s.d_x_scale,
-                                  /*routes=*/1, d.dim))
-        throw std::runtime_error("q2_quantize_x_q8_1 failed");
-    if (!q2_moe_single_w13_iq2_xxs_cuda(s.d_x_q, s.d_x_scale, s.d_route_slots,
-                                         w.d_routed_w1, w.d_routed_w3,
-                                         s.d_route_gate, s.d_route_up,
-                                         routes, /*n_experts=*/routes,
-                                         d.dim, d.moe_inter))
-        throw std::runtime_error("q2 w13 iq2_xxs failed");
-    if (!q2_route_swiglu_quantize_hidden_q8_1_cuda(
-            s.d_route_gate, s.d_route_up, s.d_route_weights,
-            s.d_route_hidden_q, s.d_route_hidden_scale,
-            routes, d.moe_inter, d.swiglu_limit))
-        throw std::runtime_error("q2 swiglu + quantize failed");
-    if (!q2_moe_single_w2_q2k_cuda(s.d_route_hidden_q, s.d_route_hidden_scale,
-                                    s.d_route_slots, w.d_routed_w2, s.d_moe_out,
-                                    routes, /*n_experts=*/routes,
-                                    d.dim, d.moe_inter))
-        throw std::runtime_error("q2 w2 q2k failed");
+    const bool q2_recipe =
+        w.routed_w1_dtype == DType::IQ2_XXS &&
+        w.routed_w3_dtype == DType::IQ2_XXS &&
+        w.routed_w2_dtype == DType::Q2_K;
+    const bool iq1_all_recipe =
+        w.routed_w1_dtype == DType::IQ1_M &&
+        w.routed_w3_dtype == DType::IQ1_M &&
+        w.routed_w2_dtype == DType::IQ1_M;
+    const bool iq1_w13_q2_w2_recipe =
+        w.routed_w1_dtype == DType::IQ1_M &&
+        w.routed_w3_dtype == DType::IQ1_M &&
+        w.routed_w2_dtype == DType::Q2_K;
+
+    const int routed_n_experts = w.routed_n_experts > 0 ? w.routed_n_experts : routes;
+    const bool iq1_fused_w13_swiglu = env_int_or_default("DSV4_GGUF_IQ1_FUSED_W13_SWIGLU", 1) != 0;
+
+    if (q2_recipe) {
+        if (!q2_quantize_x_q8_1_cuda(s.d_x_normed_ffn, s.d_x_q, s.d_x_scale,
+                                      /*routes=*/1, d.dim))
+            throw std::runtime_error("q2_quantize_x_q8_1 failed");
+        if (!q2_moe_single_w13_iq2_xxs_cuda(s.d_x_q, s.d_x_scale, s.d_route_slots,
+                                             w.d_routed_w1, w.d_routed_w3,
+                                             s.d_route_gate, s.d_route_up,
+                                             routes, routed_n_experts,
+                                             d.dim, d.moe_inter))
+            throw std::runtime_error("q2 w13 iq2_xxs failed");
+        if (!q2_route_swiglu_quantize_hidden_q8_1_cuda(
+                s.d_route_gate, s.d_route_up, s.d_route_weights,
+                s.d_route_hidden_q, s.d_route_hidden_scale,
+                routes, d.moe_inter, d.swiglu_limit))
+            throw std::runtime_error("q2 swiglu + quantize failed");
+        if (!q2_moe_single_w2_q2k_cuda(s.d_route_hidden_q, s.d_route_hidden_scale,
+                                        s.d_route_slots, w.d_routed_w2, s.d_moe_out,
+                                        routes, routed_n_experts,
+                                        d.dim, d.moe_inter))
+            throw std::runtime_error("q2 w2 q2k failed");
+    } else if (iq1_all_recipe) {
+        if (iq1_fused_w13_swiglu) {
+            if (!iq1_moe_single_w13_swiglu_cuda(
+                    s.d_x_normed_ffn, s.d_route_slots, s.d_route_weights,
+                    w.d_routed_w1, w.d_routed_w3, s.d_route_hidden,
+                    routes, routed_n_experts, d.dim, d.moe_inter, d.swiglu_limit))
+                throw std::runtime_error("iq1 fused w13+swiglu failed");
+        } else {
+            if (!iq1_moe_single_w13_cuda(s.d_x_normed_ffn, s.d_route_slots,
+                                          w.d_routed_w1, w.d_routed_w3,
+                                          s.d_route_gate, s.d_route_up,
+                                          routes, routed_n_experts,
+                                          d.dim, d.moe_inter))
+                throw std::runtime_error("iq1 w13 failed");
+            if (!iq1_route_swiglu_cuda(s.d_route_gate, s.d_route_up, s.d_route_weights,
+                                        s.d_route_hidden, routes, d.moe_inter,
+                                        d.swiglu_limit))
+                throw std::runtime_error("iq1 swiglu failed");
+        }
+        const bool iq1_w2_reduce = env_int_or_default("DSV4_GGUF_IQ1_W2_REDUCE", 0) != 0;
+        const bool w2_ok = iq1_w2_reduce
+            ? iq1_moe_single_w2_reduce_cuda(s.d_route_hidden, s.d_route_slots,
+                                            w.d_routed_w2, s.d_moe_out,
+                                            routes, routed_n_experts,
+                                            d.dim, d.moe_inter)
+            : iq1_moe_single_w2_cuda(s.d_route_hidden, s.d_route_slots,
+                                      w.d_routed_w2, s.d_moe_out,
+                                      routes, routed_n_experts,
+                                      d.dim, d.moe_inter);
+        if (!w2_ok)
+            throw std::runtime_error("iq1 w2 failed");
+    } else if (iq1_w13_q2_w2_recipe) {
+        // Dynamic IQ1_M recipe early layers: W1/W3 are IQ1_M, W2 remains Q2_K.
+        if (!iq1_moe_single_w13_cuda(s.d_x_normed_ffn, s.d_route_slots,
+                                      w.d_routed_w1, w.d_routed_w3,
+                                      s.d_route_gate, s.d_route_up,
+                                      routes, routed_n_experts,
+                                      d.dim, d.moe_inter))
+            throw std::runtime_error("iq1 w13 failed");
+        if (!q2_route_swiglu_quantize_hidden_q8_1_cuda(
+                s.d_route_gate, s.d_route_up, s.d_route_weights,
+                s.d_route_hidden_q, s.d_route_hidden_scale,
+                routes, d.moe_inter, d.swiglu_limit))
+            throw std::runtime_error("iq1/q2 swiglu + quantize failed");
+        if (!q2_moe_single_w2_q2k_cuda(s.d_route_hidden_q, s.d_route_hidden_scale,
+                                        s.d_route_slots, w.d_routed_w2, s.d_moe_out,
+                                        routes, routed_n_experts,
+                                        d.dim, d.moe_inter))
+            throw std::runtime_error("iq1/q2 w2 q2k failed");
+    } else {
+        throw std::runtime_error("unsupported routed GGUF MoE dtype recipe");
+    }
 
     gguf_all_reduce_sum_fp32_inplace(s.d_moe_out, d.dim, reduce_ctx, "GGUF MoE all-reduce");
 
@@ -5262,6 +5707,7 @@ GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path,
     float* d_route_up = nullptr;
     int8_t* d_route_hidden_q = nullptr;
     float* d_route_hidden_scale = nullptr;
+    float* d_route_hidden = nullptr;
     check_cuda(cudaMalloc(&d_x_q, dim), "alloc d_x_q");
     check_cuda(cudaMalloc(&d_x_scale, x_groups * sizeof(float)), "alloc d_x_scale");
     check_cuda(cudaMalloc(&d_route_slots, routes * sizeof(int64_t)), "alloc d_route_slots");
@@ -5275,6 +5721,8 @@ GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path,
     check_cuda(cudaMalloc(&d_route_hidden_scale,
                           static_cast<size_t>(routes) * hidden_groups * sizeof(float)),
                "alloc d_route_hidden_scale");
+    check_cuda(cudaMalloc(&d_route_hidden, static_cast<size_t>(routes) * moe_inter * sizeof(float)),
+               "alloc d_route_hidden");
     std::vector<int64_t> h_route_slots(routes);
     for (int k = 0; k < routes; ++k) h_route_slots[k] = k;
     check_cuda(cudaMemcpy(d_route_slots, h_route_slots.data(),
@@ -5310,6 +5758,10 @@ GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path,
     lw.d_routed_w1 = d_routed_w1;
     lw.d_routed_w2 = d_routed_w2;
     lw.d_routed_w3 = d_routed_w3;
+    lw.routed_n_experts = routes;
+    lw.routed_w1_dtype = first_w1.dtype;
+    lw.routed_w2_dtype = first_w2.dtype;
+    lw.routed_w3_dtype = first_w3.dtype;
 
     GgufLayerDims ld;
     ld.dim = dim;
@@ -5327,6 +5779,7 @@ GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path,
     ld.n_experts = n_experts;
     ld.topk = topk;
     ld.rope_theta = static_cast<float>(ctx.config.rope_theta);
+    ld.compress_rope_theta = static_cast<float>(ctx.config.compress_rope_theta == 0 ? ctx.config.rope_theta : ctx.config.compress_rope_theta);
     ld.swiglu_limit = static_cast<float>(ctx.config.swiglu_limit);
     ld.route_scale = static_cast<float>(ctx.config.route_scale);
 
@@ -5358,6 +5811,7 @@ GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path,
     ls.d_route_up = d_route_up;
     ls.d_route_hidden_q = d_route_hidden_q;
     ls.d_route_hidden_scale = d_route_hidden_scale;
+    ls.d_route_hidden = d_route_hidden;
     ls.d_gate_scores_scratch = d_gate_scores_scratch;
     ls.d_gate_scored_scratch = nullptr;  // hash gate path doesn't need this
     ls.d_gate_indices = d_gate_indices;
@@ -5439,6 +5893,7 @@ GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path,
     cudaFree(d_route_up);
     cudaFree(d_route_hidden_q);
     cudaFree(d_route_hidden_scale);
+    cudaFree(d_route_hidden);
     return r;
 }
 
@@ -5511,6 +5966,13 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
         uint16_t* d = nullptr;
         check_cuda(cudaMalloc(&d, n * sizeof(uint16_t)), "alloc bf16-from-f16");
         check_cuda(cudaMemcpy(d, bf.data(), n * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy bf16-from-f16");
+        return d;
+    };
+    auto upload_f32_from_f16 = [&](const void* src, size_t n) {
+        auto f32 = f16_to_f32_host(reinterpret_cast<const uint16_t*>(src), n);
+        float* d = nullptr;
+        check_cuda(cudaMalloc(&d, n * sizeof(float)), "alloc f32-from-f16");
+        check_cuda(cudaMemcpy(d, f32.data(), n * sizeof(float), cudaMemcpyHostToDevice), "copy f32-from-f16");
         return d;
     };
 
@@ -5596,24 +6058,42 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
     uint8_t* d_head = upload_u8(head.data, head.nbytes);
 
     // ===== expert staging buffers (reused per layer) =====
-    auto first_w1 = gws.get_expert("layers.0.ffn.experts.routed.w1",
-                                    "layers.0.ffn.experts.routed.w1", 0);
-    auto first_w2 = gws.get_expert("layers.0.ffn.experts.routed.w2",
-                                    "layers.0.ffn.experts.routed.w2", 0);
-    auto first_w3 = gws.get_expert("layers.0.ffn.experts.routed.w3",
-                                    "layers.0.ffn.experts.routed.w3", 0);
-    if (!first_w1.found || !first_w2.found || !first_w3.found)
-        throw std::runtime_error("get_expert(0) failed");
-    const uint64_t per_w1_bytes = first_w1.nbytes;
-    const uint64_t per_w2_bytes = first_w2.nbytes;
-    const uint64_t per_w3_bytes = first_w3.nbytes;
+    std::vector<uint64_t> layer_w1_bytes(n_layers, 0);
+    std::vector<uint64_t> layer_w2_bytes(n_layers, 0);
+    std::vector<uint64_t> layer_w3_bytes(n_layers, 0);
+    std::vector<DType> layer_w1_dtype(n_layers, DType::Unknown);
+    std::vector<DType> layer_w2_dtype(n_layers, DType::Unknown);
+    std::vector<DType> layer_w3_dtype(n_layers, DType::Unknown);
+    uint64_t max_per_w1_bytes = 0;
+    uint64_t max_per_w2_bytes = 0;
+    uint64_t max_per_w3_bytes = 0;
+    for (int L = 0; L < n_layers; ++L) {
+        const std::string lp = "layers." + std::to_string(L);
+        const std::string w1_name = lp + ".ffn.experts.routed.w1";
+        const std::string w2_name = lp + ".ffn.experts.routed.w2";
+        const std::string w3_name = lp + ".ffn.experts.routed.w3";
+        auto f1 = gws.get_expert(w1_name, w1_name, 0);
+        auto f2 = gws.get_expert(w2_name, w2_name, 0);
+        auto f3 = gws.get_expert(w3_name, w3_name, 0);
+        if (!f1.found || !f2.found || !f3.found)
+            throw std::runtime_error("get_expert(0) failed while sizing routed buffers");
+        layer_w1_bytes[L] = f1.nbytes;
+        layer_w2_bytes[L] = f2.nbytes;
+        layer_w3_bytes[L] = f3.nbytes;
+        layer_w1_dtype[L] = f1.dtype;
+        layer_w2_dtype[L] = f2.dtype;
+        layer_w3_dtype[L] = f3.dtype;
+        max_per_w1_bytes = std::max(max_per_w1_bytes, f1.nbytes);
+        max_per_w2_bytes = std::max(max_per_w2_bytes, f2.nbytes);
+        max_per_w3_bytes = std::max(max_per_w3_bytes, f3.nbytes);
+    }
 
     uint8_t* d_routed_w1 = nullptr;
     uint8_t* d_routed_w2 = nullptr;
     uint8_t* d_routed_w3 = nullptr;
-    check_cuda(cudaMalloc(&d_routed_w1, per_w1_bytes * topk), "alloc routed_w1");
-    check_cuda(cudaMalloc(&d_routed_w2, per_w2_bytes * topk), "alloc routed_w2");
-    check_cuda(cudaMalloc(&d_routed_w3, per_w3_bytes * topk), "alloc routed_w3");
+    check_cuda(cudaMalloc(&d_routed_w1, max_per_w1_bytes * topk), "alloc routed_w1");
+    check_cuda(cudaMalloc(&d_routed_w2, max_per_w2_bytes * topk), "alloc routed_w2");
+    check_cuda(cudaMalloc(&d_routed_w3, max_per_w3_bytes * topk), "alloc routed_w3");
 
     // ===== per-layer KV cache buffers (sized for this smoke's single step) =====
     // Cache capacity = position + 1: enough to write the current step's KV into
@@ -5664,11 +6144,20 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
     float* d_route_up = nullptr;
     int8_t* d_route_hidden_q = nullptr;
     float* d_route_hidden_scale = nullptr;
+    float* d_route_hidden = nullptr;
     float* d_gate_scores_scratch = nullptr;
     float* d_gate_scored_scratch = nullptr;
     int64_t* d_gate_indices = nullptr;
     int64_t* d_tid2eid_i64 = nullptr;
     uint16_t* d_embed_row_f16 = nullptr;
+    uint16_t* d_compressor_input_bf16 = nullptr;
+    float* d_compressor_input_rounded = nullptr;
+    float* d_compressor_kv = nullptr;
+    float* d_compressor_score = nullptr;
+    float* d_indexer_comp_kv = nullptr;
+    float* d_indexer_comp_score = nullptr;
+    float* d_index_q = nullptr;
+    float* d_index_scores = nullptr;
     float* d_logits = nullptr;
     check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
     check_cuda(cudaMalloc(&d_x_pre_attn, dim * sizeof(float)), "alloc d_x_pre_attn");
@@ -5702,6 +6191,8 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
     check_cuda(cudaMalloc(&d_route_hidden_scale,
                           static_cast<size_t>(topk) * hidden_groups * sizeof(float)),
                "alloc d_route_hidden_scale");
+    check_cuda(cudaMalloc(&d_route_hidden, static_cast<size_t>(topk) * moe_inter * sizeof(float)),
+               "alloc d_route_hidden");
     check_cuda(cudaMalloc(&d_gate_scores_scratch, gate_scratch_n * sizeof(float)),
                "alloc d_gate_scores_scratch");
     check_cuda(cudaMalloc(&d_gate_scored_scratch, n_experts * sizeof(float)),
@@ -5751,6 +6242,7 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
     ls.d_route_slots = d_route_slots; ls.d_route_weights = d_route_weights;
     ls.d_route_gate = d_route_gate; ls.d_route_up = d_route_up;
     ls.d_route_hidden_q = d_route_hidden_q; ls.d_route_hidden_scale = d_route_hidden_scale;
+    ls.d_route_hidden = d_route_hidden;
     ls.d_gate_scores_scratch = d_gate_scores_scratch;
     ls.d_gate_scored_scratch = d_gate_scored_scratch;
     ls.d_gate_indices = d_gate_indices;
@@ -5770,6 +6262,10 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
         lw.d_gate_w_bf16 = d_gate_w[L];
         lw.is_hash = is_hash;
         lw.d_routed_w1 = d_routed_w1; lw.d_routed_w2 = d_routed_w2; lw.d_routed_w3 = d_routed_w3;
+        lw.routed_n_experts = topk;
+        lw.routed_w1_dtype = layer_w1_dtype[L];
+        lw.routed_w2_dtype = layer_w2_dtype[L];
+        lw.routed_w3_dtype = layer_w3_dtype[L];
 
         ls.d_kv_cache = d_kv_cache[L];
         ls.cache_capacity = cache_capacity;
@@ -5807,11 +6303,13 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
             auto wv3 = gws.get_expert(w3_name, w3_name, eid);
             if (!wv1.found || !wv2.found || !wv3.found)
                 throw std::runtime_error("get_expert failed during full forward staging");
-            check_cuda(cudaMemcpy(d_routed_w1 + per_w1_bytes * k, wv1.data, per_w1_bytes,
+            if (wv1.dtype != layer_w1_dtype[L] || wv2.dtype != layer_w2_dtype[L] || wv3.dtype != layer_w3_dtype[L])
+                throw std::runtime_error("routed expert dtype changed within full forward layer");
+            check_cuda(cudaMemcpy(d_routed_w1 + layer_w1_bytes[L] * k, wv1.data, layer_w1_bytes[L],
                                   cudaMemcpyHostToDevice), "stage routed_w1");
-            check_cuda(cudaMemcpy(d_routed_w2 + per_w2_bytes * k, wv2.data, per_w2_bytes,
+            check_cuda(cudaMemcpy(d_routed_w2 + layer_w2_bytes[L] * k, wv2.data, layer_w2_bytes[L],
                                   cudaMemcpyHostToDevice), "stage routed_w2");
-            check_cuda(cudaMemcpy(d_routed_w3 + per_w3_bytes * k, wv3.data, per_w3_bytes,
+            check_cuda(cudaMemcpy(d_routed_w3 + layer_w3_bytes[L] * k, wv3.data, layer_w3_bytes[L],
                                   cudaMemcpyHostToDevice), "stage routed_w3");
         }
 
@@ -5876,7 +6374,7 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
     cudaFree(d_x_q); cudaFree(d_x_scale);
     cudaFree(d_route_slots); cudaFree(d_route_weights);
     cudaFree(d_route_gate); cudaFree(d_route_up);
-    cudaFree(d_route_hidden_q); cudaFree(d_route_hidden_scale);
+    cudaFree(d_route_hidden_q); cudaFree(d_route_hidden_scale); cudaFree(d_route_hidden);
     cudaFree(d_gate_scores_scratch); cudaFree(d_gate_scored_scratch); cudaFree(d_gate_indices);
     cudaFree(d_tid2eid_i64); cudaFree(d_embed_row_f16); cudaFree(d_logits);
     return r;
@@ -5901,23 +6399,30 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     GgufForwardContext ctx(ckpt_path);
     GGUFWeightSource& gws = *ctx.weight_source;
 
-    // ===== pin the GGUF mmap region for async H2D out of expert bytes =====
-    // The routed expert per-step staging dominates decode wall time. Pinning
-    // the mmap region lets cudaMemcpyAsync DMA directly from the file pages
-    // at ~10 GB/s instead of the ~4 GB/s pageable+staging-copy path.
-    // ReadOnly avoids any RLIMIT_MEMLOCK pressure on systems that support it
-    // (CUDA 11.4+); fall back to default flags otherwise.
+    // ===== optional GGUF mmap pinning for async H2D out of expert bytes =====
+    // Do NOT register the whole GGUF mmap by default. Large file-backed
+    // cudaHostRegister() calls can make the kernel account the entire mapping as
+    // dirty/pinned; with TP4 an ~86 GiB GGUF becomes ~344 GiB per run and can
+    // quickly throttle unrelated git/build/source writes via balance_dirty_pages.
+    // Resident-routed decode no longer needs this for its hot path, so keep it as
+    // an explicit debug/legacy staging knob with a conservative size guard.
     void* gguf_base = const_cast<uint8_t*>(gws.file().bytes());
     const size_t gguf_bytes = gws.file().file_size();
     bool gguf_registered = false;
-    if (cudaHostRegister(gguf_base, gguf_bytes, cudaHostRegisterReadOnly) == cudaSuccess) {
-        gguf_registered = true;
-    } else if (cudaHostRegister(gguf_base, gguf_bytes, cudaHostRegisterDefault) == cudaSuccess) {
-        gguf_registered = true;
-    } else {
-        // Clear the error and continue with the pageable path; correctness
-        // is unaffected, only bandwidth.
-        cudaGetLastError();
+    const bool gguf_register_mmap = env_int_or_default("DSV4_GGUF_REGISTER_MMAP", 0) != 0;
+    const int gguf_register_mmap_max_gib = env_int_or_default("DSV4_GGUF_REGISTER_MMAP_MAX_GIB", 4);
+    const size_t gguf_register_mmap_max_bytes =
+        gguf_register_mmap_max_gib <= 0 ? 0 : static_cast<size_t>(gguf_register_mmap_max_gib) * 1024ULL * 1024ULL * 1024ULL;
+    if (gguf_register_mmap && gguf_register_mmap_max_bytes > 0 && gguf_bytes <= gguf_register_mmap_max_bytes) {
+        if (cudaHostRegister(gguf_base, gguf_bytes, cudaHostRegisterReadOnly) == cudaSuccess) {
+            gguf_registered = true;
+        } else if (cudaHostRegister(gguf_base, gguf_bytes, cudaHostRegisterDefault) == cudaSuccess) {
+            gguf_registered = true;
+        } else {
+            // Clear the error and continue with the pageable path; correctness
+            // is unaffected, only bandwidth.
+            cudaGetLastError();
+        }
     }
 
     // ===== model dims =====
@@ -5968,6 +6473,36 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     for (int t : seed_tokens) if (t < 0 || t >= vocab)
         throw std::runtime_error("seed token id out of vocab range");
 
+    const int gguf_min_free_mib = env_int_or_default("DSV4_GGUF_MIN_FREE_MIB", 512);
+    const bool gguf_mem_profile = env_int_or_default("DSV4_GGUF_MEM_PROFILE", 1) != 0;
+    const int gguf_indexed_attn = gguf_indexed_attn_mode_from_env();
+    const int gguf_indexed_attn_window = env_int_or_default(
+        "DSV4_GGUF_INDEXED_ATTN_WINDOW",
+        static_cast<int>(ctx.config.window_size == 0 ? 128 : ctx.config.window_size));
+    const int gguf_indexed_attn_auto_threshold = env_int_or_default(
+        "DSV4_GGUF_INDEXED_ATTN_AUTO_THRESHOLD", gguf_indexed_attn_window);
+    const bool gguf_sparse_compressor = env_int_or_default("DSV4_GGUF_SPARSE_COMPRESSOR", 0) != 0;
+    // Optional indexer top-k for compressed slots. Default off for now: the main
+    // compressor + all compressed slots already cuts 32K attention scans by ~4x,
+    // while the GGUF indexer matvec path is not optimized yet.
+    const bool gguf_sparse_indexer = env_int_or_default("DSV4_GGUF_SPARSE_INDEXER", 0) != 0;
+    const int gguf_sparse_window = env_int_or_default(
+        "DSV4_GGUF_SPARSE_WINDOW",
+        static_cast<int>(ctx.config.window_size == 0 ? 128 : ctx.config.window_size));
+    const int gguf_sparse_attn_threshold = env_int_or_default(
+        "DSV4_GGUF_SPARSE_ATTN_THRESHOLD", gguf_sparse_window);
+    if (gguf_indexed_attn < 0 || gguf_indexed_attn > 2)
+        throw std::runtime_error("DSV4_GGUF_INDEXED_ATTN must be 0, 1, 2, or auto");
+    if (gguf_indexed_attn != 0 && gguf_indexed_attn_window <= 0)
+        throw std::runtime_error("DSV4_GGUF_INDEXED_ATTN_WINDOW must be > 0");
+    if (gguf_indexed_attn == 2 && gguf_indexed_attn_auto_threshold <= 0)
+        throw std::runtime_error("DSV4_GGUF_INDEXED_ATTN_AUTO_THRESHOLD must be > 0");
+    if (gguf_sparse_compressor && gguf_sparse_window <= 0)
+        throw std::runtime_error("DSV4_GGUF_SPARSE_WINDOW must be > 0");
+    if (gguf_sparse_compressor && (gguf_sparse_attn_threshold < 0 || gguf_sparse_attn_threshold > gguf_sparse_window))
+        throw std::runtime_error("DSV4_GGUF_SPARSE_ATTN_THRESHOLD must be in [0, DSV4_GGUF_SPARSE_WINDOW]");
+    if (gguf_mem_profile) gguf_log_mem("after_context_init", tp_rank);
+
     auto upload_u8 = [](const void* src, size_t bytes) {
         uint8_t* d = nullptr;
         check_cuda(cudaMalloc(&d, bytes), "alloc u8");
@@ -5994,6 +6529,13 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         check_cuda(cudaMemcpy(d, bf.data(), n * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy bf16-from-f16");
         return d;
     };
+    auto upload_f32_from_f16 = [&](const void* src, size_t n) {
+        auto f32 = f16_to_f32_host(reinterpret_cast<const uint16_t*>(src), n);
+        float* d = nullptr;
+        check_cuda(cudaMalloc(&d, n * sizeof(float)), "alloc f32-from-f16");
+        check_cuda(cudaMemcpy(d, f32.data(), n * sizeof(float), cudaMemcpyHostToDevice), "copy f32-from-f16");
+        return d;
+    };
 
     // ===== per-layer dense weights resident on device =====
     std::vector<uint16_t*> d_attn_gamma(n_layers, nullptr);
@@ -6011,7 +6553,12 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     std::vector<uint8_t*> d_shared_w3(n_layers, nullptr);
     std::vector<uint16_t*> d_gate_w(n_layers, nullptr);
     std::vector<float*> d_gate_bias(n_layers, nullptr);
+    std::vector<GgufCompressorDeviceWeights> d_compressor_w(n_layers);
+    std::vector<GgufIndexerDeviceWeights> d_indexer_w(n_layers);
+    std::vector<GgufSparseLayerState> d_sparse_state(n_layers);
     std::vector<const int32_t*> h_tid2eid_table(n_layers, nullptr);
+    std::vector<int64_t*> d_tid2eid_table(n_layers, nullptr);
+    const bool hash_table_resident = env_int_or_default("DSV4_GGUF_HASH_TABLE_RESIDENT", 1) != 0;
 
     for (int L = 0; L < n_layers; ++L) {
         const std::string lp = "layers." + std::to_string(L);
@@ -6048,6 +6595,17 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             if (tid2eid.nbytes < static_cast<uint64_t>(vocab) * topk * sizeof(int32_t))
                 throw std::runtime_error("tid2eid table truncated");
             h_tid2eid_table[L] = reinterpret_cast<const int32_t*>(tid2eid.data);
+            if (hash_table_resident) {
+                const size_t entries = static_cast<size_t>(vocab) * static_cast<size_t>(topk);
+                std::vector<int64_t> tid2eid_i64(entries);
+                const int32_t* src = h_tid2eid_table[L];
+                for (size_t i = 0; i < entries; ++i) tid2eid_i64[i] = src[i];
+                check_cuda(cudaMalloc(&d_tid2eid_table[L], entries * sizeof(int64_t)),
+                           "alloc resident tid2eid table");
+                check_cuda(cudaMemcpy(d_tid2eid_table[L], tid2eid_i64.data(),
+                                      entries * sizeof(int64_t), cudaMemcpyHostToDevice),
+                           "copy resident tid2eid table");
+            }
         } else {
             WeightView bias = gws.require(lp + ".ffn.gate.bias");
             if (bias.dtype != DType::F32 || bias.shape.size() != 1 ||
@@ -6055,6 +6613,66 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 throw std::runtime_error("exp_probs_b.bias shape/dtype");
             d_gate_bias[L] = upload_f32(bias.data, n_experts);
         }
+        if (gguf_sparse_compressor && L < static_cast<int>(ctx.config.compress_ratios.size()) && ctx.config.compress_ratios[L] > 0) {
+            auto load_comp = [&](const std::string& prefix, int ratio, int state_head_dim) {
+                GgufCompressorDeviceWeights c;
+                WeightView wkv_c = gws.get(prefix + ".wkv.weight");
+                WeightView wgate_c = gws.get(prefix + ".wgate.weight");
+                WeightView ape_c = gws.get(prefix + ".ape");
+                WeightView norm_c = gws.get(prefix + ".norm.weight");
+                if (!wkv_c.found || !wgate_c.found || !ape_c.found || !norm_c.found) return c;
+                if (wkv_c.dtype != DType::F16 || wgate_c.dtype != DType::F16 || ape_c.dtype != DType::F16 || norm_c.dtype != DType::F32)
+                    throw std::runtime_error("GGUF compressor dtype mismatch");
+                if (wkv_c.shape.size() != 2 || static_cast<int>(wkv_c.shape[0]) != dim || wgate_c.shape != wkv_c.shape)
+                    throw std::runtime_error("GGUF compressor shape mismatch");
+                c.cols = static_cast<int>(wkv_c.shape[1]); // GGUF raw [dim, cols], logical direct data [cols, dim].
+                c.ratio = ratio;
+                c.overlap = (c.cols == state_head_dim * 2);
+                c.state_cols = c.overlap ? state_head_dim * 2 : state_head_dim;
+                c.slots = ratio * (c.overlap ? 2 : 1);
+                c.wkv = upload_bf16_from_f16(wkv_c.data, static_cast<size_t>(c.cols) * static_cast<size_t>(dim));
+                c.wgate = upload_bf16_from_f16(wgate_c.data, static_cast<size_t>(c.cols) * static_cast<size_t>(dim));
+                c.ape = upload_f32_from_f16(ape_c.data, static_cast<size_t>(ape_c.shape[0]) * static_cast<size_t>(ape_c.shape[1]));
+                c.norm = upload_bf16_from_f32(norm_c.data, static_cast<size_t>(state_head_dim));
+                c.present = true;
+                return c;
+            };
+            const int ratio = static_cast<int>(ctx.config.compress_ratios[L]);
+            d_compressor_w[L] = load_comp(lp + ".attn.compressor", ratio, head_dim);
+            if (gguf_sparse_indexer && ratio == 4 && ctx.config.index_n_heads > 0 && ctx.config.index_head_dim > 0) {
+                WeightView idx_wq_b = gws.get(lp + ".attn.indexer.wq_b.weight");
+                WeightView idx_proj = gws.get(lp + ".attn.indexer.weights_proj.weight");
+                if (idx_wq_b.found && idx_proj.found) {
+                    if (idx_wq_b.dtype != DType::F16 || idx_proj.dtype != DType::F16)
+                        throw std::runtime_error("GGUF indexer dtype mismatch");
+                    const int idx_heads = static_cast<int>(ctx.config.index_n_heads);
+                    const int idx_head_dim = static_cast<int>(ctx.config.index_head_dim);
+                    const int idx_q_dim = idx_heads * idx_head_dim;
+                    if (idx_wq_b.shape.size() != 2 || static_cast<int>(idx_wq_b.shape[0]) != q_a_dim || static_cast<int>(idx_wq_b.shape[1]) != idx_q_dim)
+                        throw std::runtime_error("GGUF indexer wq_b shape mismatch");
+                    if (idx_proj.shape.size() != 2 || static_cast<int>(idx_proj.shape[0]) != dim || static_cast<int>(idx_proj.shape[1]) != idx_heads)
+                        throw std::runtime_error("GGUF indexer proj shape mismatch");
+                    d_indexer_w[L].heads = idx_heads;
+                    d_indexer_w[L].head_dim = idx_head_dim;
+                    d_indexer_w[L].wq_b = upload_bf16_from_f16(idx_wq_b.data, static_cast<size_t>(idx_q_dim) * static_cast<size_t>(q_a_dim));
+                    d_indexer_w[L].weights_proj = upload_bf16_from_f16(idx_proj.data, static_cast<size_t>(idx_heads) * static_cast<size_t>(dim));
+                    d_indexer_w[L].comp = load_comp(lp + ".attn.indexer.compressor", 4, idx_head_dim);
+                    d_indexer_w[L].present = d_indexer_w[L].comp.present;
+                }
+            }
+        }
+    }
+    if (gguf_mem_profile) gguf_log_mem("after_dense_weights", tp_rank);
+    gguf_check_min_free("after_dense_weights", tp_rank, gguf_min_free_mib);
+    if (hash_table_resident && gguf_mem_profile) {
+        const double hash_table_gib = static_cast<double>(n_hash) *
+            static_cast<double>(vocab) * static_cast<double>(topk) *
+            static_cast<double>(sizeof(int64_t)) / (1024.0 * 1024.0 * 1024.0);
+        std::cout << "gguf_hash_table_resident=1 tp_rank=" << tp_rank
+                  << " n_hash=" << n_hash
+                  << " table_topk=" << topk
+                  << " hash_table_gib=" << hash_table_gib
+                  << "\n";
     }
 
     WeightView final_norm = gws.require("norm.weight");
@@ -6068,38 +6686,278 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     auto head_local = slice_q8_0_rows(head.data, local_vocab_start, local_vocab, dim);
     uint8_t* d_head = upload_u8(head_local.data(), head_local.size());
 
-    // ===== routed expert staging buffers (reused per layer per step) =====
-    auto first_w1 = gws.get_expert("layers.0.ffn.experts.routed.w1",
-                                    "layers.0.ffn.experts.routed.w1", 0);
-    auto first_w2 = gws.get_expert("layers.0.ffn.experts.routed.w2",
-                                    "layers.0.ffn.experts.routed.w2", 0);
-    auto first_w3 = gws.get_expert("layers.0.ffn.experts.routed.w3",
-                                    "layers.0.ffn.experts.routed.w3", 0);
-    if (!first_w1.found || !first_w2.found || !first_w3.found)
-        throw std::runtime_error("get_expert(0) failed");
-    const uint64_t per_w1_bytes = first_w1.nbytes;
-    const uint64_t per_w2_bytes = first_w2.nbytes;
-    const uint64_t per_w3_bytes = first_w3.nbytes;
+    // ===== routed expert staging / resident buffers =====
+    // Dynamic IQ1_M GGUF changes W2 dtype/byte-size after early layers, so size
+    // the reusable staging arena by the maximum per-layer expert byte count and
+    // dispatch kernels from each layer's exact dtype recipe.
+    std::vector<uint64_t> layer_w1_bytes(n_layers, 0);
+    std::vector<uint64_t> layer_w2_bytes(n_layers, 0);
+    std::vector<uint64_t> layer_w3_bytes(n_layers, 0);
+    std::vector<DType> layer_w1_dtype(n_layers, DType::Unknown);
+    std::vector<DType> layer_w2_dtype(n_layers, DType::Unknown);
+    std::vector<DType> layer_w3_dtype(n_layers, DType::Unknown);
+    uint64_t max_per_w1_bytes = 0;
+    uint64_t max_per_w2_bytes = 0;
+    uint64_t max_per_w3_bytes = 0;
+    for (int L = 0; L < n_layers; ++L) {
+        const std::string lp = "layers." + std::to_string(L);
+        const std::string w1_name = lp + ".ffn.experts.routed.w1";
+        const std::string w2_name = lp + ".ffn.experts.routed.w2";
+        const std::string w3_name = lp + ".ffn.experts.routed.w3";
+        auto f1 = gws.get_expert(w1_name, w1_name, 0);
+        auto f2 = gws.get_expert(w2_name, w2_name, 0);
+        auto f3 = gws.get_expert(w3_name, w3_name, 0);
+        if (!f1.found || !f2.found || !f3.found)
+            throw std::runtime_error("get_expert(0) failed while sizing routed buffers");
+        const bool q2_recipe = f1.dtype == DType::IQ2_XXS && f3.dtype == DType::IQ2_XXS && f2.dtype == DType::Q2_K;
+        const bool iq1_all_recipe = f1.dtype == DType::IQ1_M && f3.dtype == DType::IQ1_M && f2.dtype == DType::IQ1_M;
+        const bool iq1_w13_q2_w2_recipe = f1.dtype == DType::IQ1_M && f3.dtype == DType::IQ1_M && f2.dtype == DType::Q2_K;
+        if (!q2_recipe && !iq1_all_recipe && !iq1_w13_q2_w2_recipe) {
+            throw std::runtime_error("unsupported routed dtype recipe at layer " + std::to_string(L) +
+                                     ": w1=" + dtype_name(f1.dtype) + " w2=" + dtype_name(f2.dtype) +
+                                     " w3=" + dtype_name(f3.dtype));
+        }
+        layer_w1_bytes[L] = f1.nbytes;
+        layer_w2_bytes[L] = f2.nbytes;
+        layer_w3_bytes[L] = f3.nbytes;
+        layer_w1_dtype[L] = f1.dtype;
+        layer_w2_dtype[L] = f2.dtype;
+        layer_w3_dtype[L] = f3.dtype;
+        max_per_w1_bytes = std::max(max_per_w1_bytes, f1.nbytes);
+        max_per_w2_bytes = std::max(max_per_w2_bytes, f2.nbytes);
+        max_per_w3_bytes = std::max(max_per_w3_bytes, f3.nbytes);
+    }
     uint8_t* d_routed_w1 = nullptr;
     uint8_t* d_routed_w2 = nullptr;
     uint8_t* d_routed_w3 = nullptr;
-    check_cuda(cudaMalloc(&d_routed_w1, per_w1_bytes * topk), "alloc routed_w1");
-    check_cuda(cudaMalloc(&d_routed_w2, per_w2_bytes * topk), "alloc routed_w2");
-    check_cuda(cudaMalloc(&d_routed_w3, per_w3_bytes * topk), "alloc routed_w3");
+    check_cuda(cudaMalloc(&d_routed_w1, max_per_w1_bytes * topk), "alloc routed_w1");
+    check_cuda(cudaMalloc(&d_routed_w2, max_per_w2_bytes * topk), "alloc routed_w2");
+    check_cuda(cudaMalloc(&d_routed_w3, max_per_w3_bytes * topk), "alloc routed_w3");
+
+    // Optional resident local routed experts. The legacy path stages active top-k
+    // experts every token/layer from the GGUF mmap; with TP=4 that H2D staging
+    // dominates decode latency. Resident mode uploads this rank's local expert
+    // slice once and maps route_slots to local expert ordinals, while still
+    // consuming the original raw quantized blocks.
+    const bool has_iq1_routed = std::any_of(
+        layer_w1_dtype.begin(), layer_w1_dtype.end(),
+        [](DType t) { return t == DType::IQ1_M; });
+    const int resident_layers_env = env_int_or_default("DSV4_GGUF_RESIDENT_ROUTED_LAYERS", -1);
+    const bool resident_routed_requested = tp_world > 1 && (
+        env_int_or_default("DSV4_GGUF_RESIDENT_ROUTED_EXPERTS", has_iq1_routed ? 1 : 0) != 0 ||
+        resident_layers_env > 0);
+    const int resident_routed_layers = resident_routed_requested
+        ? std::max(0, std::min(n_layers, resident_layers_env >= 0 ? resident_layers_env : n_layers))
+        : 0;
+    std::vector<uint8_t> is_resident_routed_layer(static_cast<size_t>(n_layers), 0);
+    for (int L = 0; L < resident_routed_layers; ++L) is_resident_routed_layer[L] = 1;
+    const bool any_resident_routed = resident_routed_layers > 0;
+    const bool all_resident_routed = resident_routed_layers == n_layers;
+    const bool device_route_slots = any_resident_routed &&
+        env_int_or_default("DSV4_GGUF_DEVICE_ROUTE_SLOTS", 1) != 0;
+    GgufPinnedStagingRing gguf_pinned_stage;
+    const bool gguf_pinned_stage_enabled = env_int_or_default("DSV4_GGUF_PINNED_STAGE", 0) != 0;
+    if (gguf_pinned_stage_enabled && !all_resident_routed) {
+        const size_t max_stage_copy_bytes = std::max<size_t>(
+            static_cast<size_t>(std::max(max_per_w1_bytes, std::max(max_per_w2_bytes, max_per_w3_bytes))),
+            static_cast<size_t>(topk) * sizeof(int64_t));
+        gguf_pinned_stage.init(max_stage_copy_bytes,
+                               env_int_or_default("DSV4_GGUF_PINNED_STAGE_SLOTS", 32),
+                               env_int_or_default("DSV4_GGUF_PINNED_STAGE_CAP_MIB", 256),
+                               tp_rank);
+    }
+    std::vector<uint8_t*> d_resident_w1(n_layers, nullptr);
+    std::vector<uint8_t*> d_resident_w2(n_layers, nullptr);
+    std::vector<uint8_t*> d_resident_w3(n_layers, nullptr);
+    uint64_t resident_bytes = 0;
+    if (any_resident_routed) {
+        for (int L = 0; L < n_layers; ++L) {
+            if (!is_resident_routed_layer[L]) continue;
+            const std::string lp = "layers." + std::to_string(L);
+            const std::string w1_name = lp + ".ffn.experts.routed.w1";
+            const std::string w2_name = lp + ".ffn.experts.routed.w2";
+            const std::string w3_name = lp + ".ffn.experts.routed.w3";
+            const size_t w1_layer_bytes = static_cast<size_t>(layer_w1_bytes[L]) * experts_per_rank;
+            const size_t w2_layer_bytes = static_cast<size_t>(layer_w2_bytes[L]) * experts_per_rank;
+            const size_t w3_layer_bytes = static_cast<size_t>(layer_w3_bytes[L]) * experts_per_rank;
+            check_cuda(cudaMalloc(&d_resident_w1[L], w1_layer_bytes), "alloc resident routed_w1");
+            check_cuda(cudaMalloc(&d_resident_w2[L], w2_layer_bytes), "alloc resident routed_w2");
+            check_cuda(cudaMalloc(&d_resident_w3[L], w3_layer_bytes), "alloc resident routed_w3");
+            resident_bytes += static_cast<uint64_t>(w1_layer_bytes + w2_layer_bytes + w3_layer_bytes);
+            for (int local_e = 0; local_e < experts_per_rank; ++local_e) {
+                const int eid = expert_start + local_e;
+                auto wv1 = gws.get_expert(w1_name, w1_name, eid);
+                auto wv2 = gws.get_expert(w2_name, w2_name, eid);
+                auto wv3 = gws.get_expert(w3_name, w3_name, eid);
+                if (!wv1.found || !wv2.found || !wv3.found)
+                    throw std::runtime_error("get_expert failed during resident routed load");
+                if (wv1.dtype != layer_w1_dtype[L] || wv2.dtype != layer_w2_dtype[L] || wv3.dtype != layer_w3_dtype[L])
+                    throw std::runtime_error("routed expert dtype changed during resident load");
+                check_cuda(cudaMemcpy(d_resident_w1[L] + layer_w1_bytes[L] * local_e,
+                                      wv1.data, layer_w1_bytes[L], cudaMemcpyHostToDevice),
+                           "copy resident routed_w1");
+                check_cuda(cudaMemcpy(d_resident_w2[L] + layer_w2_bytes[L] * local_e,
+                                      wv2.data, layer_w2_bytes[L], cudaMemcpyHostToDevice),
+                           "copy resident routed_w2");
+                check_cuda(cudaMemcpy(d_resident_w3[L] + layer_w3_bytes[L] * local_e,
+                                      wv3.data, layer_w3_bytes[L], cudaMemcpyHostToDevice),
+                           "copy resident routed_w3");
+            }
+        }
+        size_t free_bytes = 0, total_bytes = 0;
+        check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo resident routed");
+        std::cout << "gguf_resident_routed_experts=1 tp_rank=" << tp_rank
+                  << " layers=" << resident_routed_layers << "/" << n_layers
+                  << " local_experts=" << experts_per_rank
+                  << " resident_gib=" << (static_cast<double>(resident_bytes) / (1024.0 * 1024.0 * 1024.0))
+                  << " free_gib=" << (static_cast<double>(free_bytes) / (1024.0 * 1024.0 * 1024.0))
+                  << " total_gib=" << (static_cast<double>(total_bytes) / (1024.0 * 1024.0 * 1024.0))
+                  << "\n";
+    }
+    if (gguf_mem_profile) gguf_log_mem("after_resident_experts", tp_rank);
+    gguf_check_min_free("after_resident_experts", tp_rank, gguf_min_free_mib);
 
     // ===== per-layer KV cache sized for full sequence =====
-    const int total_positions = static_cast<int>(seed_tokens.size()) + max_new_tokens;
-    const int cache_capacity = std::max(1, total_positions);
+    // To generate K tokens from an N-token seed, positions 0..N-1 are the
+    // prefill/TTFT pass and positions N..N+K-2 are continuation decode passes.
+    const int decode_only_context = env_int_or_default("DSV4_GGUF_DECODE_ONLY_CONTEXT", 0);
+    if (decode_only_context < 0) throw std::runtime_error("DSV4_GGUF_DECODE_ONLY_CONTEXT must be >= 0");
+    const int generate_total_positions = static_cast<int>(seed_tokens.size()) + std::max(0, max_new_tokens - 1);
+    const int total_positions = std::max(generate_total_positions, decode_only_context > 0 ? decode_only_context : 0);
+    int max_sparse_compressed_cap = 0;
+    if (gguf_sparse_compressor) {
+        for (int L = 0; L < n_layers; ++L) {
+            if (!d_compressor_w[L].present || d_compressor_w[L].ratio <= 0) continue;
+            max_sparse_compressed_cap = std::max(
+                max_sparse_compressed_cap,
+                (std::max(1, total_positions) + d_compressor_w[L].ratio - 1) / d_compressor_w[L].ratio);
+        }
+    }
+    std::vector<int> layer_cache_capacity(n_layers, std::max(1, total_positions));
+    int max_layer_cache_capacity = std::max(1, total_positions);
+    if (gguf_sparse_compressor) {
+        max_layer_cache_capacity = 1;
+        for (int L = 0; L < n_layers; ++L) {
+            if (d_compressor_w[L].present && d_compressor_w[L].ratio > 0) {
+                const int compressed_cap =
+                    (std::max(1, total_positions) + d_compressor_w[L].ratio - 1) /
+                    d_compressor_w[L].ratio;
+                layer_cache_capacity[L] = std::max(1, gguf_sparse_window + std::max(1, compressed_cap));
+            } else {
+                // Layers without compressor still run dense cached attention and
+                // need direct position-addressable KV storage.
+                layer_cache_capacity[L] = std::max(1, total_positions);
+            }
+            max_layer_cache_capacity = std::max(max_layer_cache_capacity, layer_cache_capacity[L]);
+        }
+    }
+    const int cache_capacity = max_layer_cache_capacity;
     std::vector<float*> d_kv_cache(n_layers, nullptr);
     for (int L = 0; L < n_layers; ++L) {
         check_cuda(cudaMalloc(&d_kv_cache[L],
-                              static_cast<size_t>(cache_capacity) *
+                              static_cast<size_t>(layer_cache_capacity[L]) *
                                   static_cast<size_t>(kv_dim) * sizeof(float)),
                    "alloc d_kv_cache");
         check_cuda(cudaMemset(d_kv_cache[L], 0,
-                              static_cast<size_t>(cache_capacity) *
+                              static_cast<size_t>(layer_cache_capacity[L]) *
                                   static_cast<size_t>(kv_dim) * sizeof(float)),
                    "memset d_kv_cache");
+    }
+    if (gguf_sparse_compressor) {
+        for (int L = 0; L < n_layers; ++L) {
+            const auto& c = d_compressor_w[L];
+            if (!c.present) continue;
+            auto init_score = [](float* ptr, size_t n, const char* label) {
+                std::vector<float> neg_inf(n, -INFINITY);
+                check_cuda(cudaMemcpy(ptr, neg_inf.data(), n * sizeof(float), cudaMemcpyHostToDevice), label);
+            };
+            check_cuda(cudaMalloc(&d_sparse_state[L].compressor_kv,
+                                  static_cast<size_t>(c.slots) * c.state_cols * sizeof(float)),
+                       "alloc GGUF sparse compressor kv state");
+            check_cuda(cudaMalloc(&d_sparse_state[L].compressor_score,
+                                  static_cast<size_t>(c.slots) * c.state_cols * sizeof(float)),
+                       "alloc GGUF sparse compressor score state");
+            check_cuda(cudaMemset(d_sparse_state[L].compressor_kv, 0,
+                                  static_cast<size_t>(c.slots) * c.state_cols * sizeof(float)),
+                       "zero GGUF sparse compressor kv state");
+            init_score(d_sparse_state[L].compressor_score,
+                       static_cast<size_t>(c.slots) * c.state_cols,
+                       "init GGUF sparse compressor score state");
+            if (d_indexer_w[L].present && d_indexer_w[L].comp.present) {
+                const auto& ic = d_indexer_w[L].comp;
+                check_cuda(cudaMalloc(&d_sparse_state[L].indexer_comp_kv,
+                                      static_cast<size_t>(ic.slots) * ic.state_cols * sizeof(float)),
+                           "alloc GGUF sparse indexer compressor kv state");
+                check_cuda(cudaMalloc(&d_sparse_state[L].indexer_comp_score,
+                                      static_cast<size_t>(ic.slots) * ic.state_cols * sizeof(float)),
+                           "alloc GGUF sparse indexer compressor score state");
+                check_cuda(cudaMemset(d_sparse_state[L].indexer_comp_kv, 0,
+                                      static_cast<size_t>(ic.slots) * ic.state_cols * sizeof(float)),
+                           "zero GGUF sparse indexer compressor kv state");
+                init_score(d_sparse_state[L].indexer_comp_score,
+                           static_cast<size_t>(ic.slots) * ic.state_cols,
+                           "init GGUF sparse indexer compressor score state");
+                const int indexer_cache_cap = std::max(1, max_sparse_compressed_cap);
+                check_cuda(cudaMalloc(&d_sparse_state[L].indexer_kv_cache,
+                                      static_cast<size_t>(indexer_cache_cap) *
+                                          static_cast<size_t>(d_indexer_w[L].head_dim) * sizeof(float)),
+                           "alloc GGUF sparse indexer kv cache");
+                check_cuda(cudaMemset(d_sparse_state[L].indexer_kv_cache, 0,
+                                      static_cast<size_t>(indexer_cache_cap) *
+                                          static_cast<size_t>(d_indexer_w[L].head_dim) * sizeof(float)),
+                           "zero GGUF sparse indexer kv cache");
+            }
+        }
+    }
+    uint64_t kv_cache_elems = 0;
+    for (int cap : layer_cache_capacity) {
+        kv_cache_elems += static_cast<uint64_t>(cap) * static_cast<uint64_t>(kv_dim);
+    }
+    const double kv_cache_gib = static_cast<double>(kv_cache_elems) *
+        static_cast<double>(sizeof(float)) / (1024.0 * 1024.0 * 1024.0);
+    if (gguf_mem_profile) {
+        int sparse_layers = 0;
+        for (int L = 0; L < n_layers; ++L) if (d_compressor_w[L].present) ++sparse_layers;
+        std::cout << "gguf_kv_cache tp_rank=" << tp_rank
+                  << " max_capacity=" << cache_capacity
+                  << " sparse_layers=" << sparse_layers
+                  << " n_layers=" << n_layers
+                  << " kv_dim=" << kv_dim
+                  << " kv_cache_gib=" << kv_cache_gib
+                  << "\n";
+        gguf_log_mem("after_kv_cache", tp_rank);
+    }
+    gguf_check_min_free("after_kv_cache", tp_rank, gguf_min_free_mib);
+
+    // Cached attention scratch. The legacy cached attention kernel stores
+    // per-token softmax logits in dynamic shared memory, which cannot scale to
+    // 32K context. The workspace variant keeps the same dense attention math but
+    // uses one global [heads, cache_capacity] scratch buffer reused by all layers.
+    float* d_attn_weight_scratch = nullptr;
+    if (gguf_indexed_attn != 1) {
+        check_cuda(cudaMalloc(&d_attn_weight_scratch,
+                              static_cast<size_t>(heads) * static_cast<size_t>(cache_capacity) * sizeof(float)),
+                   "alloc d_attn_weight_scratch");
+    }
+    int* d_kv_indices = nullptr;
+    if (gguf_indexed_attn != 0 || gguf_sparse_compressor) {
+        const int max_kv_index_count = gguf_sparse_compressor
+            ? std::min(cache_capacity, gguf_sparse_window + std::max(1, max_sparse_compressed_cap))
+            : std::min(cache_capacity, gguf_indexed_attn_window);
+        check_cuda(cudaMalloc(&d_kv_indices, static_cast<size_t>(max_kv_index_count) * sizeof(int)),
+                   "alloc d_kv_indices");
+    }
+    if (gguf_mem_profile && tp_rank == 0) {
+        std::cout << "gguf_indexed_attn mode=" << gguf_indexed_attn
+                  << " window=" << gguf_indexed_attn_window
+                  << " auto_threshold=" << gguf_indexed_attn_auto_threshold
+                  << " sparse_compressor=" << (gguf_sparse_compressor ? 1 : 0)
+                  << " sparse_indexer=" << (gguf_sparse_indexer ? 1 : 0)
+                  << " sparse_window=" << gguf_sparse_window
+                  << " sparse_attn_threshold=" << gguf_sparse_attn_threshold
+                  << " decode_only_context=" << decode_only_context
+                  << " cache_capacity=" << cache_capacity
+                  << "\n";
     }
 
     // ===== activation + scratch buffers (one set, reused per step + per layer) =====
@@ -6133,12 +6991,23 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     float* d_route_up = nullptr;
     int8_t* d_route_hidden_q = nullptr;
     float* d_route_hidden_scale = nullptr;
+    float* d_route_hidden = nullptr;
     float* d_gate_scores_scratch = nullptr;
     float* d_gate_scored_scratch = nullptr;
     int64_t* d_gate_indices = nullptr;
     int64_t* d_tid2eid_i64 = nullptr;
     uint16_t* d_embed_row_f16 = nullptr;
+    uint16_t* d_compressor_input_bf16 = nullptr;
+    float* d_compressor_input_rounded = nullptr;
+    float* d_compressor_kv = nullptr;
+    float* d_compressor_score = nullptr;
+    float* d_indexer_comp_kv = nullptr;
+    float* d_indexer_comp_score = nullptr;
+    float* d_index_q = nullptr;
+    float* d_index_scores = nullptr;
     float* d_logits = nullptr;
+    int* d_argmax_token = nullptr;
+    float* d_argmax_logit = nullptr;
     check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
     check_cuda(cudaMalloc(&d_x_pre_attn, dim * sizeof(float)), "alloc d_x_pre_attn");
     check_cuda(cudaMalloc(&d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
@@ -6171,6 +7040,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     check_cuda(cudaMalloc(&d_route_hidden_scale,
                           static_cast<size_t>(topk) * hidden_groups * sizeof(float)),
                "alloc d_route_hidden_scale");
+    check_cuda(cudaMalloc(&d_route_hidden, static_cast<size_t>(topk) * moe_inter * sizeof(float)),
+               "alloc d_route_hidden");
     check_cuda(cudaMalloc(&d_gate_scores_scratch, gate_scratch_n * sizeof(float)),
                "alloc d_gate_scores_scratch");
     check_cuda(cudaMalloc(&d_gate_scored_scratch, n_experts * sizeof(float)),
@@ -6178,7 +7049,41 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     check_cuda(cudaMalloc(&d_gate_indices, topk * sizeof(int64_t)), "alloc d_gate_indices");
     check_cuda(cudaMalloc(&d_tid2eid_i64, topk * sizeof(int64_t)), "alloc d_tid2eid_i64");
     check_cuda(cudaMalloc(&d_embed_row_f16, dim * sizeof(uint16_t)), "alloc d_embed_row_f16");
+    if (gguf_sparse_compressor) {
+        int max_comp_cols = 1;
+        int max_index_q_dim = 1;
+        int max_index_heads = 1;
+        for (int L = 0; L < n_layers; ++L) {
+            if (d_compressor_w[L].present) max_comp_cols = std::max(max_comp_cols, d_compressor_w[L].cols);
+            if (d_indexer_w[L].present) {
+                max_comp_cols = std::max(max_comp_cols, d_indexer_w[L].comp.cols);
+                max_index_q_dim = std::max(max_index_q_dim, d_indexer_w[L].heads * d_indexer_w[L].head_dim);
+                max_index_heads = std::max(max_index_heads, d_indexer_w[L].heads);
+            }
+        }
+        check_cuda(cudaMalloc(&d_compressor_input_bf16, dim * sizeof(uint16_t)),
+                   "alloc GGUF sparse compressor input bf16");
+        check_cuda(cudaMalloc(&d_compressor_input_rounded, dim * sizeof(float)),
+                   "alloc GGUF sparse compressor input rounded");
+        check_cuda(cudaMalloc(&d_compressor_kv, static_cast<size_t>(max_comp_cols) * sizeof(float)),
+                   "alloc GGUF sparse compressor kv scratch");
+        check_cuda(cudaMalloc(&d_compressor_score, static_cast<size_t>(max_comp_cols) * sizeof(float)),
+                   "alloc GGUF sparse compressor score scratch");
+        check_cuda(cudaMalloc(&d_indexer_comp_kv, static_cast<size_t>(max_comp_cols) * sizeof(float)),
+                   "alloc GGUF sparse indexer compressor kv scratch");
+        check_cuda(cudaMalloc(&d_indexer_comp_score, static_cast<size_t>(max_comp_cols) * sizeof(float)),
+                   "alloc GGUF sparse indexer compressor score scratch");
+        check_cuda(cudaMalloc(&d_index_q, static_cast<size_t>(max_index_q_dim) * sizeof(float)),
+                   "alloc GGUF sparse index q scratch");
+        check_cuda(cudaMalloc(&d_index_scores,
+                              static_cast<size_t>(max_index_heads + std::max(1, max_sparse_compressed_cap)) * sizeof(float)),
+                   "alloc GGUF sparse index score scratch");
+    }
     check_cuda(cudaMalloc(&d_logits, local_vocab * sizeof(float)), "alloc d_logits");
+    check_cuda(cudaMalloc(&d_argmax_token, sizeof(int)), "alloc d_argmax_token");
+    check_cuda(cudaMalloc(&d_argmax_logit, sizeof(float)), "alloc d_argmax_logit");
+    if (gguf_mem_profile) gguf_log_mem("after_scratch", tp_rank);
+    gguf_check_min_free("after_scratch", tp_rank, gguf_min_free_mib);
 
     // Dedicated copy stream for staging (H2D for routed Q2 experts). Currently
     // neutral in wall-time (staging is on the critical path between gate D2H
@@ -6189,11 +7094,16 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         env_int_or_default("DSV4_GGUF_MOE_COPY_STREAM", 1) != 0;
     cudaStream_t gguf_moe_copy_stream = nullptr;
     cudaEvent_t gguf_moe_stage_event = nullptr;
+    cudaEvent_t gguf_moe_consume_event = nullptr;
     if (moe_copy_stream_enabled) {
         check_cuda(cudaStreamCreateWithFlags(&gguf_moe_copy_stream, cudaStreamNonBlocking),
                    "create gguf moe copy stream");
         check_cuda(cudaEventCreateWithFlags(&gguf_moe_stage_event, cudaEventDisableTiming),
                    "create gguf moe stage event");
+        check_cuda(cudaEventCreateWithFlags(&gguf_moe_consume_event, cudaEventDisableTiming),
+                   "create gguf moe consume event");
+        check_cuda(cudaEventRecord(gguf_moe_consume_event, nullptr),
+                   "record initial gguf moe consume event");
     }
 
 #ifdef DSV4_HAVE_NCCL
@@ -6233,17 +7143,40 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     ls.d_route_slots = d_route_slots; ls.d_route_weights = d_route_weights;
     ls.d_route_gate = d_route_gate; ls.d_route_up = d_route_up;
     ls.d_route_hidden_q = d_route_hidden_q; ls.d_route_hidden_scale = d_route_hidden_scale;
+    ls.d_route_hidden = d_route_hidden;
     ls.d_gate_scores_scratch = d_gate_scores_scratch;
     ls.d_gate_scored_scratch = d_gate_scored_scratch;
     ls.d_gate_indices = d_gate_indices;
     ls.cache_capacity = cache_capacity;
+    ls.d_compressor_input_bf16 = d_compressor_input_bf16;
+    ls.d_compressor_input_rounded = d_compressor_input_rounded;
+    ls.d_compressor_kv = d_compressor_kv;
+    ls.d_compressor_score = d_compressor_score;
+    ls.d_indexer_comp_kv = d_indexer_comp_kv;
+    ls.d_indexer_comp_score = d_indexer_comp_score;
+    ls.d_index_q = d_index_q;
+    ls.d_index_scores = d_index_scores;
 
     auto t_load_end = std::chrono::steady_clock::now();
+    const bool gguf_load_only = env_int_or_default("DSV4_GGUF_LOAD_ONLY", 0) != 0;
 
     // ===== per-step forward (embed + 43 layers + final norm + head + argmax) =====
     const bool profile_gguf = env_int_or_default("DSV4_GGUF_PROFILE", 0) != 0;
+    const bool gguf_host_logits = env_int_or_default("DSV4_GGUF_HOST_LOGITS", 0) != 0;
+    const bool decode_only_attention_only =
+        decode_only_context > 0 && env_int_or_default("DSV4_GGUF_DECODE_ONLY_ATTENTION_ONLY", 0) != 0;
+    if (gguf_mem_profile && tp_rank == 0 && decode_only_context > 0) {
+        std::cout << "gguf_decode_only context=" << decode_only_context
+                  << " attention_only=" << (decode_only_attention_only ? 1 : 0)
+                  << " warmup=" << env_int_or_default("DSV4_GGUF_DECODE_ONLY_WARMUP", all_resident_routed ? 0 : 1)
+                  << "\n";
+    }
     double prof_attn_ms = 0.0, prof_stage_ms = 0.0, prof_moe_ms = 0.0;
     double prof_embed_ms = 0.0, prof_head_ms = 0.0;
+    long long prof_indexed_attn_steps = 0;
+    long long prof_indexed_attn_indices = 0;
+    long long prof_sparse_attn_layer_steps = 0;
+    long long prof_sparse_attn_indices = 0;
     int prof_steps = 0;
     auto sync_now = [&]() {
         if (profile_gguf) check_cuda(cudaDeviceSynchronize(), "profile sync");
@@ -6263,6 +7196,22 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             throw std::runtime_error("f16 embed failed");
         auto t_embed_end = sync_now();
         if (profile_gguf) prof_embed_ms += elapsed_ms(t_embed_start, t_embed_end);
+        int gguf_kv_index_count = 0;
+        const bool use_indexed_attn_for_step =
+            (gguf_indexed_attn == 1) ||
+            (gguf_indexed_attn == 2 && (position + 1) > gguf_indexed_attn_auto_threshold);
+        if (d_kv_indices != nullptr && use_indexed_attn_for_step) {
+            gguf_kv_index_count = std::min(position + 1, gguf_indexed_attn_window);
+            const int window_start = std::max(0, position - gguf_kv_index_count + 1);
+            if (!build_decode_kv_indices_cuda(d_kv_indices, window_start, gguf_kv_index_count,
+                                              cache_capacity, /*compressed_count=*/0,
+                                              /*compressed_offset=*/cache_capacity))
+                throw std::runtime_error("build GGUF decode kv indices failed");
+            if (profile_gguf) {
+                ++prof_indexed_attn_steps;
+                prof_indexed_attn_indices += gguf_kv_index_count;
+            }
+        }
         for (int L = 0; L < n_layers; ++L) {
             auto t_layer_start = sync_now();
             const bool is_hash = (L < n_hash);
@@ -6275,8 +7224,43 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             lw.d_shared_w1 = d_shared_w1[L]; lw.d_shared_w2 = d_shared_w2[L]; lw.d_shared_w3 = d_shared_w3[L];
             lw.d_gate_w_bf16 = d_gate_w[L];
             lw.is_hash = is_hash;
-            lw.d_routed_w1 = d_routed_w1; lw.d_routed_w2 = d_routed_w2; lw.d_routed_w3 = d_routed_w3;
+            const bool layer_resident_routed = is_resident_routed_layer[L] != 0;
+            if (layer_resident_routed) {
+                lw.d_routed_w1 = d_resident_w1[L];
+                lw.d_routed_w2 = d_resident_w2[L];
+                lw.d_routed_w3 = d_resident_w3[L];
+                lw.routed_n_experts = experts_per_rank;
+            } else {
+                lw.d_routed_w1 = d_routed_w1;
+                lw.d_routed_w2 = d_routed_w2;
+                lw.d_routed_w3 = d_routed_w3;
+                lw.routed_n_experts = topk;
+            }
+            lw.routed_w1_dtype = layer_w1_dtype[L];
+            lw.routed_w2_dtype = layer_w2_dtype[L];
+            lw.routed_w3_dtype = layer_w3_dtype[L];
+            const bool layer_sparse_enabled = gguf_sparse_compressor && d_compressor_w[L].present;
+            lw.compressor = layer_sparse_enabled ? &d_compressor_w[L] : nullptr;
+            lw.indexer = (layer_sparse_enabled && d_indexer_w[L].present) ? &d_indexer_w[L] : nullptr;
+            lw.sparse_state = (layer_sparse_enabled && d_sparse_state[L].compressor_kv != nullptr) ? &d_sparse_state[L] : nullptr;
+            lw.compress_ratio = layer_sparse_enabled ? d_compressor_w[L].ratio : 0;
+            lw.sparse_window_size = layer_sparse_enabled ? gguf_sparse_window : 0;
+            lw.sparse_attn_threshold = layer_sparse_enabled ? gguf_sparse_attn_threshold : 0;
+            lw.index_topk = static_cast<int>(ctx.config.index_topk == 0 ? 0 : ctx.config.index_topk);
+            ld.rope_theta = static_cast<float>(ctx.config.rope_theta);
+            if (gguf_sparse_compressor) {
+                ls.d_kv_indices = d_kv_indices;
+                ls.kv_index_count = 0;
+            } else if (d_kv_indices != nullptr && use_indexed_attn_for_step) {
+                ls.d_kv_indices = d_kv_indices;
+                ls.kv_index_count = gguf_kv_index_count;
+            } else {
+                ls.d_kv_indices = nullptr;
+                ls.kv_index_count = 0;
+            }
+            ls.d_attn_weight_scratch = d_attn_weight_scratch;
             ls.d_kv_cache = d_kv_cache[L];
+            ls.cache_capacity = layer_cache_capacity[L];
             const std::string lp = "layers." + std::to_string(L);
             const std::string w1_name = lp + ".ffn.experts.routed.w1";
             const std::string w2_name = lp + ".ffn.experts.routed.w2";
@@ -6286,15 +7270,33 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 const int32_t* row = h_tid2eid_table[L] + static_cast<size_t>(token) * topk;
                 int64_t h_slice[8];
                 for (int k = 0; k < topk; ++k) h_slice[k] = row[k];
-                check_cuda(cudaMemcpy(d_tid2eid_i64, h_slice, topk * sizeof(int64_t),
-                                      cudaMemcpyHostToDevice), "copy tid2eid slice");
-                lw.d_tid2eid_i64 = d_tid2eid_i64;
+                if (d_tid2eid_table[L] != nullptr) {
+                    lw.d_tid2eid_i64 = d_tid2eid_table[L];
+                    lw.hash_token = token;
+                    lw.hash_table_topk = topk;
+                } else {
+                    check_cuda(cudaMemcpy(d_tid2eid_i64, h_slice, topk * sizeof(int64_t),
+                                          cudaMemcpyHostToDevice), "copy tid2eid slice");
+                    lw.d_tid2eid_i64 = d_tid2eid_i64;
+                    lw.hash_token = 0;
+                    lw.hash_table_topk = topk;
+                }
                 lw.d_gate_bias_f32 = nullptr;
                 // Hash-layer expert ids come straight from the deterministic
-                // tid2eid table -- no dependency on the gate matvec. Pre-stage
-                // the routed experts on copy_stream NOW so the H2D overlaps
-                // with attention compute on the default stream below.
-                if (moe_copy_stream_enabled) {
+                // tid2eid table -- no dependency on the gate matvec. In resident
+                // mode only tiny route metadata is needed; legacy mode pre-stages
+                // the routed experts on copy_stream so H2D overlaps with attention.
+                if (layer_resident_routed) {
+                    for (int k = 0; k < topk; ++k) {
+                        const int eid = static_cast<int>(h_slice[k]);
+                        if (eid < 0 || eid >= n_experts)
+                            throw std::runtime_error("hash table produced out-of-range expert id");
+                        const bool is_local = (eid >= expert_start && eid < expert_end);
+                        h_route_slots[k] = is_local ? static_cast<int64_t>(eid - expert_start) : -1;
+                    }
+                } else if (!decode_only_attention_only && moe_copy_stream_enabled) {
+                    check_cuda(cudaStreamWaitEvent(gguf_moe_copy_stream, gguf_moe_consume_event, 0),
+                               "copy stream wait prior GGUF MoE consume event");
                     for (int k = 0; k < topk; ++k) {
                         const int eid = static_cast<int>(h_slice[k]);
                         if (eid < 0 || eid >= n_experts)
@@ -6307,17 +7309,23 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                         auto wv3 = gws.get_expert(w3_name, w3_name, eid);
                         if (!wv1.found || !wv2.found || !wv3.found)
                             throw std::runtime_error("get_expert failed during hash prestaging");
-                        check_cuda(cudaMemcpyAsync(d_routed_w1 + per_w1_bytes * k, wv1.data, per_w1_bytes,
-                                              cudaMemcpyHostToDevice, gguf_moe_copy_stream), "prestage routed_w1");
-                        check_cuda(cudaMemcpyAsync(d_routed_w2 + per_w2_bytes * k, wv2.data, per_w2_bytes,
-                                              cudaMemcpyHostToDevice, gguf_moe_copy_stream), "prestage routed_w2");
-                        check_cuda(cudaMemcpyAsync(d_routed_w3 + per_w3_bytes * k, wv3.data, per_w3_bytes,
-                                              cudaMemcpyHostToDevice, gguf_moe_copy_stream), "prestage routed_w3");
+                        if (wv1.dtype != layer_w1_dtype[L] || wv2.dtype != layer_w2_dtype[L] || wv3.dtype != layer_w3_dtype[L])
+                            throw std::runtime_error("routed expert dtype changed within hash layer");
+                        gguf_pinned_stage.copy_async(d_routed_w1 + layer_w1_bytes[L] * k,
+                                                     wv1.data, layer_w1_bytes[L],
+                                                     gguf_moe_copy_stream, "prestage routed_w1");
+                        gguf_pinned_stage.copy_async(d_routed_w2 + layer_w2_bytes[L] * k,
+                                                     wv2.data, layer_w2_bytes[L],
+                                                     gguf_moe_copy_stream, "prestage routed_w2");
+                        gguf_pinned_stage.copy_async(d_routed_w3 + layer_w3_bytes[L] * k,
+                                                     wv3.data, layer_w3_bytes[L],
+                                                     gguf_moe_copy_stream, "prestage routed_w3");
                     }
-                    check_cuda(cudaMemcpyAsync(d_route_slots, h_route_slots.data(),
-                                               topk * sizeof(int64_t),
-                                               cudaMemcpyHostToDevice, gguf_moe_copy_stream),
-                               "prestage d_route_slots");
+                    gguf_pinned_stage.copy_async(reinterpret_cast<uint8_t*>(d_route_slots),
+                                                 reinterpret_cast<const uint8_t*>(h_route_slots.data()),
+                                                 static_cast<size_t>(topk) * sizeof(int64_t),
+                                                 gguf_moe_copy_stream,
+                                                 "prestage d_route_slots");
                     check_cuda(cudaEventRecord(gguf_moe_stage_event, gguf_moe_copy_stream),
                                "record gguf moe stage event (hash prestage)");
                     hash_prestaged = true;
@@ -6327,64 +7335,117 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 lw.d_gate_bias_f32 = d_gate_bias[L];
             }
             gguf_layer_forward_attn_to_gate(lw, ls, ld, position, reduce_ctx_ptr);
-            auto t_attn_end = std::chrono::steady_clock::now();
-            if (profile_gguf) prof_attn_ms += elapsed_ms(t_layer_start, t_attn_end);
-            if (!hash_prestaged) {
-                check_cuda(cudaMemcpy(h_gate_indices.data(), d_gate_indices, topk * sizeof(int64_t),
-                                      cudaMemcpyDeviceToHost), "copy gate indices");
-                for (int k = 0; k < topk; ++k) {
-                    const int eid = static_cast<int>(h_gate_indices[k]);
-                    if (eid < 0 || eid >= n_experts)
-                        throw std::runtime_error("gate produced out-of-range expert id");
-                    const bool is_local = (eid >= expert_start && eid < expert_end);
-                    h_route_slots[k] = is_local ? static_cast<int64_t>(k) : -1;
-                    if (!is_local) continue;
-                    auto wv1 = gws.get_expert(w1_name, w1_name, eid);
-                    auto wv2 = gws.get_expert(w2_name, w2_name, eid);
-                    auto wv3 = gws.get_expert(w3_name, w3_name, eid);
-                    if (!wv1.found || !wv2.found || !wv3.found)
-                        throw std::runtime_error("get_expert failed during decode staging");
-                    check_cuda(cudaMemcpyAsync(d_routed_w1 + per_w1_bytes * k, wv1.data, per_w1_bytes,
-                                          cudaMemcpyHostToDevice, gguf_moe_copy_stream), "stage routed_w1");
-                    check_cuda(cudaMemcpyAsync(d_routed_w2 + per_w2_bytes * k, wv2.data, per_w2_bytes,
-                                          cudaMemcpyHostToDevice, gguf_moe_copy_stream), "stage routed_w2");
-                    check_cuda(cudaMemcpyAsync(d_routed_w3 + per_w3_bytes * k, wv3.data, per_w3_bytes,
-                                          cudaMemcpyHostToDevice, gguf_moe_copy_stream), "stage routed_w3");
-                }
-                check_cuda(cudaMemcpyAsync(d_route_slots, h_route_slots.data(),
-                                           topk * sizeof(int64_t),
-                                           cudaMemcpyHostToDevice, gguf_moe_copy_stream),
-                           "copy d_route_slots");
-                if (moe_copy_stream_enabled) {
-                    check_cuda(cudaEventRecord(gguf_moe_stage_event, gguf_moe_copy_stream),
-                               "record gguf moe stage event");
-                }
+            if (profile_gguf && ls.sparse_attn_used) {
+                ++prof_sparse_attn_layer_steps;
+                prof_sparse_attn_indices += ls.sparse_kv_index_count;
             }
-            if (moe_copy_stream_enabled) {
-                check_cuda(cudaStreamWaitEvent(nullptr, gguf_moe_stage_event, 0),
-                           "default stream wait stage event");
+            auto t_attn_end = sync_now();
+            if (profile_gguf) prof_attn_ms += elapsed_ms(t_layer_start, t_attn_end);
+            if (!decode_only_attention_only) {
+                if (!hash_prestaged) {
+                    if (layer_resident_routed && device_route_slots) {
+                        if (!gguf_route_slots_from_indices_cuda(d_gate_indices, d_route_slots,
+                                                                topk, expert_start, experts_per_rank))
+                            throw std::runtime_error("gguf_route_slots_from_indices_cuda failed");
+                    } else {
+                        check_cuda(cudaMemcpy(h_gate_indices.data(), d_gate_indices, topk * sizeof(int64_t),
+                                              cudaMemcpyDeviceToHost), "copy gate indices");
+                        for (int k = 0; k < topk; ++k) {
+                            const int eid = static_cast<int>(h_gate_indices[k]);
+                            if (eid < 0 || eid >= n_experts)
+                                throw std::runtime_error("gate produced out-of-range expert id");
+                            const bool is_local = (eid >= expert_start && eid < expert_end);
+                            h_route_slots[k] = is_local
+                                ? static_cast<int64_t>(layer_resident_routed ? (eid - expert_start) : k)
+                                : -1;
+                            if (layer_resident_routed || !is_local) continue;
+                            if (moe_copy_stream_enabled) {
+                                check_cuda(cudaStreamWaitEvent(gguf_moe_copy_stream, gguf_moe_consume_event, 0),
+                                           "copy stream wait prior GGUF MoE consume event");
+                            }
+                            auto wv1 = gws.get_expert(w1_name, w1_name, eid);
+                            auto wv2 = gws.get_expert(w2_name, w2_name, eid);
+                            auto wv3 = gws.get_expert(w3_name, w3_name, eid);
+                            if (!wv1.found || !wv2.found || !wv3.found)
+                                throw std::runtime_error("get_expert failed during decode staging");
+                            if (wv1.dtype != layer_w1_dtype[L] || wv2.dtype != layer_w2_dtype[L] || wv3.dtype != layer_w3_dtype[L])
+                                throw std::runtime_error("routed expert dtype changed within layer");
+                            gguf_pinned_stage.copy_async(d_routed_w1 + layer_w1_bytes[L] * k,
+                                                         wv1.data, layer_w1_bytes[L],
+                                                         gguf_moe_copy_stream, "stage routed_w1");
+                            gguf_pinned_stage.copy_async(d_routed_w2 + layer_w2_bytes[L] * k,
+                                                         wv2.data, layer_w2_bytes[L],
+                                                         gguf_moe_copy_stream, "stage routed_w2");
+                            gguf_pinned_stage.copy_async(d_routed_w3 + layer_w3_bytes[L] * k,
+                                                         wv3.data, layer_w3_bytes[L],
+                                                         gguf_moe_copy_stream, "stage routed_w3");
+                        }
+                        if (layer_resident_routed) {
+                            check_cuda(cudaMemcpy(d_route_slots, h_route_slots.data(),
+                                                  topk * sizeof(int64_t),
+                                                  cudaMemcpyHostToDevice),
+                                       "copy resident d_route_slots");
+                        } else {
+                            if (moe_copy_stream_enabled) {
+                                check_cuda(cudaStreamWaitEvent(gguf_moe_copy_stream, gguf_moe_consume_event, 0),
+                                           "copy stream wait prior GGUF route-slot consume event");
+                            }
+                            gguf_pinned_stage.copy_async(reinterpret_cast<uint8_t*>(d_route_slots),
+                                                         reinterpret_cast<const uint8_t*>(h_route_slots.data()),
+                                                         static_cast<size_t>(topk) * sizeof(int64_t),
+                                                         gguf_moe_copy_stream,
+                                                         "copy d_route_slots");
+                            if (moe_copy_stream_enabled) {
+                                check_cuda(cudaEventRecord(gguf_moe_stage_event, gguf_moe_copy_stream),
+                                           "record gguf moe stage event");
+                            }
+                        }
+                    }
+                }
+                if (moe_copy_stream_enabled && !layer_resident_routed) {
+                    check_cuda(cudaStreamWaitEvent(nullptr, gguf_moe_stage_event, 0),
+                               "default stream wait stage event");
+                }
             }
             auto t_stage_end = sync_now();
             if (profile_gguf) prof_stage_ms += elapsed_ms(t_attn_end, t_stage_end);
-            gguf_layer_forward_moe(lw, ls, ld, reduce_ctx_ptr);
+            if (!decode_only_attention_only) {
+                gguf_layer_forward_moe(lw, ls, ld, reduce_ctx_ptr);
+                if (moe_copy_stream_enabled) {
+                    check_cuda(cudaEventRecord(gguf_moe_consume_event, nullptr),
+                               "record GGUF MoE consume event");
+                }
+            }
             auto t_moe_end = sync_now();
-            if (profile_gguf) prof_moe_ms += elapsed_ms(t_stage_end, t_moe_end);
+            if (profile_gguf && !decode_only_attention_only) prof_moe_ms += elapsed_ms(t_stage_end, t_moe_end);
         }
         auto t_head_start = sync_now();
         if (!rmsnorm_bf16_gamma_cuda(d_x, d_final_norm_gamma, d_x_normed, dim, 1e-6f))
             throw std::runtime_error("final norm failed");
         if (!q8_0_matvec_cuda(d_x_normed, d_head, d_logits, local_vocab, dim))
             throw std::runtime_error("head matvec failed");
-        check_cuda(cudaDeviceSynchronize(), "sync after head");
-        check_cuda(cudaMemcpy(h_logits.data(), d_logits, local_vocab * sizeof(float),
-                              cudaMemcpyDeviceToHost), "copy logits");
-        int local_t = 0;
-        float local_l = -INFINITY;
-        for (int i = 0; i < local_vocab; ++i) {
-            if (h_logits[i] > local_l) { local_l = h_logits[i]; local_t = i; }
+        int top_t = local_vocab_start;
+        float top_l = -INFINITY;
+        if (gguf_host_logits) {
+            check_cuda(cudaDeviceSynchronize(), "sync after head");
+            check_cuda(cudaMemcpy(h_logits.data(), d_logits, local_vocab * sizeof(float),
+                                  cudaMemcpyDeviceToHost), "copy logits");
+            int local_t = 0;
+            float local_l = -INFINITY;
+            for (int i = 0; i < local_vocab; ++i) {
+                if (h_logits[i] > local_l) { local_l = h_logits[i]; local_t = i; }
+            }
+            top_t = local_t + local_vocab_start;
+            top_l = local_l;
+        } else {
+            if (!argmax_fp32_cuda(d_logits, d_argmax_token, d_argmax_logit,
+                                  local_vocab, local_vocab_start))
+                throw std::runtime_error("argmax_fp32_cuda failed");
+            check_cuda(cudaMemcpy(&top_t, d_argmax_token, sizeof(int),
+                                  cudaMemcpyDeviceToHost), "copy argmax token");
+            check_cuda(cudaMemcpy(&top_l, d_argmax_logit, sizeof(float),
+                                  cudaMemcpyDeviceToHost), "copy argmax logit");
         }
-        int top_t = local_t + local_vocab_start;
-        float top_l = local_l;
 #ifdef DSV4_HAVE_NCCL
         if (tp_world > 1 && !options.nccl_id_path.empty()) {
             TpTopResult global = nccl_global_top1(tp_world, tp_rank, tp_device,
@@ -6407,29 +7468,79 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     r.n_layers = n_layers;
     r.dim = dim;
     r.vocab = vocab;
-    r.prompt_tokens = static_cast<int>(seed_tokens.size());
-    r.decode_tokens = max_new_tokens;
+    r.prompt_tokens = gguf_load_only && decode_only_context > 0
+        ? decode_only_context
+        : static_cast<int>(seed_tokens.size());
+    // Continuation decode passes after TTFT. The first generated token is the
+    // argmax from the final prefill position; remaining generated tokens each
+    // require one decode step.
+    r.decode_tokens = std::max(0, max_new_tokens - 1);
     r.top_logits.reserve(total_positions);
     r.generated_tokens.reserve(max_new_tokens);
 
-    auto t_forward_start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point t_forward_start = std::chrono::steady_clock::now();
+    auto t_prefill_start = t_forward_start;
+    auto t_prefill_end = t_forward_start;
+    auto t_decode_start = t_forward_start;
+    auto t_decode_end = t_forward_start;
     int last_argmax = 0;
-    for (int pos = 0; pos < total_positions; ++pos) {
-        const int feed_token = (pos < r.prompt_tokens) ? seed_tokens[pos] : last_argmax;
-        auto [argmax, logit] = run_step(feed_token, pos);
-        r.top_logits.push_back(logit);
-        // argmax produced at position p predicts the token for position p+1.
-        // Record argmax once we reach the last seed (its prediction is the first
-        // generated token) and every step thereafter.
-        if (pos >= r.prompt_tokens - 1 &&
-            static_cast<int>(r.generated_tokens.size()) < max_new_tokens) {
-            r.generated_tokens.push_back(argmax);
+    if (!gguf_load_only && decode_only_context > 0) {
+        if (max_new_tokens <= 0) throw std::runtime_error("DSV4_GGUF_DECODE_ONLY_CONTEXT requires max_new_tokens > 0");
+        // Decode-only profiler: allocate caches as if context tokens already exist,
+        // then run a single real forward step at position context-1. KV contents are
+        // zero/dummy, so this is for timing/scaling only, not logits parity.
+        //
+        // The first step touches the cold GGUF mmap for non-resident Q2 expert
+        // staging (random page faults across an ~86 GiB file). To measure steady
+        // state, run a configurable number of warmup steps (excluded from the
+        // profile counters and timing) before the measured step.
+        const int warmup = env_int_or_default("DSV4_GGUF_DECODE_ONLY_WARMUP", all_resident_routed ? 0 : 1);
+        const int feed_token = seed_tokens.empty() ? 1234 : seed_tokens[0];
+        for (int w = 0; w < warmup; ++w) {
+            (void)run_step(feed_token, decode_only_context - 1);
         }
+        // Reset profile accumulators so only the measured step is reported.
+        prof_embed_ms = prof_attn_ms = prof_stage_ms = prof_moe_ms = prof_head_ms = 0.0;
+        prof_indexed_attn_steps = prof_indexed_attn_indices = 0;
+        prof_sparse_attn_layer_steps = prof_sparse_attn_indices = 0;
+        prof_steps = 0;
+        r.prompt_tokens = decode_only_context;
+        r.decode_tokens = 1;
+        t_forward_start = std::chrono::steady_clock::now();
+        t_prefill_start = t_forward_start;
+        t_prefill_end = t_forward_start;
+        t_decode_start = t_forward_start;
+        auto [argmax, logit] = run_step(feed_token, decode_only_context - 1);
+        r.top_logits.push_back(logit);
+        r.generated_tokens.push_back(argmax);
         last_argmax = argmax;
+    } else {
+        const int forward_positions = (!gguf_load_only && max_new_tokens > 0) ? total_positions : 0;
+        for (int pos = 0; pos < forward_positions; ++pos) {
+            if (pos == r.prompt_tokens) t_decode_start = std::chrono::steady_clock::now();
+            const int feed_token = (pos < r.prompt_tokens) ? seed_tokens[pos] : last_argmax;
+            auto [argmax, logit] = run_step(feed_token, pos);
+            r.top_logits.push_back(logit);
+            // argmax produced at position p predicts the token for position p+1.
+            // Record argmax once we reach the last seed (its prediction is the first
+            // generated token) and every step thereafter.
+            if (pos >= r.prompt_tokens - 1 &&
+                static_cast<int>(r.generated_tokens.size()) < max_new_tokens) {
+                r.generated_tokens.push_back(argmax);
+            }
+            last_argmax = argmax;
+            if (pos == r.prompt_tokens - 1) {
+                t_prefill_end = std::chrono::steady_clock::now();
+                t_decode_start = t_prefill_end;
+            }
+        }
     }
     auto t_forward_end = std::chrono::steady_clock::now();
+    t_decode_end = t_forward_end;
     r.load_seconds = std::chrono::duration<double>(t_load_end - t_load_start).count();
     r.forward_seconds = std::chrono::duration<double>(t_forward_end - t_forward_start).count();
+    r.prefill_seconds = std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
+    r.decode_seconds = std::chrono::duration<double>(t_decode_end - t_decode_start).count();
 
     if (profile_gguf && prof_steps > 0 && tp_rank == 0) {
         const double inv = 1.0 / static_cast<double>(prof_steps);
@@ -6437,10 +7548,18 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         const double per_layer_stage = prof_stage_ms * inv / static_cast<double>(n_layers);
         const double per_layer_moe = prof_moe_ms * inv / static_cast<double>(n_layers);
         const double per_step_total = (prof_embed_ms + prof_attn_ms + prof_stage_ms + prof_moe_ms + prof_head_ms) * inv;
-        std::printf("[gguf_profile steps=%d n_layers=%d] per_step: embed=%.2f attn+gate=%.2f stage=%.2f moe=%.2f head=%.2f total=%.2f ms; per_layer: attn+gate=%.3f stage=%.3f moe=%.3f ms\n",
+        const double avg_index_count = prof_indexed_attn_steps > 0
+            ? static_cast<double>(prof_indexed_attn_indices) / static_cast<double>(prof_indexed_attn_steps)
+            : 0.0;
+        const double avg_sparse_index_count = prof_sparse_attn_layer_steps > 0
+            ? static_cast<double>(prof_sparse_attn_indices) / static_cast<double>(prof_sparse_attn_layer_steps)
+            : 0.0;
+        std::printf("[gguf_profile steps=%d n_layers=%d] per_step: embed=%.2f attn+gate=%.2f stage=%.2f moe=%.2f head=%.2f total=%.2f ms; per_layer: attn+gate=%.3f stage=%.3f moe=%.3f ms; indexed_attn_steps=%lld avg_index_count=%.1f sparse_attn_layer_steps=%lld avg_sparse_index_count=%.1f\n",
                     prof_steps, n_layers,
                     prof_embed_ms * inv, prof_attn_ms * inv, prof_stage_ms * inv, prof_moe_ms * inv, prof_head_ms * inv,
-                    per_step_total, per_layer_attn, per_layer_stage, per_layer_moe);
+                    per_step_total, per_layer_attn, per_layer_stage, per_layer_moe,
+                    prof_indexed_attn_steps, avg_index_count,
+                    prof_sparse_attn_layer_steps, avg_sparse_index_count);
     }
 
     // ===== cleanup =====
@@ -6453,8 +7572,31 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     free_vec_u8(d_wo_a); free_vec_u8(d_wo_b);
     free_vec_u8(d_shared_w1); free_vec_u8(d_shared_w2); free_vec_u8(d_shared_w3);
     free_vec_u16(d_gate_w); free_vec_f32(d_gate_bias);
+    for (auto& c : d_compressor_w) {
+        cudaFree(const_cast<uint16_t*>(c.wkv));
+        cudaFree(const_cast<uint16_t*>(c.wgate));
+        cudaFree(const_cast<float*>(c.ape));
+        cudaFree(const_cast<uint16_t*>(c.norm));
+    }
+    for (auto& idx : d_indexer_w) {
+        cudaFree(const_cast<uint16_t*>(idx.wq_b));
+        cudaFree(const_cast<uint16_t*>(idx.weights_proj));
+        cudaFree(const_cast<uint16_t*>(idx.comp.wkv));
+        cudaFree(const_cast<uint16_t*>(idx.comp.wgate));
+        cudaFree(const_cast<float*>(idx.comp.ape));
+        cudaFree(const_cast<uint16_t*>(idx.comp.norm));
+    }
+    for (auto& st : d_sparse_state) {
+        cudaFree(st.compressor_kv);
+        cudaFree(st.compressor_score);
+        cudaFree(st.indexer_kv_cache);
+        cudaFree(st.indexer_comp_kv);
+        cudaFree(st.indexer_comp_score);
+    }
+    for (auto* p : d_tid2eid_table) cudaFree(p);
     cudaFree(d_final_norm_gamma); cudaFree(d_head);
     cudaFree(d_routed_w1); cudaFree(d_routed_w2); cudaFree(d_routed_w3);
+    cudaFree(d_attn_weight_scratch); cudaFree(d_kv_indices);
     free_vec_f32(d_kv_cache);
     cudaFree(d_x); cudaFree(d_x_pre_attn); cudaFree(d_x_normed);
     cudaFree(d_q_a); cudaFree(d_q_normed); cudaFree(d_q);
@@ -6466,11 +7608,19 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     cudaFree(d_x_q); cudaFree(d_x_scale);
     cudaFree(d_route_slots); cudaFree(d_route_weights);
     cudaFree(d_route_gate); cudaFree(d_route_up);
-    cudaFree(d_route_hidden_q); cudaFree(d_route_hidden_scale);
+    cudaFree(d_route_hidden_q); cudaFree(d_route_hidden_scale); cudaFree(d_route_hidden);
     cudaFree(d_gate_scores_scratch); cudaFree(d_gate_scored_scratch); cudaFree(d_gate_indices);
-    cudaFree(d_tid2eid_i64); cudaFree(d_embed_row_f16); cudaFree(d_logits);
+    cudaFree(d_tid2eid_i64); cudaFree(d_embed_row_f16);
+    cudaFree(d_compressor_input_bf16); cudaFree(d_compressor_input_rounded);
+    cudaFree(d_compressor_kv); cudaFree(d_compressor_score);
+    cudaFree(d_indexer_comp_kv); cudaFree(d_indexer_comp_score);
+    cudaFree(d_index_q); cudaFree(d_index_scores);
+    cudaFree(d_logits);
+    cudaFree(d_argmax_token); cudaFree(d_argmax_logit);
+    free_vec_u8(d_resident_w1); free_vec_u8(d_resident_w2); free_vec_u8(d_resident_w3);
     if (moe_copy_stream_enabled) {
         cudaEventDestroy(gguf_moe_stage_event);
+        cudaEventDestroy(gguf_moe_consume_event);
         cudaStreamDestroy(gguf_moe_copy_stream);
     }
     if (gguf_registered) cudaHostUnregister(gguf_base);

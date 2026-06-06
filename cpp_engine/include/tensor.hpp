@@ -14,6 +14,7 @@ enum class DType {
     Q8_0,
     Q2_K,
     IQ2_XXS,
+    IQ1_M,
     Unknown,
 };
 

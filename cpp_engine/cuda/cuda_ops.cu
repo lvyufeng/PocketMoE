@@ -8,6 +8,60 @@
 namespace dsv4 {
 namespace {
 
+__global__ void gguf_route_slots_from_indices_kernel(
+    const int64_t* __restrict__ indices,
+    int64_t* __restrict__ route_slots,
+    int topk,
+    int expert_start,
+    int experts_per_rank) {
+    const int k = threadIdx.x;
+    if (k >= topk) return;
+    const int64_t eid = indices[k];
+    const int64_t local = eid - static_cast<int64_t>(expert_start);
+    route_slots[k] = (local >= 0 && local < experts_per_rank) ? local : -1;
+}
+
+__global__ void argmax_fp32_kernel(
+    const float* __restrict__ logits,
+    int* __restrict__ out_token,
+    float* __restrict__ out_logit,
+    int count,
+    int token_offset) {
+    const int tid = threadIdx.x;
+    const int threads = blockDim.x;
+    extern __shared__ char smem_raw[];
+    float* s_val = reinterpret_cast<float*>(smem_raw);
+    int* s_idx = reinterpret_cast<int*>(s_val + threads);
+
+    float best = -INFINITY;
+    int best_idx = 0;
+    for (int i = tid; i < count; i += threads) {
+        const float v = logits[i];
+        if (v > best || (v == best && i < best_idx)) {
+            best = v;
+            best_idx = i;
+        }
+    }
+    s_val[tid] = best;
+    s_idx[tid] = best_idx;
+    __syncthreads();
+    for (int stride = threads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            const float ov = s_val[tid + stride];
+            const int oi = s_idx[tid + stride];
+            if (ov > s_val[tid] || (ov == s_val[tid] && oi < s_idx[tid])) {
+                s_val[tid] = ov;
+                s_idx[tid] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        *out_token = token_offset + s_idx[0];
+        *out_logit = s_val[0];
+    }
+}
+
 __device__ __forceinline__ float sigmoidf_fast(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
@@ -788,10 +842,70 @@ __global__ void cached_single_token_attention_kernel(
     }
 }
 
+__global__ void cached_single_token_attention_workspace_kernel(
+    const float* q,
+    const float* kv_cache,
+    const float* attn_sink,
+    float* weight_scratch,
+    float* y,
+    int head_dim,
+    int cache_len,
+    float scale) {
+    const int head = blockIdx.x;
+    const int tid = threadIdx.x;
+    extern __shared__ float smem[];
+    float* q_shared = smem;
+    float* partial = q_shared + head_dim;
+    float* weights = weight_scratch + static_cast<size_t>(head) * cache_len;
+    const float* q_head = q + static_cast<size_t>(head) * head_dim;
+    for (int i = tid; i < head_dim; i += blockDim.x) q_shared[i] = q_head[i];
+    __syncthreads();
+    const float sink_logit = attn_sink == nullptr ? -INFINITY : attn_sink[head];
+    float local_max = sink_logit;
+    for (int t = tid; t < cache_len; t += blockDim.x) {
+        const float* kv = kv_cache + static_cast<size_t>(t) * head_dim;
+        float dot = 0.0f;
+        for (int i = 0; i < head_dim; ++i) dot += q_shared[i] * kv[i];
+        const float logit = dot * scale;
+        weights[t] = logit;
+        local_max = fmaxf(local_max, logit);
+    }
+    partial[tid] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] = fmaxf(partial[tid], partial[tid + stride]);
+        __syncthreads();
+    }
+    const float max_logit = partial[0];
+    float local_denom = 0.0f;
+    for (int t = tid; t < cache_len; t += blockDim.x) {
+        const float w = expf(weights[t] - max_logit);
+        weights[t] = w;
+        local_denom += w;
+    }
+    partial[tid] = local_denom;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float denom = partial[0] + (attn_sink == nullptr ? 0.0f : expf(sink_logit - max_logit));
+    const float inv_denom = 1.0f / denom;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float out = 0.0f;
+        for (int t = 0; t < cache_len; ++t) {
+            const float* kv = kv_cache + static_cast<size_t>(t) * head_dim;
+            out += weights[t] * kv[i];
+        }
+        y[static_cast<size_t>(head) * head_dim + i] = out * inv_denom;
+    }
+}
+
 __device__ float bf16_to_float_device(uint16_t bits) {
     uint32_t value = static_cast<uint32_t>(bits) << 16;
     return __uint_as_float(value);
 }
+
 
 __device__ float round_pow2_device(float x) {
     return exp2f(roundf(log2f(x)));
@@ -1249,6 +1363,36 @@ bool hc_post_float_rows_cuda(
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool gguf_route_slots_from_indices_cuda(
+    const int64_t* d_indices,
+    int64_t* d_route_slots,
+    int topk,
+    int expert_start,
+    int experts_per_rank,
+    void* stream) {
+    if (d_indices == nullptr || d_route_slots == nullptr || topk <= 0 || experts_per_rank <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    gguf_route_slots_from_indices_kernel<<<1, 32, 0, cuda_stream>>>(
+        d_indices, d_route_slots, topk, expert_start, experts_per_rank);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool argmax_fp32_cuda(
+    const float* d_logits,
+    int* d_token,
+    float* d_logit,
+    int count,
+    int token_offset,
+    void* stream) {
+    if (d_logits == nullptr || d_token == nullptr || d_logit == nullptr || count <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    constexpr int threads = 256;
+    const size_t shared_bytes = threads * (sizeof(float) + sizeof(int));
+    argmax_fp32_kernel<<<1, threads, shared_bytes, cuda_stream>>>(
+        d_logits, d_token, d_logit, count, token_offset);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool silu_mul_cuda(const float* d_gate, const float* d_up, float* d_y, int cols, void* stream) {
     if (d_gate == nullptr || d_up == nullptr || d_y == nullptr || cols <= 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
@@ -1393,6 +1537,26 @@ bool cached_single_token_attention_cuda(
     const int threads = 256;
     const size_t shared_bytes = (static_cast<size_t>(head_dim) + cache_len + threads) * sizeof(float);
     cached_single_token_attention_kernel<<<heads, threads, shared_bytes, cuda_stream>>>(d_q, d_kv_cache, d_attn_sink, d_y, head_dim, cache_len, scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool cached_single_token_attention_workspace_cuda(
+    const float* d_q,
+    const float* d_kv_cache,
+    const float* d_attn_sink,
+    float* d_weight_scratch,
+    float* d_y,
+    int heads,
+    int head_dim,
+    int cache_len,
+    float scale,
+    void* stream) {
+    if (d_q == nullptr || d_kv_cache == nullptr || d_weight_scratch == nullptr || d_y == nullptr || heads <= 0 || head_dim <= 0 || cache_len <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    const int threads = 256;
+    const size_t shared_bytes = (static_cast<size_t>(head_dim) + threads) * sizeof(float);
+    cached_single_token_attention_workspace_kernel<<<heads, threads, shared_bytes, cuda_stream>>>(
+        d_q, d_kv_cache, d_attn_sink, d_weight_scratch, d_y, head_dim, cache_len, scale);
     return cudaGetLastError() == cudaSuccess;
 }
 

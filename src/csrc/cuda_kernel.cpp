@@ -304,6 +304,16 @@ torch::Tensor gguf_moe_single_token_iq2_q2k_forward_cuda(
     const torch::Tensor& signed_grid,
     double swiglu_limit);
 
+torch::Tensor gguf_moe_single_token_iq1m_forward_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& route_slots,
+    const torch::Tensor& route_weights,
+    const torch::Tensor& w1_blocks,
+    const torch::Tensor& w3_blocks,
+    const torch::Tensor& w2_blocks,
+    const torch::Tensor& iq1_grid,
+    double swiglu_limit);
+
 void fused_o_inverse_rope_inplace_cuda(
     torch::Tensor& o,
     const torch::Tensor& freqs_real,
@@ -355,6 +365,27 @@ bool int8_gemm_imma_enabled() {
         return true;
     }();
     return enabled;
+}
+
+int64_t gguf_quant_block_bytes_for_type(int64_t type_id) {
+    if (type_id == 0) return 66;   // iq2_xxs
+    if (type_id == 1) return 84;   // q2_k
+    if (type_id == 2) return 56;   // iq1_m
+    TORCH_CHECK(false, "type_id must be 0 (iq2_xxs), 1 (q2_k), or 2 (iq1_m)");
+}
+
+void check_gguf_quant_grid(const torch::Tensor& grid, int64_t type_id, const char* name) {
+    if (type_id == 0) {
+        TORCH_CHECK(grid.is_cuda(), name, " must be CUDA for iq2_xxs");
+        TORCH_CHECK(grid.scalar_type() == torch::kInt8, name, " must be int8");
+        TORCH_CHECK(grid.is_contiguous(), name, " must be contiguous");
+        TORCH_CHECK(grid.numel() == 256 * 128 * 8, name, " must contain 256*128*8 entries for iq2_xxs");
+    } else if (type_id == 2) {
+        TORCH_CHECK(grid.is_cuda(), name, " must be CUDA for iq1_m");
+        TORCH_CHECK(grid.scalar_type() == torch::kInt8, name, " must be int8");
+        TORCH_CHECK(grid.is_contiguous(), name, " must be contiguous");
+        TORCH_CHECK(grid.numel() == 2048 * 8, name, " must contain 2048*8 entries for iq1_m");
+    }
 }
 
 }  // namespace
@@ -492,11 +523,11 @@ torch::Tensor gguf_quant_gemm_forward(
     const torch::Tensor& signed_grid) {
     TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "x must have shape [M, K] or [B, S, K]");
     TORCH_CHECK(blocks.dim() == 3, "blocks must have shape [N, K_blocks, block_bytes]");
-    TORCH_CHECK(type_id == 0 || type_id == 1, "type_id must be 0 (iq2_xxs) or 1 (q2_k)");
+    TORCH_CHECK(type_id == 0 || type_id == 1 || type_id == 2, "type_id must be 0 (iq2_xxs), 1 (q2_k), or 2 (iq1_m)");
     TORCH_CHECK(row_elems > 0, "row_elems must be positive");
     TORCH_CHECK(x.size(-1) == row_elems, "inner dimension mismatch");
     TORCH_CHECK(blocks.size(1) * 256 >= row_elems, "blocks do not cover row_elems");
-    TORCH_CHECK(blocks.size(2) == (type_id == 0 ? 66 : 84), "unexpected GGUF block size for type_id");
+    TORCH_CHECK(blocks.size(2) == gguf_quant_block_bytes_for_type(type_id), "unexpected GGUF block size for type_id");
     TORCH_CHECK(x.is_cuda() && blocks.is_cuda(), "x and blocks must be CUDA tensors");
     TORCH_CHECK(x.is_contiguous() && blocks.is_contiguous(), "x and blocks must be contiguous");
     check_tensor(blocks, "blocks", torch::kUInt8);
@@ -505,12 +536,7 @@ torch::Tensor gguf_quant_gemm_forward(
         x.scalar_type() == torch::kBFloat16 ||
         x.scalar_type() == torch::kFloat32,
         "x must be float16, bfloat16, or float32");
-    if (type_id == 0) {
-        TORCH_CHECK(signed_grid.is_cuda(), "signed_grid must be CUDA for iq2_xxs");
-        TORCH_CHECK(signed_grid.scalar_type() == torch::kInt8, "signed_grid must be int8");
-        TORCH_CHECK(signed_grid.is_contiguous(), "signed_grid must be contiguous");
-        TORCH_CHECK(signed_grid.numel() == 256 * 128 * 8, "signed_grid must contain 256*128*8 entries");
-    }
+    check_gguf_quant_grid(signed_grid, type_id, "signed_grid");
     return gguf_quant_gemm_forward_cuda(x, blocks, row_elems, type_id, signed_grid);
 }
 
@@ -522,11 +548,11 @@ torch::Tensor gguf_quant_gemm_prefill_forward(
     const torch::Tensor& signed_grid) {
     TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "x must have shape [M, K] or [B, S, K]");
     TORCH_CHECK(blocks.dim() == 3, "blocks must have shape [N, K_blocks, block_bytes]");
-    TORCH_CHECK(type_id == 0 || type_id == 1, "type_id must be 0 (iq2_xxs) or 1 (q2_k)");
+    TORCH_CHECK(type_id == 0 || type_id == 1 || type_id == 2, "type_id must be 0 (iq2_xxs), 1 (q2_k), or 2 (iq1_m)");
     TORCH_CHECK(row_elems > 0, "row_elems must be positive");
     TORCH_CHECK(x.size(-1) == row_elems, "inner dimension mismatch");
     TORCH_CHECK(blocks.size(1) * 256 >= row_elems, "blocks do not cover row_elems");
-    TORCH_CHECK(blocks.size(2) == (type_id == 0 ? 66 : 84), "unexpected GGUF block size for type_id");
+    TORCH_CHECK(blocks.size(2) == gguf_quant_block_bytes_for_type(type_id), "unexpected GGUF block size for type_id");
     TORCH_CHECK(x.is_cuda() && blocks.is_cuda(), "x and blocks must be CUDA tensors");
     TORCH_CHECK(x.is_contiguous() && blocks.is_contiguous(), "x and blocks must be contiguous");
     check_tensor(blocks, "blocks", torch::kUInt8);
@@ -535,12 +561,7 @@ torch::Tensor gguf_quant_gemm_prefill_forward(
         x.scalar_type() == torch::kBFloat16 ||
         x.scalar_type() == torch::kFloat32,
         "x must be float16, bfloat16, or float32");
-    if (type_id == 0) {
-        TORCH_CHECK(signed_grid.is_cuda(), "signed_grid must be CUDA for iq2_xxs");
-        TORCH_CHECK(signed_grid.scalar_type() == torch::kInt8, "signed_grid must be int8");
-        TORCH_CHECK(signed_grid.is_contiguous(), "signed_grid must be contiguous");
-        TORCH_CHECK(signed_grid.numel() == 256 * 128 * 8, "signed_grid must contain 256*128*8 entries");
-    }
+    check_gguf_quant_grid(signed_grid, type_id, "signed_grid");
     return gguf_quant_gemm_prefill_forward_cuda(x, blocks, row_elems, type_id, signed_grid);
 }
 torch::Tensor gguf_quant_gemm_pair_forward(
@@ -554,15 +575,16 @@ torch::Tensor gguf_quant_gemm_pair_forward(
     const torch::Tensor& signed_grid) {
     TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "x must have shape [M, K] or [B, S, K]");
     TORCH_CHECK(blocks0.dim() == 3 && blocks1.dim() == 3, "blocks must have shape [N, K_blocks, block_bytes]");
-    TORCH_CHECK(type_id0 == 0 || type_id0 == 1, "type_id0 must be 0 or 1");
-    TORCH_CHECK(type_id1 == 0 || type_id1 == 1, "type_id1 must be 0 or 1");
+    TORCH_CHECK(type_id0 == 0 || type_id0 == 1 || type_id0 == 2, "type_id0 must be 0, 1, or 2");
+    TORCH_CHECK(type_id1 == 0 || type_id1 == 1 || type_id1 == 2, "type_id1 must be 0, 1, or 2");
+    TORCH_CHECK(!(type_id0 == 0 && type_id1 == 2) && !(type_id0 == 2 && type_id1 == 0), "paired GEMM cannot mix iq2_xxs and iq1_m because they require different grids");
     TORCH_CHECK(row_elems0 > 0 && row_elems1 > 0, "row_elems must be positive");
     TORCH_CHECK(row_elems0 == row_elems1, "paired GGUF GEMM requires matching input dimensions");
     TORCH_CHECK(x.size(-1) == row_elems0, "inner dimension mismatch");
     TORCH_CHECK(blocks0.size(0) == blocks1.size(0), "paired blocks must have same output rows");
     TORCH_CHECK(blocks0.size(1) * 256 >= row_elems0 && blocks1.size(1) * 256 >= row_elems1, "blocks do not cover row_elems");
-    TORCH_CHECK(blocks0.size(2) == (type_id0 == 0 ? 66 : 84), "unexpected blocks0 GGUF block size");
-    TORCH_CHECK(blocks1.size(2) == (type_id1 == 0 ? 66 : 84), "unexpected blocks1 GGUF block size");
+    TORCH_CHECK(blocks0.size(2) == gguf_quant_block_bytes_for_type(type_id0), "unexpected blocks0 GGUF block size");
+    TORCH_CHECK(blocks1.size(2) == gguf_quant_block_bytes_for_type(type_id1), "unexpected blocks1 GGUF block size");
     TORCH_CHECK(x.is_cuda() && blocks0.is_cuda() && blocks1.is_cuda(), "x and blocks must be CUDA tensors");
     TORCH_CHECK(x.is_contiguous() && blocks0.is_contiguous() && blocks1.is_contiguous(), "x and blocks must be contiguous");
     check_tensor(blocks0, "blocks0", torch::kUInt8);
@@ -573,10 +595,9 @@ torch::Tensor gguf_quant_gemm_pair_forward(
         x.scalar_type() == torch::kFloat32,
         "x must be float16, bfloat16, or float32");
     if (type_id0 == 0 || type_id1 == 0) {
-        TORCH_CHECK(signed_grid.is_cuda(), "signed_grid must be CUDA for iq2_xxs");
-        TORCH_CHECK(signed_grid.scalar_type() == torch::kInt8, "signed_grid must be int8");
-        TORCH_CHECK(signed_grid.is_contiguous(), "signed_grid must be contiguous");
-        TORCH_CHECK(signed_grid.numel() == 256 * 128 * 8, "signed_grid must contain 256*128*8 entries");
+        check_gguf_quant_grid(signed_grid, 0, "signed_grid");
+    } else if (type_id0 == 2 || type_id1 == 2) {
+        check_gguf_quant_grid(signed_grid, 2, "signed_grid");
     }
     return gguf_quant_gemm_pair_forward_cuda(
         x,
@@ -614,12 +635,15 @@ torch::Tensor gguf_moe_prefill_grouped_forward(
     TORCH_CHECK(seg_starts.size(0) == w1_blocks.size(0) + 1, "seg_starts/expert count mismatch");
     TORCH_CHECK(w1_blocks.size(0) == w3_blocks.size(0) && w1_blocks.size(0) == w2_blocks.size(0), "expert count mismatch");
     TORCH_CHECK(w1_blocks.size(2) * 256 >= w1_row_elems && w3_blocks.size(2) * 256 >= w3_row_elems && w2_blocks.size(2) * 256 >= w2_row_elems, "blocks do not cover row_elems");
-    TORCH_CHECK(w1_type_id == 0 || w1_type_id == 1, "w1_type_id must be 0 or 1");
-    TORCH_CHECK(w3_type_id == 0 || w3_type_id == 1, "w3_type_id must be 0 or 1");
-    TORCH_CHECK(w2_type_id == 0 || w2_type_id == 1, "w2_type_id must be 0 or 1");
-    TORCH_CHECK(w1_blocks.size(3) == (w1_type_id == 0 ? 66 : 84), "unexpected w1 GGUF block size");
-    TORCH_CHECK(w3_blocks.size(3) == (w3_type_id == 0 ? 66 : 84), "unexpected w3 GGUF block size");
-    TORCH_CHECK(w2_blocks.size(3) == (w2_type_id == 0 ? 66 : 84), "unexpected w2 GGUF block size");
+    TORCH_CHECK(w1_type_id == 0 || w1_type_id == 1 || w1_type_id == 2, "w1_type_id must be 0, 1, or 2");
+    TORCH_CHECK(w3_type_id == 0 || w3_type_id == 1 || w3_type_id == 2, "w3_type_id must be 0, 1, or 2");
+    TORCH_CHECK(w2_type_id == 0 || w2_type_id == 1 || w2_type_id == 2, "w2_type_id must be 0, 1, or 2");
+    const bool uses_iq2_grid = (w1_type_id == 0 || w3_type_id == 0 || w2_type_id == 0);
+    const bool uses_iq1_grid = (w1_type_id == 2 || w3_type_id == 2 || w2_type_id == 2);
+    TORCH_CHECK(!(uses_iq2_grid && uses_iq1_grid), "grouped GGUF kernel cannot mix iq2_xxs and iq1_m because they require different grids");
+    TORCH_CHECK(w1_blocks.size(3) == gguf_quant_block_bytes_for_type(w1_type_id), "unexpected w1 GGUF block size");
+    TORCH_CHECK(w3_blocks.size(3) == gguf_quant_block_bytes_for_type(w3_type_id), "unexpected w3 GGUF block size");
+    TORCH_CHECK(w2_blocks.size(3) == gguf_quant_block_bytes_for_type(w2_type_id), "unexpected w2 GGUF block size");
     TORCH_CHECK(w1_row_elems == x.size(1) && w3_row_elems == x.size(1), "w1/w3 input dimension mismatch");
     TORCH_CHECK(w2_row_elems == w1_blocks.size(1) && w1_blocks.size(1) == w3_blocks.size(1), "w2 input dimension mismatch");
     TORCH_CHECK(w2_blocks.size(1) == x.size(1), "w2 output dimension mismatch");
@@ -638,11 +662,10 @@ torch::Tensor gguf_moe_prefill_grouped_forward(
     check_tensor(w1_blocks, "w1_blocks", torch::kUInt8);
     check_tensor(w3_blocks, "w3_blocks", torch::kUInt8);
     check_tensor(w2_blocks, "w2_blocks", torch::kUInt8);
-    if (w1_type_id == 0 || w3_type_id == 0 || w2_type_id == 0) {
-        TORCH_CHECK(signed_grid.is_cuda(), "signed_grid must be CUDA when iq2_xxs blocks are used");
-        TORCH_CHECK(signed_grid.scalar_type() == torch::kInt8, "signed_grid must be int8");
-        TORCH_CHECK(signed_grid.is_contiguous(), "signed_grid must be contiguous");
-        TORCH_CHECK(signed_grid.numel() == 256 * 128 * 8, "signed_grid must contain 256*128*8 entries");
+    if (uses_iq2_grid) {
+        check_gguf_quant_grid(signed_grid, 0, "signed_grid");
+    } else if (uses_iq1_grid) {
+        check_gguf_quant_grid(signed_grid, 2, "signed_grid");
     }
     return gguf_moe_prefill_grouped_forward_cuda(
         x,
@@ -710,6 +733,53 @@ torch::Tensor gguf_moe_single_token_iq2_q2k_forward(
         w3_blocks,
         w2_blocks,
         signed_grid,
+        swiglu_limit);
+}
+
+torch::Tensor gguf_moe_single_token_iq1m_forward(
+    const torch::Tensor& x,
+    const torch::Tensor& route_slots,
+    const torch::Tensor& route_weights,
+    const torch::Tensor& w1_blocks,
+    const torch::Tensor& w3_blocks,
+    const torch::Tensor& w2_blocks,
+    const torch::Tensor& iq1_grid,
+    double swiglu_limit) {
+    TORCH_CHECK(x.dim() == 2 && x.size(0) == 1, "x must have shape [1, D]");
+    TORCH_CHECK(route_slots.dim() == 1, "route_slots must have shape [K]");
+    TORCH_CHECK(route_weights.dim() == 1, "route_weights must have shape [K]");
+    TORCH_CHECK(route_slots.size(0) == route_weights.size(0), "route_slots/route_weights length mismatch");
+    TORCH_CHECK(w1_blocks.dim() == 4 && w3_blocks.dim() == 4 && w2_blocks.dim() == 4, "GGUF blocks must have shape [E, N, K_blocks, 56]");
+    TORCH_CHECK(w1_blocks.size(0) == w3_blocks.size(0) && w1_blocks.size(0) == w2_blocks.size(0), "expert count mismatch");
+    TORCH_CHECK(w1_blocks.size(1) == w3_blocks.size(1), "w1/w3 inter_dim mismatch");
+    TORCH_CHECK(w1_blocks.size(2) == w3_blocks.size(2), "w1/w3 block count mismatch");
+    TORCH_CHECK(w1_blocks.size(3) == 56 && w3_blocks.size(3) == 56 && w2_blocks.size(3) == 56, "w1/w3/w2 must be IQ1_M blocks");
+    TORCH_CHECK(w1_blocks.size(2) * 256 >= x.size(1), "w1/w3 blocks do not cover x dim");
+    TORCH_CHECK(w2_blocks.size(1) == x.size(1), "w2 output dimension mismatch");
+    TORCH_CHECK(w2_blocks.size(2) * 256 >= w1_blocks.size(1), "w2 blocks do not cover inter dim");
+    TORCH_CHECK(x.is_cuda() && route_slots.is_cuda() && route_weights.is_cuda(), "x/route tensors must be CUDA tensors");
+    TORCH_CHECK(w1_blocks.is_cuda() && w3_blocks.is_cuda() && w2_blocks.is_cuda(), "GGUF blocks must be CUDA tensors");
+    TORCH_CHECK(x.is_contiguous() && route_slots.is_contiguous() && route_weights.is_contiguous(), "x/route tensors must be contiguous");
+    TORCH_CHECK(w1_blocks.is_contiguous() && w3_blocks.is_contiguous() && w2_blocks.is_contiguous(), "GGUF blocks must be contiguous");
+    TORCH_CHECK(
+        x.scalar_type() == torch::kFloat16 ||
+        x.scalar_type() == torch::kBFloat16 ||
+        x.scalar_type() == torch::kFloat32,
+        "x must be float16, bfloat16, or float32");
+    TORCH_CHECK(route_slots.scalar_type() == torch::kInt64, "route_slots must be int64");
+    TORCH_CHECK(route_weights.scalar_type() == torch::kFloat32, "route_weights must be float32");
+    check_tensor(w1_blocks, "w1_blocks", torch::kUInt8);
+    check_tensor(w3_blocks, "w3_blocks", torch::kUInt8);
+    check_tensor(w2_blocks, "w2_blocks", torch::kUInt8);
+    check_gguf_quant_grid(iq1_grid, 2, "iq1_grid");
+    return gguf_moe_single_token_iq1m_forward_cuda(
+        x,
+        route_slots,
+        route_weights,
+        w1_blocks,
+        w3_blocks,
+        w2_blocks,
+        iq1_grid,
         swiglu_limit);
 }
 
@@ -1755,6 +1825,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gguf_quant_gemm_pair_forward", &gguf_quant_gemm_pair_forward, "paired raw GGUF iq2_xxs/q2_k GEMM forward (CUDA)");
     m.def("gguf_moe_prefill_grouped_forward", &gguf_moe_prefill_grouped_forward, "raw GGUF routed grouped MoE prefill forward (CUDA)");
     m.def("gguf_moe_single_token_iq2_q2k_forward", &gguf_moe_single_token_iq2_q2k_forward, "single-token GGUF IQ2_XXS/Q2_K routed MoE forward (CUDA)");
+    m.def("gguf_moe_single_token_iq1m_forward", &gguf_moe_single_token_iq1m_forward, "single-token GGUF IQ1_M routed MoE forward (CUDA)");
     m.def("int8_gemm_forward", &int8_gemm_forward, "generic int8 GEMM forward (CUDA)");
     m.def("int8_gemm_pair_forward", &int8_gemm_pair_forward, "paired int8 GEMM forward with shared activation quantization (CUDA)");
     m.def("wo_a_int8_forward", &wo_a_int8_forward, "wo_a grouped int8 forward (CUDA)");

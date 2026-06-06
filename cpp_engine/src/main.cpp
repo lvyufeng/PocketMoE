@@ -307,6 +307,7 @@ int main(int argc, char** argv) {
                             ? args.max_context
                             : static_cast<int>(prompt_ids.size()) + args.max_new_tokens;
                         dsv4::PersistentEngine engine(args.ckpt, opts, args.smoke_layers, max_context);
+                        engine.warmup_tp();
                         if (args.tp_rank > 0) {
                             engine.run_worker_loop();
                             return 0;

@@ -13,7 +13,10 @@ from src.runtime.transformer import Transformer
 
 
 _ROUTED_ORIGINAL_FORMAT_ROLES = {"routed_w1", "routed_w2", "routed_w3"}
-_ORIGINAL_QUANTIZED_TYPES = {"q8_0", "q2_k", "iq2_xxs"}
+# Quantized GGUF types we bind directly as raw routed-expert blocks.  iq1_m joins
+# the existing q2_k/iq2_xxs routed path; non-routed iq1_m is still rejected by
+# _unsupported_non_routed_quantized_mappings so it can never silently load.
+_ORIGINAL_QUANTIZED_TYPES = {"q8_0", "q2_k", "iq2_xxs", "iq1_m"}
 _IGNORED_RUNTIME_TARGET_PREFIXES = ("mtp.",)
 
 

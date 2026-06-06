@@ -47,30 +47,80 @@ __global__ void bf16_matvec_kernel(const float* x, const uint16_t* w, float* y, 
 __global__ void bf16_dual_matvec_kernel(const float* x, const uint16_t* w_a, const uint16_t* w_b, float* y_a, float* y_b, int rows, int cols) {
     const int row = blockIdx.x;
     if (row >= rows) return;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    const int num_warps = blockDim.x >> 5;
     float sum_a = 0.0f;
     float sum_b = 0.0f;
-    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+    for (int c = tid; c < cols; c += blockDim.x) {
         const float xv = x[c];
         const size_t idx = static_cast<size_t>(row) * cols + c;
         sum_a += bf16_to_float(w_a[idx]) * xv;
         sum_b += bf16_to_float(w_b[idx]) * xv;
     }
-    extern __shared__ float scratch[];
-    float* scratch_a = scratch;
-    float* scratch_b = scratch + blockDim.x;
-    scratch_a[threadIdx.x] = sum_a;
-    scratch_b[threadIdx.x] = sum_b;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            scratch_a[threadIdx.x] += scratch_a[threadIdx.x + stride];
-            scratch_b[threadIdx.x] += scratch_b[threadIdx.x + stride];
-        }
-        __syncthreads();
+    for (int off = 16; off > 0; off >>= 1) {
+        sum_a += __shfl_down_sync(0xffffffff, sum_a, off);
+        sum_b += __shfl_down_sync(0xffffffff, sum_b, off);
     }
-    if (threadIdx.x == 0) {
-        y_a[row] = scratch_a[0];
-        y_b[row] = scratch_b[0];
+    __shared__ float warp_partials_a[32];
+    __shared__ float warp_partials_b[32];
+    if (lane == 0) {
+        warp_partials_a[warp_id] = sum_a;
+        warp_partials_b[warp_id] = sum_b;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        float val_a = lane < num_warps ? warp_partials_a[lane] : 0.0f;
+        float val_b = lane < num_warps ? warp_partials_b[lane] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) {
+            val_a += __shfl_down_sync(0xffffffff, val_a, off);
+            val_b += __shfl_down_sync(0xffffffff, val_b, off);
+        }
+        if (lane == 0) {
+            y_a[row] = val_a;
+            y_b[row] = val_b;
+        }
+    }
+}
+
+__global__ void bf16_dual_matvec_bf16_x_kernel(const uint16_t* x, const uint16_t* w_a, const uint16_t* w_b, float* y_a, float* y_b, int rows, int cols) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    const int num_warps = blockDim.x >> 5;
+    float sum_a = 0.0f;
+    float sum_b = 0.0f;
+    for (int c = tid; c < cols; c += blockDim.x) {
+        const float xv = bf16_to_float(x[c]);
+        const size_t idx = static_cast<size_t>(row) * cols + c;
+        sum_a += bf16_to_float(w_a[idx]) * xv;
+        sum_b += bf16_to_float(w_b[idx]) * xv;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        sum_a += __shfl_down_sync(0xffffffff, sum_a, off);
+        sum_b += __shfl_down_sync(0xffffffff, sum_b, off);
+    }
+    __shared__ float warp_partials_a[32];
+    __shared__ float warp_partials_b[32];
+    if (lane == 0) {
+        warp_partials_a[warp_id] = sum_a;
+        warp_partials_b[warp_id] = sum_b;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        float val_a = lane < num_warps ? warp_partials_a[lane] : 0.0f;
+        float val_b = lane < num_warps ? warp_partials_b[lane] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) {
+            val_a += __shfl_down_sync(0xffffffff, val_a, off);
+            val_b += __shfl_down_sync(0xffffffff, val_b, off);
+        }
+        if (lane == 0) {
+            y_a[row] = val_a;
+            y_b[row] = val_b;
+        }
     }
 }
 
@@ -255,7 +305,14 @@ bool bf16_matvec_cuda(const float* d_x, const uint16_t* d_w_bf16, float* d_y, in
 bool bf16_dual_matvec_cuda(const float* d_x, const uint16_t* d_w_a_bf16, const uint16_t* d_w_b_bf16, float* d_y_a, float* d_y_b, int rows, int cols, void* stream) {
     if (d_x == nullptr || d_w_a_bf16 == nullptr || d_w_b_bf16 == nullptr || d_y_a == nullptr || d_y_b == nullptr || rows <= 0 || cols <= 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    bf16_dual_matvec_kernel<<<rows, 256, 512 * sizeof(float), cuda_stream>>>(d_x, d_w_a_bf16, d_w_b_bf16, d_y_a, d_y_b, rows, cols);
+    bf16_dual_matvec_kernel<<<rows, 256, 0, cuda_stream>>>(d_x, d_w_a_bf16, d_w_b_bf16, d_y_a, d_y_b, rows, cols);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool bf16_dual_matvec_bf16_x_cuda(const uint16_t* d_x_bf16, const uint16_t* d_w_a_bf16, const uint16_t* d_w_b_bf16, float* d_y_a, float* d_y_b, int rows, int cols, void* stream) {
+    if (d_x_bf16 == nullptr || d_w_a_bf16 == nullptr || d_w_b_bf16 == nullptr || d_y_a == nullptr || d_y_b == nullptr || rows <= 0 || cols <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    bf16_dual_matvec_bf16_x_kernel<<<rows, 256, 0, cuda_stream>>>(d_x_bf16, d_w_a_bf16, d_w_b_bf16, d_y_a, d_y_b, rows, cols);
     return cudaGetLastError() == cudaSuccess;
 }
 

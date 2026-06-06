@@ -5470,6 +5470,114 @@ __device__ __forceinline__ float gguf_block_scale_f16(const uint8_t* ptr) {
     return __half2float(__ushort_as_half(bits));
 }
 
+// Decode the shared f16 super-block scale of an IQ1_M block from the high
+// nibbles of its four uint16 scale words.  Mirrors gguf-py IQ1_M.dequantize.
+__device__ __forceinline__ float iq1m_super_scale(const uint16_t* sc) {
+    const uint16_t d_bits = static_cast<uint16_t>(
+        ((sc[0] & 0xF000u) >> 12) | ((sc[1] & 0xF000u) >> 8) |
+        ((sc[2] & 0xF000u) >> 4) | (sc[3] & 0xF000u));
+    return __half2float(__ushort_as_half(d_bits));
+}
+
+// Full IQ1_M block dot for 256 elements.  Must be entered by all 32 lanes of a
+// warp (the per-lane reduction uses a full-warp shuffle); the returned value is
+// valid on lane 0.  iq1_grid is the (2048, 8) int8 codebook flattened to 16384.
+// Block layout (56 bytes): qs[32] + qh[16] + scales[8] (4 uint16 words).
+__device__ __forceinline__ float iq1m_block_dot_256(
+    const float* __restrict__ x_shared,
+    const uint8_t* __restrict__ block,
+    const int8_t* __restrict__ iq1_grid,
+    int lane) {
+    const uint8_t* qs = block;
+    const uint8_t* qh = block + 32;
+    const uint16_t* sc = reinterpret_cast<const uint16_t*>(block + 48);
+    const float d = iq1m_super_scale(sc);
+    float local = 0.0f;
+    const int j = lane;  // grid index 0..31, one per lane
+    if (j < 32) {
+        const int sub = j >> 2;
+        const int half = (j >> 1) & 1;
+        const int pair = j & 1;
+        const int s = sub * 2 + half;
+        const int local_scale = (sc[s >> 2] >> ((s & 3) * 3)) & 0x07;
+        const float dl = d * static_cast<float>(2 * local_scale + 1);
+        const int qhv = (qh[j >> 1] >> ((j & 1) * 4)) & 0x0F;
+        const int qidx = static_cast<int>(qs[j]) | ((qhv & 0x07) << 8);
+        const float delta = (qhv & 0x08) ? -0.125f : 0.125f;
+        const int8_t* gvals = iq1_grid + qidx * 8;
+        const int k_out = sub * 32 + half * 16 + pair * 8;
+        float partial = 0.0f;
+        #pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            partial += x_shared[k_out + g] * (static_cast<float>(gvals[g]) + delta);
+        }
+        local = dl * partial;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local += __shfl_down_sync(0xffffffff, local, offset);
+    }
+    return local;  // valid on lane 0
+}
+
+// IQ1_M block dot for up to 4 rows sharing the same weight block.  Row r reads
+// activations from x_shared + r*256.  Accumulates into acc[r] on lane 0.
+__device__ __forceinline__ void iq1m_block_dot_256_rows4(
+    const float* __restrict__ x_shared,
+    const uint8_t* __restrict__ block,
+    const int8_t* __restrict__ iq1_grid,
+    int lane,
+    int valid_rows,
+    float* __restrict__ acc) {
+    const uint8_t* qs = block;
+    const uint8_t* qh = block + 32;
+    const uint16_t* sc = reinterpret_cast<const uint16_t*>(block + 48);
+    const float d = iq1m_super_scale(sc);
+    float l0 = 0.0f, l1 = 0.0f, l2 = 0.0f, l3 = 0.0f;
+    const int j = lane;
+    if (j < 32) {
+        const int sub = j >> 2;
+        const int half = (j >> 1) & 1;
+        const int pair = j & 1;
+        const int s = sub * 2 + half;
+        const int local_scale = (sc[s >> 2] >> ((s & 3) * 3)) & 0x07;
+        const float dl = d * static_cast<float>(2 * local_scale + 1);
+        const int qhv = (qh[j >> 1] >> ((j & 1) * 4)) & 0x0F;
+        const int qidx = static_cast<int>(qs[j]) | ((qhv & 0x07) << 8);
+        const float delta = (qhv & 0x08) ? -0.125f : 0.125f;
+        const int8_t* gvals = iq1_grid + qidx * 8;
+        const int k_out = sub * 32 + half * 16 + pair * 8;
+        float gv[8];
+        #pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            gv[g] = static_cast<float>(gvals[g]) + delta;
+        }
+        #pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const float w = gv[g];
+            const int kk = k_out + g;
+            l0 += x_shared[kk] * w;
+            if (valid_rows > 1) l1 += x_shared[256 + kk] * w;
+            if (valid_rows > 2) l2 += x_shared[512 + kk] * w;
+            if (valid_rows > 3) l3 += x_shared[768 + kk] * w;
+        }
+        l0 *= dl; l1 *= dl; l2 *= dl; l3 *= dl;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        l0 += __shfl_down_sync(0xffffffff, l0, offset);
+        l1 += __shfl_down_sync(0xffffffff, l1, offset);
+        l2 += __shfl_down_sync(0xffffffff, l2, offset);
+        l3 += __shfl_down_sync(0xffffffff, l3, offset);
+    }
+    if (lane == 0) {
+        acc[0] += l0;
+        if (valid_rows > 1) acc[1] += l1;
+        if (valid_rows > 2) acc[2] += l2;
+        if (valid_rows > 3) acc[3] += l3;
+    }
+}
+
 
 constexpr int kQ8_0TileN = 8;
 constexpr int kGGUFQuantTileN = 8;
@@ -5741,6 +5849,9 @@ __global__ void gguf_quant_gemm_kernel(
                         }
                     }
                 }
+            } else if (type_id == 2) {
+                const float blk = iq1m_block_dot_256(x_shared, block, signed_grid, lane);
+                if (lane == 0) acc += blk;
             } else {
                 const uint8_t* scales = block;
                 const uint8_t* qs = block + 16;
@@ -5902,6 +6013,9 @@ __device__ __forceinline__ float gguf_quant_block_dot_256(
                 }
             }
         }
+    } else if (type_id == 2) {
+        const float blk = iq1m_block_dot_256(x_shared, block, signed_grid, lane);
+        if (lane == 0) acc += blk;
     } else {
         const uint8_t* scales = block;
         const uint8_t* qs = block + 16;
@@ -5975,6 +6089,8 @@ __device__ __forceinline__ void gguf_quant_block_dot_256_rows4(
                 }
             }
         }
+    } else if (type_id == 2) {
+        iq1m_block_dot_256_rows4(x_shared, block, signed_grid, lane, valid_rows, acc);
     } else {
         const uint8_t* scales = block;
         const uint8_t* qs = block + 16;
@@ -7149,7 +7265,7 @@ torch::Tensor gguf_quant_gemm_forward_cuda(
     auto out = torch::empty({rows, n}, x.options().dtype(torch::kBFloat16));
     const int8_t* grid_ptr = nullptr;
     torch::Tensor grid_contig;
-    if (type_id == 0) {
+    if (type_id == 0 || type_id == 2) {
         grid_contig = signed_grid.contiguous();
         grid_ptr = grid_contig.data_ptr<int8_t>();
     }
@@ -7191,7 +7307,7 @@ torch::Tensor gguf_quant_gemm_prefill_forward_cuda(
     auto out = torch::empty({rows, n}, x.options().dtype(torch::kBFloat16));
     const int8_t* grid_ptr = nullptr;
     torch::Tensor grid_contig;
-    if (type_id == 0) {
+    if (type_id == 0 || type_id == 2) {
         grid_contig = signed_grid.contiguous();
         grid_ptr = grid_contig.data_ptr<int8_t>();
     }
@@ -7240,7 +7356,7 @@ torch::Tensor gguf_quant_gemm_pair_forward_cuda(
     auto out1 = torch::empty({rows, n}, x.options().dtype(torch::kBFloat16));
     const int8_t* grid_ptr = nullptr;
     torch::Tensor grid_contig;
-    if (type_id0 == 0 || type_id1 == 0) {
+    if (type_id0 == 0 || type_id1 == 0 || type_id0 == 2 || type_id1 == 2) {
         grid_contig = signed_grid.contiguous();
         grid_ptr = grid_contig.data_ptr<int8_t>();
     }
@@ -7318,7 +7434,7 @@ torch::Tensor gguf_moe_prefill_grouped_forward_cuda(
 
     const int8_t* grid_ptr = nullptr;
     torch::Tensor grid_contig;
-    if (w1_type_id == 0 || w3_type_id == 0 || w2_type_id == 0) {
+    if (w1_type_id == 0 || w3_type_id == 0 || w2_type_id == 0 || w1_type_id == 2 || w3_type_id == 2 || w2_type_id == 2) {
         grid_contig = signed_grid.contiguous();
         grid_ptr = grid_contig.data_ptr<int8_t>();
     }
@@ -7706,6 +7822,97 @@ torch::Tensor gguf_moe_single_token_iq2_q2k_forward_cuda(
         inter_dim,
         w2_blocks_per_row,
         hidden_groups);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
+
+torch::Tensor gguf_moe_single_token_iq1m_forward_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& route_slots,
+    const torch::Tensor& route_weights,
+    const torch::Tensor& w1_blocks,
+    const torch::Tensor& w3_blocks,
+    const torch::Tensor& w2_blocks,
+    const torch::Tensor& iq1_grid,
+    double swiglu_limit) {
+    c10::cuda::CUDAGuard device_guard(x.device());
+    auto x_contig = x.contiguous();
+    auto route_slots_contig = route_slots.contiguous();
+    auto route_weights_contig = route_weights.contiguous();
+    auto w1_contig = w1_blocks.contiguous();
+    auto w3_contig = w3_blocks.contiguous();
+    auto w2_contig = w2_blocks.contiguous();
+    auto grid_contig = iq1_grid.contiguous();
+
+    const int routes = static_cast<int>(route_slots_contig.size(0));
+    const int n_experts = static_cast<int>(w1_contig.size(0));
+    const int dim = static_cast<int>(x_contig.size(1));
+    const int inter_dim = static_cast<int>(w1_contig.size(1));
+    auto y = torch::zeros({1, dim}, x.options().dtype(torch::kFloat32));
+    if (routes == 0 || n_experts <= 0) {
+        return y;
+    }
+
+    const int w1_blocks_per_row = static_cast<int>(w1_contig.size(2));
+    const int w3_blocks_per_row = static_cast<int>(w3_contig.size(2));
+    const int w2_blocks_per_row = static_cast<int>(w2_contig.size(2));
+    const int w_block_bytes = 56;
+
+    auto route_tokens = torch::zeros({routes}, route_slots_contig.options());
+    auto route_experts = route_slots_contig.to(torch::kInt32);
+    auto gate = torch::empty({routes, inter_dim}, x.options().dtype(torch::kFloat32));
+    auto up = torch::empty({routes, inter_dim}, x.options().dtype(torch::kFloat32));
+    const dim3 block(256);
+    const dim3 w13_grid(ceil_div(inter_dim, kGGUFQuantTileN), routes);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x_contig.scalar_type(), "gguf_moe_single_token_iq1m_w13", [&] {
+        gguf_moe_w13_kernel<scalar_t><<<w13_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            x_contig.data_ptr<scalar_t>(),
+            route_tokens.data_ptr<int64_t>(),
+            route_experts.data_ptr<int32_t>(),
+            w1_contig.data_ptr<uint8_t>(),
+            w3_contig.data_ptr<uint8_t>(),
+            grid_contig.data_ptr<int8_t>(),
+            gate.data_ptr<float>(),
+            up.data_ptr<float>(),
+            routes,
+            dim,
+            inter_dim,
+            w1_blocks_per_row,
+            w_block_bytes,
+            2,
+            w3_blocks_per_row,
+            w_block_bytes,
+            2);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    auto hidden = torch::empty({routes, inter_dim}, x.options().dtype(torch::kFloat32));
+    const int hidden_threads = 256;
+    const int hidden_blocks = static_cast<int>((static_cast<int64_t>(routes) * inter_dim + hidden_threads - 1) / hidden_threads);
+    route_swiglu_cast_kernel<float><<<hidden_blocks, hidden_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        gate.data_ptr<float>(),
+        up.data_ptr<float>(),
+        route_weights_contig.data_ptr<float>(),
+        hidden.data_ptr<float>(),
+        routes,
+        inter_dim,
+        static_cast<float>(swiglu_limit));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    const dim3 w2_grid(ceil_div(dim, kGGUFQuantTileN), routes);
+    gguf_moe_w2_scatter_kernel<<<w2_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        hidden.data_ptr<float>(),
+        route_tokens.data_ptr<int64_t>(),
+        route_experts.data_ptr<int32_t>(),
+        w2_contig.data_ptr<uint8_t>(),
+        grid_contig.data_ptr<int8_t>(),
+        y.data_ptr<float>(),
+        routes,
+        dim,
+        inter_dim,
+        w2_blocks_per_row,
+        w_block_bytes,
+        2);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }

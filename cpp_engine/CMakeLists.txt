@@ -52,6 +52,7 @@ add_library(dsv4_cpp_core STATIC
     cuda/fp4_ops.cu
     cuda/fp8_ops.cu
     cuda/q2_ops.cu
+    cuda/iq1_ops.cu
     cuda/rmsnorm_rope.cu
 )
 
@@ -82,6 +83,10 @@ set_target_properties(inspect_safetensors PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${
 add_executable(test_gguf_reader tests/test_gguf_reader.cpp)
 target_link_libraries(test_gguf_reader PRIVATE dsv4_cpp_core)
 set_target_properties(test_gguf_reader PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_gguf_iq1m_reader tests/test_gguf_iq1m_reader.cpp)
+target_link_libraries(test_gguf_iq1m_reader PRIVATE dsv4_cpp_core)
+set_target_properties(test_gguf_iq1m_reader PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_safetensors_reader tests/test_safetensors_reader.cpp)
 target_link_libraries(test_safetensors_reader PRIVATE dsv4_cpp_core)

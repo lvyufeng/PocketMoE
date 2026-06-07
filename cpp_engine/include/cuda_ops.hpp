@@ -15,6 +15,26 @@ bool q8_0_matvec_cuda(
     int cols,
     void* stream = nullptr);
 
+bool q8_0_matmul_rows_cuda(
+    const float* d_x,
+    const uint8_t* d_w,
+    float* d_y,
+    int batch,
+    int rows,
+    int cols,
+    void* stream = nullptr);
+
+bool q8_0_matmul_rows_strided_cuda(
+    const float* d_x,
+    const uint8_t* d_w,
+    float* d_y,
+    int batch,
+    int rows,
+    int cols,
+    int x_stride,
+    int y_stride,
+    void* stream = nullptr);
+
 // --- IQ2_XXS / Q2_K single-token MoE decode kernels (cuda/q2_ops.cu). ---
 
 // Returns a device pointer to the lazy-initialized signed_grid lookup table
@@ -83,6 +103,54 @@ bool q2_moe_single_w2_q2k_cuda(
     int inter_dim,
     void* stream = nullptr);
 
+bool q2_moe_grouped_w2_q2k_cuda(
+    const int8_t* d_hidden_q,
+    const float* d_hidden_scale,
+    const int64_t* d_route_tokens,
+    const int32_t* d_seg_starts,
+    const uint8_t* d_w2_blocks,
+    float* d_y_rows,
+    int tokens,
+    int routes,
+    int n_experts,
+    int max_count,
+    int dim,
+    int inter_dim,
+    void* stream = nullptr);
+
+struct MoePrefillQ2GroupedWorkspace {
+    float* d_x_route = nullptr;    // [routes_cap, dim]
+    int8_t* d_x_q = nullptr;       // [routes_cap, dim]
+    float* d_x_scale = nullptr;    // [routes_cap, ceil(dim/32)]
+    int64_t* d_route_slots = nullptr; // [routes_cap]
+    float* d_gate = nullptr;       // [routes_cap, inter_dim]
+    float* d_up = nullptr;         // [routes_cap, inter_dim]
+    int8_t* d_hidden_q = nullptr;  // [routes_cap, inter_dim]
+    float* d_hidden_scale = nullptr; // [routes_cap, ceil(inter_dim/16)]
+    int routes_cap = 0;
+    int dim = 0;
+    int inter_dim = 0;
+};
+
+bool moe_prefill_q2_grouped_cuda_with_workspace(
+    const float* d_x_rows,
+    const int64_t* d_route_tokens,
+    const float* d_route_weights,
+    const int32_t* d_seg_starts,
+    const uint8_t* d_w1_blocks,
+    const uint8_t* d_w2_blocks,
+    const uint8_t* d_w3_blocks,
+    float* d_y_rows,
+    int tokens,
+    int routes,
+    int n_experts,
+    int max_count,
+    int dim,
+    int inter_dim,
+    float swiglu_limit,
+    MoePrefillQ2GroupedWorkspace workspace,
+    void* stream = nullptr);
+
 // --- IQ1_M single-token MoE decode kernels (cuda/iq1_ops.cu). ---
 
 bool iq1_moe_single_w13_cuda(
@@ -147,6 +215,60 @@ bool iq1_moe_single_w2_reduce_cuda(
     int n_experts,
     int dim,
     int inter_dim,
+    void* stream = nullptr);
+
+bool iq1_moe_grouped_w13_swiglu_cuda(
+    const float* d_x_rows,
+    const int64_t* d_route_tokens,
+    const float* d_route_weights,
+    const int32_t* d_seg_starts,
+    const uint8_t* d_w1_blocks,
+    const uint8_t* d_w3_blocks,
+    float* d_hidden,
+    int routes,
+    int n_experts,
+    int max_count,
+    int dim,
+    int inter_dim,
+    float swiglu_limit,
+    void* stream = nullptr);
+
+struct MoePrefillIq1GroupedWorkspace {
+    float* d_hidden = nullptr;       // [routes_cap, inter_dim]
+    int8_t* d_hidden_q = nullptr;    // [routes_cap, inter_dim], for IQ1 grouped W2 q8 path and IQ1 W13 + Q2_K W2 recipe
+    float* d_hidden_scale = nullptr; // [routes_cap, ceil(inter_dim/16)]
+    int8_t* d_x_q = nullptr;         // [routes_cap, dim], IQ1 grouped-GEMM W13 q8 route rows
+    float* d_x_scale = nullptr;      // [routes_cap, ceil(dim/16)]
+    int32_t* d_tile_experts = nullptr; // [tile_cap], compact route tiles
+    int32_t* d_tile_rows = nullptr;    // [tile_cap], row offset within expert segment
+    int routes_cap = 0;
+    int tile_cap = 0;
+    int tile_count = 0;
+    int dim = 0;
+    int inter_dim = 0;
+};
+
+// IQ1_M grouped routed MoE for prefill. Routes are grouped by local expert via
+// moe_group_routes_cuda: d_seg_starts[e]..d_seg_starts[e+1] are route ids for
+// expert e, and d_route_tokens[route] selects the source/output token row.
+// Consumes raw IQ1_M blocks directly and writes d_y_rows [tokens, dim].
+bool moe_prefill_iq1_grouped_cuda_with_workspace(
+    const float* d_x_rows,
+    const int64_t* d_route_tokens,
+    const float* d_route_weights,
+    const int32_t* d_seg_starts,
+    const uint8_t* d_w1_blocks,
+    const uint8_t* d_w2_blocks,
+    const uint8_t* d_w3_blocks,
+    float* d_y_rows,
+    int tokens,
+    int routes,
+    int n_experts,
+    int max_count,
+    int dim,
+    int inter_dim,
+    float swiglu_limit,
+    MoePrefillIq1GroupedWorkspace workspace,
     void* stream = nullptr);
 
 bool fp4_e2m1_e8m0_matvec_cuda(
@@ -389,6 +511,21 @@ bool f16_row_to_float_cuda(
     int cols,
     void* stream = nullptr);
 
+bool f16_rows_to_float_cuda(
+    const uint16_t* d_matrix_f16,
+    const int* d_rows,
+    float* d_y,
+    int rows,
+    int cols,
+    void* stream = nullptr);
+
+bool f16_contiguous_rows_to_float_cuda(
+    const uint16_t* d_matrix_f16,
+    float* d_y,
+    int rows,
+    int cols,
+    void* stream = nullptr);
+
 bool bf16_rows_to_float_cuda(
     const uint16_t* d_matrix_bf16,
     const int* d_rows,
@@ -564,6 +701,20 @@ bool prefill_causal_attention_cuda(
     float scale,
     void* stream = nullptr);
 
+bool prefill_causal_attention_chunk_cuda(
+    const float* d_q,
+    const float* d_kv,
+    const float* d_attn_sink,
+    float* d_y,
+    int tokens,
+    int heads,
+    int kv_len,
+    int head_dim,
+    int window_size,
+    int start_position,
+    float scale,
+    void* stream = nullptr);
+
 bool build_prefill_window_indices_cuda(
     int32_t* d_indices,
     int tokens,
@@ -578,6 +729,20 @@ bool build_decode_kv_indices_cuda(
     int window_size,
     int compressed_count,
     int compressed_offset,
+    void* stream = nullptr);
+
+bool prefill_sparse_attention_indexed_cuda(
+    const float* d_q,
+    const float* d_kv,
+    const float* d_attn_sink,
+    const int32_t* d_topk_indices,
+    float* d_y,
+    int tokens,
+    int heads,
+    int kv_len,
+    int topk,
+    int head_dim,
+    float scale,
     void* stream = nullptr);
 
 bool prefill_sparse_attention_headpair_cuda(
@@ -707,6 +872,18 @@ bool head_rmsnorm_rope_cuda(
     int head_dim,
     int rope_dim,
     int position,
+    float theta,
+    bool inverse,
+    float eps,
+    void* stream = nullptr);
+
+bool head_rmsnorm_rope_rows_cuda(
+    float* d_x,
+    int tokens,
+    int heads,
+    int head_dim,
+    int rope_dim,
+    int start_position,
     float theta,
     bool inverse,
     float eps,

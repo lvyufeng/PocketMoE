@@ -403,42 +403,252 @@ __global__ void gguf_moe_single_w2_q2k_dp4a_kernel(
         const float d = gguf_block_scale_f16(block + 80);
         const float dmin = gguf_block_scale_f16(block + 82);
         const int k_base = block_idx * 256;
-        for (int group = 0; group < 16; ++group) {
-            float local = 0.0f;
-            if (lane < 4) {
-                const int half_block = group >> 3;
-                const int group_in_half = group & 7;
-                const int shift = (group_in_half >> 1) * 2;
-                const int byte_start = half_block * 32 + (group_in_half & 1) * 16;
-                const int idx = lane * 4;
-                const int q0 = static_cast<int>((qs[byte_start + idx + 0] >> shift) & 0x03);
-                const int q1 = static_cast<int>((qs[byte_start + idx + 1] >> shift) & 0x03);
-                const int q2 = static_cast<int>((qs[byte_start + idx + 2] >> shift) & 0x03);
-                const int q3 = static_cast<int>((qs[byte_start + idx + 3] >> shift) & 0x03);
-                const int w_pack = pack_i8x4(q0, q1, q2, q3);
-                const int h_idx = k_base + group * 16 + idx;
-                const int h_pack = pack_i8x4(
-                    static_cast<int>(hidden_row[h_idx + 0]),
-                    static_cast<int>(hidden_row[h_idx + 1]),
-                    static_cast<int>(hidden_row[h_idx + 2]),
-                    static_cast<int>(hidden_row[h_idx + 3]));
-                const int dot_q = __dp4a(w_pack, h_pack, 0);
-                const int sum_h = __dp4a(0x01010101, h_pack, 0);
-                const float qscale = d * static_cast<float>(scales[group] & 0x0f);
-                const float base = dmin * static_cast<float>(scales[group] >> 4);
-                local = hs_row[block_idx * 16 + group] * (qscale * static_cast<float>(dot_q) - base * static_cast<float>(sum_h));
-            }
+        for (int half = 0; half < 2; ++half) {
+            const int sub = lane >> 2;      // eight 4-lane groups per half-block.
+            const int part = lane & 3;
+            const int group = half * 8 + sub;
+            const int shift = (sub >> 1) * 2;
+            const int byte_start = half * 32 + (sub & 1) * 16;
+            const int idx = part * 4;
+            const int q0 = static_cast<int>((qs[byte_start + idx + 0] >> shift) & 0x03);
+            const int q1 = static_cast<int>((qs[byte_start + idx + 1] >> shift) & 0x03);
+            const int q2 = static_cast<int>((qs[byte_start + idx + 2] >> shift) & 0x03);
+            const int q3 = static_cast<int>((qs[byte_start + idx + 3] >> shift) & 0x03);
+            const int w_pack = pack_i8x4(q0, q1, q2, q3);
+            const int h_idx = k_base + group * 16 + idx;
+            const int h_pack = pack_i8x4(
+                static_cast<int>(hidden_row[h_idx + 0]),
+                static_cast<int>(hidden_row[h_idx + 1]),
+                static_cast<int>(hidden_row[h_idx + 2]),
+                static_cast<int>(hidden_row[h_idx + 3]));
+            const int dot_q = __dp4a(w_pack, h_pack, 0);
+            const int sum_h = __dp4a(0x01010101, h_pack, 0);
+            const float qscale = d * static_cast<float>(scales[group] & 0x0f);
+            const float base = dmin * static_cast<float>(scales[group] >> 4);
+            float local = hs_row[block_idx * 16 + group] * (qscale * static_cast<float>(dot_q) - base * static_cast<float>(sum_h));
+            const unsigned group_mask = 0x0fu << (sub * 4);
+            local += __shfl_down_sync(group_mask, local, 2, 4);
+            local += __shfl_down_sync(group_mask, local, 1, 4);
+            float group_sum = (part == 0) ? local : 0.0f;
             #pragma unroll
-            for (int offset = 2; offset > 0; offset >>= 1) {
-                local += __shfl_down_sync(0x0f, local, offset);
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                group_sum += __shfl_down_sync(0xffffffff, group_sum, offset);
             }
-            if (lane == 0) acc += local;
+            if (lane == 0) acc += group_sum;
         }
     }
 
     if (lane == 0) {
         atomicAdd(y + out_col, acc);
     }
+}
+
+__global__ void gather_q2_route_rows_kernel(
+    const float* __restrict__ x_rows,
+    const int64_t* __restrict__ route_tokens,
+    float* __restrict__ x_route_rows,
+    int routes,
+    int dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t total = static_cast<int64_t>(routes) * dim;
+    if (idx >= total) return;
+    const int route = idx / dim;
+    const int col = idx - route * dim;
+    const int64_t token = route_tokens[route];
+    x_route_rows[idx] = token >= 0 ? x_rows[token * static_cast<int64_t>(dim) + col] : 0.0f;
+}
+
+__global__ void gguf_moe_grouped_w13_iq2_xxs_dp4a_kernel(
+    const int8_t* __restrict__ x_q,
+    const float* __restrict__ x_scale,
+    const int64_t* __restrict__ route_slots,
+    const uint8_t* __restrict__ w1_blocks,
+    const uint8_t* __restrict__ w3_blocks,
+    const int8_t* __restrict__ signed_grid,
+    float* __restrict__ gate,
+    float* __restrict__ up,
+    int routes,
+    int n_experts,
+    int dim,
+    int inter_dim,
+    int blocks_per_row,
+    int x_groups) {
+    const int route = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int out_col = blockIdx.x * kQ2TileN + warp;
+    if (route >= routes || warp >= kQ2TileN) return;
+    const int expert = static_cast<int>(route_slots[route]);
+    if (expert < 0 || expert >= n_experts) return;
+
+    const int8_t* xq_row = x_q + static_cast<int64_t>(route) * dim;
+    const float* xs_row = x_scale + static_cast<int64_t>(route) * x_groups;
+    const uint8_t* w1_row = w1_blocks + (static_cast<int64_t>(expert) * inter_dim + out_col) * blocks_per_row * 66;
+    const uint8_t* w3_row = w3_blocks + (static_cast<int64_t>(expert) * inter_dim + out_col) * blocks_per_row * 66;
+
+    __shared__ int x_shared_q[64];
+    __shared__ float x_shared_scale[8];
+    float acc1 = 0.0f;
+    float acc3 = 0.0f;
+    for (int block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const int k_base = block_idx * 256;
+        const int tid = threadIdx.x;
+        if (tid < 64) {
+            const int byte_off = tid * 4;
+            int v = 0;
+            if (k_base + byte_off + 4 <= dim) {
+                v = *reinterpret_cast<const int*>(xq_row + k_base + byte_off);
+            }
+            x_shared_q[tid] = v;
+        }
+        if (tid < 8) {
+            const int sg_idx = block_idx * 8 + tid;
+            x_shared_scale[tid] = sg_idx < x_groups ? xs_row[sg_idx] : 0.0f;
+        }
+        __syncthreads();
+        if (out_col < inter_dim) {
+            const int sub = lane >> 2;
+            const int part = lane & 3;
+            const uint8_t* w1_block = w1_row + static_cast<int64_t>(block_idx) * 66;
+            const uint8_t* w3_block = w3_row + static_cast<int64_t>(block_idx) * 66;
+            const uint8_t* chunk1 = w1_block + 2 + sub * 8;
+            const uint8_t* chunk3 = w3_block + 2 + sub * 8;
+            const float d1 = gguf_block_scale_f16(w1_block);
+            const float d3 = gguf_block_scale_f16(w3_block);
+            const uint32_t aux1 = static_cast<uint32_t>(chunk1[4]) |
+                (static_cast<uint32_t>(chunk1[5]) << 8) |
+                (static_cast<uint32_t>(chunk1[6]) << 16) |
+                (static_cast<uint32_t>(chunk1[7]) << 24);
+            const uint32_t aux3 = static_cast<uint32_t>(chunk3[4]) |
+                (static_cast<uint32_t>(chunk3[5]) << 8) |
+                (static_cast<uint32_t>(chunk3[6]) << 16) |
+                (static_cast<uint32_t>(chunk3[7]) << 24);
+            const int grid_id1 = chunk1[part];
+            const int grid_id3 = chunk3[part];
+            const int sign_idx1 = static_cast<int>((aux1 >> (7 * part)) & 127);
+            const int sign_idx3 = static_cast<int>((aux3 >> (7 * part)) & 127);
+            const float s1 = 0.125f * d1 * static_cast<float>(2 * (aux1 >> 28) + 1);
+            const float s3 = 0.125f * d3 * static_cast<float>(2 * (aux3 >> 28) + 1);
+            const int8_t* vals1 = signed_grid + (grid_id1 * 128 + sign_idx1) * 8;
+            const int8_t* vals3 = signed_grid + (grid_id3 * 128 + sign_idx3) * 8;
+            const int v1_p0 = *reinterpret_cast<const int*>(vals1);
+            const int v1_p1 = *reinterpret_cast<const int*>(vals1 + 4);
+            const int v3_p0 = *reinterpret_cast<const int*>(vals3);
+            const int v3_p1 = *reinterpret_cast<const int*>(vals3 + 4);
+            const int xq_base = sub * 8 + part * 2;
+            const int x_p0 = x_shared_q[xq_base];
+            const int x_p1 = x_shared_q[xq_base + 1];
+            int sumi1 = __dp4a(v1_p0, x_p0, 0);
+            sumi1 = __dp4a(v1_p1, x_p1, sumi1);
+            int sumi3 = __dp4a(v3_p0, x_p0, 0);
+            sumi3 = __dp4a(v3_p1, x_p1, sumi3);
+            const float xs = x_shared_scale[sub];
+            float local1 = s1 * xs * static_cast<float>(sumi1);
+            float local3 = s3 * xs * static_cast<float>(sumi3);
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                local1 += __shfl_down_sync(0xffffffff, local1, offset);
+                local3 += __shfl_down_sync(0xffffffff, local3, offset);
+            }
+            if (lane == 0) {
+                acc1 += local1;
+                acc3 += local3;
+            }
+        }
+        __syncthreads();
+    }
+    if (lane == 0 && out_col < inter_dim) {
+        gate[static_cast<int64_t>(route) * inter_dim + out_col] = acc1;
+        up[static_cast<int64_t>(route) * inter_dim + out_col] = acc3;
+    }
+}
+
+__global__ void q2_route_slots_from_segments_kernel(
+    const int32_t* __restrict__ seg_starts,
+    int64_t* __restrict__ route_slots,
+    int routes,
+    int n_experts,
+    int max_count) {
+    const int expert = blockIdx.x;
+    const int ordinal = blockIdx.y * blockDim.x + threadIdx.x;
+    if (expert >= n_experts || ordinal >= max_count) return;
+    const int start = seg_starts[expert];
+    const int end = seg_starts[expert + 1];
+    const int route = start + ordinal;
+    if (route < end && route < routes) route_slots[route] = expert;
+}
+
+__global__ void gguf_moe_grouped_w2_q2k_dp4a_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ seg_starts,
+    const uint8_t* __restrict__ w2_blocks,
+    float* __restrict__ y_rows,
+    int routes,
+    int n_experts,
+    int max_count,
+    int dim,
+    int inter_dim,
+    int w2_blocks_per_row,
+    int hidden_groups) {
+    const int expert = blockIdx.z;
+    const int route_ordinal = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int out_col = blockIdx.x * kQ2TileN + warp;
+    if (expert >= n_experts || route_ordinal >= max_count || warp >= kQ2TileN || out_col >= dim) return;
+    const int route = seg_starts[expert] + route_ordinal;
+    if (route >= seg_starts[expert + 1] || route >= routes) return;
+    const int64_t token = route_tokens[route];
+    if (token < 0) return;
+
+    const int8_t* hidden_row = hidden_q + static_cast<int64_t>(route) * inter_dim;
+    const float* hs_row = hidden_scale + static_cast<int64_t>(route) * hidden_groups;
+    const uint8_t* w2_row = w2_blocks + (static_cast<int64_t>(expert) * dim + out_col) * w2_blocks_per_row * 84;
+    float acc = 0.0f;
+    for (int block_idx = 0; block_idx < w2_blocks_per_row; ++block_idx) {
+        const uint8_t* block = w2_row + static_cast<int64_t>(block_idx) * 84;
+        const uint8_t* scales = block;
+        const uint8_t* qs = block + 16;
+        const float d = gguf_block_scale_f16(block + 80);
+        const float dmin = gguf_block_scale_f16(block + 82);
+        const int k_base = block_idx * 256;
+        for (int half = 0; half < 2; ++half) {
+            const int sub = lane >> 2;      // eight 4-lane groups per half-block.
+            const int part = lane & 3;
+            const int group = half * 8 + sub;
+            const int shift = (sub >> 1) * 2;
+            const int byte_start = half * 32 + (sub & 1) * 16;
+            const int idx = part * 4;
+            const int q0 = static_cast<int>((qs[byte_start + idx + 0] >> shift) & 0x03);
+            const int q1 = static_cast<int>((qs[byte_start + idx + 1] >> shift) & 0x03);
+            const int q2 = static_cast<int>((qs[byte_start + idx + 2] >> shift) & 0x03);
+            const int q3 = static_cast<int>((qs[byte_start + idx + 3] >> shift) & 0x03);
+            const int w_pack = pack_i8x4(q0, q1, q2, q3);
+            const int h_idx = k_base + group * 16 + idx;
+            const int h_pack = pack_i8x4(
+                static_cast<int>(hidden_row[h_idx + 0]),
+                static_cast<int>(hidden_row[h_idx + 1]),
+                static_cast<int>(hidden_row[h_idx + 2]),
+                static_cast<int>(hidden_row[h_idx + 3]));
+            const int dot_q = __dp4a(w_pack, h_pack, 0);
+            const int sum_h = __dp4a(0x01010101, h_pack, 0);
+            const float qscale = d * static_cast<float>(scales[group] & 0x0f);
+            const float base = dmin * static_cast<float>(scales[group] >> 4);
+            float local = hs_row[block_idx * 16 + group] * (qscale * static_cast<float>(dot_q) - base * static_cast<float>(sum_h));
+            const unsigned group_mask = 0x0fu << (sub * 4);
+            local += __shfl_down_sync(group_mask, local, 2, 4);
+            local += __shfl_down_sync(group_mask, local, 1, 4);
+            float group_sum = (part == 0) ? local : 0.0f;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                group_sum += __shfl_down_sync(0xffffffff, group_sum, offset);
+            }
+            if (lane == 0) acc += group_sum;
+        }
+    }
+    if (lane == 0) atomicAdd(y_rows + token * static_cast<int64_t>(dim) + out_col, acc);
 }
 
 inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
@@ -546,6 +756,97 @@ bool q2_moe_single_w2_q2k_cuda(
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool q2_moe_grouped_w2_q2k_cuda(
+    const int8_t* d_hidden_q,
+    const float* d_hidden_scale,
+    const int64_t* d_route_tokens,
+    const int32_t* d_seg_starts,
+    const uint8_t* d_w2_blocks,
+    float* d_y_rows,
+    int tokens,
+    int routes,
+    int n_experts,
+    int max_count,
+    int dim,
+    int inter_dim,
+    void* stream) {
+    if (tokens <= 0 || routes < 0 || n_experts <= 0 || max_count < 0 || dim <= 0 || inter_dim <= 0) return false;
+    cudaStream_t cs = static_cast<cudaStream_t>(stream);
+    if (cudaMemsetAsync(d_y_rows, 0, static_cast<size_t>(tokens) * dim * sizeof(float), cs) != cudaSuccess) return false;
+    if (routes == 0 || max_count == 0) return cudaGetLastError() == cudaSuccess;
+    const int w2_blocks_per_row = inter_dim / 256;
+    const int hidden_groups = ceil_div(inter_dim, 16);
+    dim3 grid(ceil_div(dim, kQ2TileN), max_count, n_experts);
+    dim3 block(256);
+    gguf_moe_grouped_w2_q2k_dp4a_kernel<<<grid, block, 0, cs>>>(
+        d_hidden_q, d_hidden_scale, d_route_tokens, d_seg_starts, d_w2_blocks,
+        d_y_rows, routes, n_experts, max_count, dim, inter_dim, w2_blocks_per_row, hidden_groups);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool moe_prefill_q2_grouped_cuda_with_workspace(
+    const float* d_x_rows,
+    const int64_t* d_route_tokens,
+    const float* d_route_weights,
+    const int32_t* d_seg_starts,
+    const uint8_t* d_w1_blocks,
+    const uint8_t* d_w2_blocks,
+    const uint8_t* d_w3_blocks,
+    float* d_y_rows,
+    int tokens,
+    int routes,
+    int n_experts,
+    int max_count,
+    int dim,
+    int inter_dim,
+    float swiglu_limit,
+    MoePrefillQ2GroupedWorkspace workspace,
+    void* stream) {
+    if (d_x_rows == nullptr || d_route_tokens == nullptr || d_route_weights == nullptr ||
+        d_seg_starts == nullptr || d_w1_blocks == nullptr || d_w2_blocks == nullptr ||
+        d_w3_blocks == nullptr || d_y_rows == nullptr) return false;
+    if (tokens <= 0 || routes < 0 || n_experts <= 0 || max_count < 0 || dim <= 0 || inter_dim <= 0) return false;
+    cudaStream_t cs = static_cast<cudaStream_t>(stream);
+    if (cudaMemsetAsync(d_y_rows, 0, static_cast<size_t>(tokens) * dim * sizeof(float), cs) != cudaSuccess) return false;
+    if (routes == 0 || max_count == 0) return cudaGetLastError() == cudaSuccess;
+    if (workspace.routes_cap < routes || workspace.dim < dim || workspace.inter_dim < inter_dim ||
+        workspace.d_x_route == nullptr || workspace.d_x_q == nullptr || workspace.d_x_scale == nullptr ||
+        workspace.d_route_slots == nullptr || workspace.d_gate == nullptr || workspace.d_up == nullptr ||
+        workspace.d_hidden_q == nullptr || workspace.d_hidden_scale == nullptr) return false;
+    const int8_t* sg = signed_grid_device();
+    if (sg == nullptr) return false;
+    const int threads = 256;
+    const int64_t routes_dim = static_cast<int64_t>(routes) * dim;
+    gather_q2_route_rows_kernel<<<static_cast<int>((routes_dim + threads - 1) / threads), threads, 0, cs>>>(
+        d_x_rows, d_route_tokens, workspace.d_x_route, routes, dim);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    if (!q2_quantize_x_q8_1_cuda(workspace.d_x_route, workspace.d_x_q, workspace.d_x_scale, routes, dim, stream)) return false;
+    dim3 slot_grid(n_experts, (max_count + threads - 1) / threads);
+    q2_route_slots_from_segments_kernel<<<slot_grid, threads, 0, cs>>>(
+        d_seg_starts, workspace.d_route_slots, routes, n_experts, max_count);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    const int blocks_per_row = dim / 256;
+    const int x_groups = ceil_div(dim, 32);
+    dim3 grid_w13(ceil_div(inter_dim, kQ2TileN), routes);
+    dim3 block(256);
+    gguf_moe_grouped_w13_iq2_xxs_dp4a_kernel<<<grid_w13, block, 0, cs>>>(
+        workspace.d_x_q, workspace.d_x_scale, workspace.d_route_slots, d_w1_blocks, d_w3_blocks, sg,
+        workspace.d_gate, workspace.d_up, routes, n_experts, dim, inter_dim, blocks_per_row, x_groups);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    if (!q2_route_swiglu_quantize_hidden_q8_1_cuda(workspace.d_gate, workspace.d_up, d_route_weights,
+                                                   workspace.d_hidden_q, workspace.d_hidden_scale,
+                                                   routes, inter_dim, swiglu_limit, stream)) {
+        return false;
+    }
+    const int w2_blocks_per_row = inter_dim / 256;
+    const int hidden_groups = ceil_div(inter_dim, 16);
+    dim3 grid_w2(ceil_div(dim, kQ2TileN), max_count, n_experts);
+    gguf_moe_grouped_w2_q2k_dp4a_kernel<<<grid_w2, block, 0, cs>>>(
+        workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, d_w2_blocks,
+        d_y_rows, routes, n_experts, max_count, dim, inter_dim, w2_blocks_per_row, hidden_groups);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 // --- Generic F16 row dequant ------------------------------------------------
 // GGUF stores `token_embd.weight` and `output.weight` as F16. The layout is
 // row-major [vocab, dim] (per-token row is contiguous), matching the FP4 path's
@@ -563,6 +864,21 @@ __global__ void f16_row_to_float_kernel(
     }
 }
 
+__global__ void f16_rows_to_float_kernel(
+    const uint16_t* matrix,
+    const int* rows,
+    float* y,
+    int count,
+    int cols) {
+    const int out_row = blockIdx.x;
+    if (out_row >= count) return;
+    const uint16_t* src = matrix + static_cast<size_t>(rows[out_row]) * cols;
+    float* dst = y + static_cast<size_t>(out_row) * cols;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        dst[c] = __half2float(__ushort_as_half(src[c]));
+    }
+}
+
 bool f16_row_to_float_cuda(
     const uint16_t* d_matrix_f16,
     float* d_y,
@@ -572,6 +888,33 @@ bool f16_row_to_float_cuda(
     if (cols <= 0) return true;
     cudaStream_t cs = static_cast<cudaStream_t>(stream);
     f16_row_to_float_kernel<<<1, 256, 0, cs>>>(d_matrix_f16, d_y, row, cols);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool f16_rows_to_float_cuda(
+    const uint16_t* d_matrix_f16,
+    const int* d_rows,
+    float* d_y,
+    int rows,
+    int cols,
+    void* stream) {
+    if (rows <= 0 || cols <= 0) return true;
+    if (d_matrix_f16 == nullptr || d_rows == nullptr || d_y == nullptr) return false;
+    cudaStream_t cs = static_cast<cudaStream_t>(stream);
+    f16_rows_to_float_kernel<<<rows, 256, 0, cs>>>(d_matrix_f16, d_rows, d_y, rows, cols);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool f16_contiguous_rows_to_float_cuda(
+    const uint16_t* d_matrix_f16,
+    float* d_y,
+    int rows,
+    int cols,
+    void* stream) {
+    if (rows <= 0 || cols <= 0) return true;
+    if (d_matrix_f16 == nullptr || d_y == nullptr) return false;
+    cudaStream_t cs = static_cast<cudaStream_t>(stream);
+    f16_row_to_float_kernel<<<rows, 256, 0, cs>>>(d_matrix_f16, d_y, 0, cols);
     return cudaGetLastError() == cudaSuccess;
 }
 

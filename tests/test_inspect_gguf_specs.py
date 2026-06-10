@@ -5,10 +5,22 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+import torch
+
 from tests.gguf_test_utils import write_gguf, write_minimax_bundle
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _cuda_gguf_ext_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    from src.kernels.cuda_loader import load_cuda_kernel
+
+    cuda_mod = load_cuda_kernel()
+    return cuda_mod is not None and hasattr(cuda_mod, "gguf_quant_gemm_forward")
 
 
 def _run_inspect(*args: str) -> subprocess.CompletedProcess[str]:
@@ -110,6 +122,56 @@ def test_inspect_minimax_check_routed_blocks(tmp_path: Path) -> None:
     assert "layer=0 role=routed_w3 type=iq2_xxs" in result.stdout
     assert "blocks_shape=(1, 1, 66)" in result.stdout
     assert "routed block check: OK" in result.stdout
+
+
+@pytest.mark.skipif(torch.cuda.is_available(), reason="negative CUDA-unavailable CLI check only runs on CPU-only hosts")
+def test_inspect_minimax_cuda_smoke_reports_missing_cuda(tmp_path: Path) -> None:
+    root = write_minimax_bundle(tmp_path / "bundle", n_layers=1, hidden=256, inter=256)
+
+    result = _run_inspect(
+        "--gguf-path",
+        str(root),
+        "--architecture",
+        "minimax-m2",
+        "--cuda-smoke-routed-blocks",
+    )
+
+    assert result.returncode == 1
+    assert "cuda routed block smoke: FAILED" in result.stdout
+    assert "CUDA is not available" in result.stdout
+
+
+@pytest.mark.skipif(not _cuda_gguf_ext_available(), reason="CUDA GGUF extension is not available")
+def test_inspect_minimax_cuda_smoke_routed_blocks(tmp_path: Path) -> None:
+    root = write_minimax_bundle(tmp_path / "bundle", n_layers=1, hidden=256, inter=256)
+
+    result = _run_inspect(
+        "--gguf-path",
+        str(root),
+        "--architecture",
+        "minimax-m2",
+        "--cuda-smoke-routed-blocks",
+        "--cuda-smoke-layer",
+        "0",
+        "--cuda-smoke-role",
+        "routed_w1",
+        "--cuda-smoke-expert",
+        "0",
+        "--cuda-smoke-expert-count",
+        "1",
+        "--cuda-smoke-tokens",
+        "2",
+        "--cuda-smoke-device",
+        "cuda:0",
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "cuda routed block smoke:" in result.stdout
+    assert "type: iq2_xxs type_id=0" in result.stdout
+    assert "blocks_shape: (256, 1, 66)" in result.stdout
+    assert "input_shape: (2, 256)" in result.stdout
+    assert "output_shape: (2, 256)" in result.stdout
+    assert "cuda routed block smoke: OK" in result.stdout
 
 
 def test_inspect_legacy_ds4_summary_and_q2_validation_still_work(tmp_path: Path) -> None:

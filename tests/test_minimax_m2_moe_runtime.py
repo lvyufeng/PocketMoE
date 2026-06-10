@@ -3,9 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import torch
 
 from src.gguf.bundle import read_gguf_bundle
-from src.runtime.minimax_m2_moe import (
+from src.moe_model.minimax_m2_moe import (
+    GGUF_DEVICE_TYPE_IDS,
+    MiniMaxM2DeviceResidentCache,
     MiniMaxM2RoutedBlockLoader,
     ROUTED_ROLES,
     build_minimax_m2_moe_runtime_plan,
@@ -14,6 +17,15 @@ from tests.gguf_test_utils import write_minimax_bundle
 
 
 REAL_MINIMAX_PATH = Path("/mnt/data1/dsv4_inference/gguf_hfd/MiniMax-M2.7-GGUF/UD-IQ1_M")
+
+
+def _cuda_gguf_ext_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    from src.kernels.cuda_loader import load_cuda_kernel
+
+    cuda_mod = load_cuda_kernel()
+    return cuda_mod is not None and hasattr(cuda_mod, "gguf_quant_gemm_forward")
 
 
 def test_minimax_moe_runtime_plan_validates_tiny_bundle(tmp_path: Path) -> None:
@@ -73,6 +85,77 @@ def test_minimax_routed_block_loader_reads_small_slice(tmp_path: Path) -> None:
             assert layer_type_name == "iq2_xxs"
             assert layer_in_dim == in_dim
             assert tuple(layer_blocks.shape) == (1, 256, 1, 66)
+
+
+
+def test_minimax_routed_layer_blocks_full_expert_shape(tmp_path: Path) -> None:
+    root = write_minimax_bundle(tmp_path / "bundle", n_layers=1, hidden=256, inter=256, experts=3)
+    bundle = read_gguf_bundle(root)
+    plan = build_minimax_m2_moe_runtime_plan(bundle)
+
+    with MiniMaxM2RoutedBlockLoader(bundle, plan=plan) as loader:
+        w1, type_name, in_dim = loader.read_layer_role_blocks(0, "routed_w1")
+        assert type_name == "iq2_xxs"
+        assert in_dim == 256
+        assert tuple(w1.shape) == (3, 256, 1, 66)
+
+        w2, type_name, in_dim = loader.read_layer_role_blocks(0, "routed_w2")
+        assert type_name == "iq2_xxs"
+        assert in_dim == 256
+        assert tuple(w2.shape) == (3, 256, 1, 66)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_minimax_device_resident_cache_loads_tiny_layer_cuda(tmp_path: Path) -> None:
+    root = write_minimax_bundle(tmp_path / "bundle", n_layers=1, hidden=256, inter=256, experts=2)
+    bundle = read_gguf_bundle(root)
+    plan = build_minimax_m2_moe_runtime_plan(bundle)
+
+    with MiniMaxM2DeviceResidentCache(bundle, plan=plan, device="cuda:0", expert_start=0, expert_count=1) as cache:
+        layer = cache.layer(0)
+        assert layer.device.type == "cuda"
+        assert layer.w1.blocks.is_cuda
+        assert layer.w1.blocks.dtype == torch.uint8
+        assert layer.w1.type_id == GGUF_DEVICE_TYPE_IDS["iq2_xxs"]
+        assert tuple(layer.w1.blocks.shape) == (1, 256, 1, 66)
+        assert tuple(layer.w2.blocks.shape) == (1, 256, 1, 66)
+        assert cache.memory_bytes() == 3 * 256 * 1 * 66
+        summary = cache.summary()
+        assert summary["cached_tensors"] == 3
+        assert summary["resident_bytes"] == cache.memory_bytes()
+
+
+@pytest.mark.skipif(not _cuda_gguf_ext_available(), reason="CUDA GGUF extension is not available")
+def test_minimax_device_resident_cache_cuda_gemm_smoke_tiny(tmp_path: Path) -> None:
+    root = write_minimax_bundle(tmp_path / "bundle", n_layers=1, hidden=256, inter=256, experts=2)
+    bundle = read_gguf_bundle(root)
+    plan = build_minimax_m2_moe_runtime_plan(bundle)
+
+    with MiniMaxM2DeviceResidentCache(bundle, plan=plan, device="cuda:0", expert_start=0, expert_count=1) as cache:
+        output, result = cache.cuda_gemm_smoke(layer=0, role="routed_w1", expert=0, tokens=2)
+
+    assert output.is_cuda
+    assert tuple(output.shape) == (2, 256)
+    assert result.finite
+    assert result.input_shape == (2, 256)
+    assert result.output_shape == (2, 256)
+    assert result.blocks_shape == (256, 1, 66)
+    assert result.type_name == "iq2_xxs"
+
+
+@pytest.mark.skipif(not (REAL_MINIMAX_PATH.exists() and _cuda_gguf_ext_available()), reason="local MiniMax-M2.7 GGUF bundle or CUDA GGUF extension not present")
+def test_real_minimax_device_resident_cache_cuda_gemm_smoke_tiny_slice() -> None:
+    bundle = read_gguf_bundle(REAL_MINIMAX_PATH)
+    plan = build_minimax_m2_moe_runtime_plan(bundle)
+
+    with MiniMaxM2DeviceResidentCache(bundle, plan=plan, device="cuda:0", expert_start=0, expert_count=1) as cache:
+        output, result = cache.cuda_gemm_smoke(layer=0, role="routed_w1", expert=0, tokens=1)
+
+    assert output.is_cuda
+    assert result.finite
+    assert result.input_shape == (1, 3072)
+    assert result.output_shape == (1, 1536)
+    assert result.blocks_shape == (1536, 12, 66)
 
 
 @pytest.mark.skipif(not REAL_MINIMAX_PATH.exists(), reason="local MiniMax-M2.7 GGUF bundle not present")

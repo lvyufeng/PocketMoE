@@ -331,7 +331,7 @@ def _print_placement_report(report: CapabilityReport) -> None:
 
 
 def _print_moe_runtime_report(bundle: GGUFBundle, *, gpu_count: int, gpu_memory_gib: float):
-    from src.runtime.minimax_m2_moe import build_minimax_m2_moe_runtime_plan
+    from src.moe_model.minimax_m2_moe import build_minimax_m2_moe_runtime_plan
 
     plan = build_minimax_m2_moe_runtime_plan(bundle, gpu_count=gpu_count, gpu_memory_gib=gpu_memory_gib)
     print("\nmoe runtime report:")
@@ -374,7 +374,7 @@ def _print_moe_runtime_report(bundle: GGUFBundle, *, gpu_count: int, gpu_memory_
 
 
 def _check_minimax_routed_blocks(bundle: GGUFBundle, *, layer_limit: int, expert: int, row_count: int) -> int:
-    from src.runtime.minimax_m2_moe import MiniMaxM2RoutedBlockLoader, ROUTED_ROLES, build_minimax_m2_moe_runtime_plan
+    from src.moe_model.minimax_m2_moe import MiniMaxM2RoutedBlockLoader, ROUTED_ROLES, build_minimax_m2_moe_runtime_plan
 
     plan = build_minimax_m2_moe_runtime_plan(bundle)
     if not plan.ok:
@@ -394,6 +394,68 @@ def _check_minimax_routed_blocks(bundle: GGUFBundle, *, layer_limit: int, expert
                 blocks, type_name, in_dim = loader.read_expert_role_blocks(layer, role, expert=int(expert), row_count=rows)
                 print(f"  layer={layer} role={role} type={type_name} in_dim={in_dim} blocks_shape={tuple(blocks.shape)}")
     print("routed block check: OK")
+    return 0
+
+
+def _cuda_smoke_minimax_routed_blocks(
+    bundle: GGUFBundle,
+    *,
+    layer: int,
+    role: str,
+    expert: int,
+    expert_count: int,
+    tokens: int,
+    device: str,
+) -> int:
+    import torch
+
+    from src.moe_model.minimax_m2_moe import MiniMaxM2DeviceResidentCache, build_minimax_m2_moe_runtime_plan
+
+    if not torch.cuda.is_available():
+        print("\ncuda routed block smoke: FAILED")
+        print("  - CUDA is not available")
+        return 1
+    plan = build_minimax_m2_moe_runtime_plan(bundle)
+    if not plan.ok:
+        print("\ncuda routed block smoke: FAILED")
+        for error in plan.errors[:20]:
+            print(f"  - {error}")
+        return 1
+    layer = int(layer)
+    expert = int(expert)
+    expert_count = int(expert_count)
+    tokens = int(tokens)
+    if expert_count <= 0:
+        print("\ncuda routed block smoke: FAILED")
+        print(f"  - expert_count must be positive, got {expert_count}")
+        return 1
+    print("\ncuda routed block smoke:")
+    print(f"  device: {device}")
+    print(f"  layer: {layer}")
+    print(f"  role: {role}")
+    print(f"  expert_range: [{expert}, {expert + expert_count})")
+    print(f"  tokens: {tokens}")
+    try:
+        with MiniMaxM2DeviceResidentCache(
+            bundle,
+            plan=plan,
+            device=device,
+            expert_start=expert,
+            expert_count=expert_count,
+        ) as cache:
+            _output, result = cache.cuda_gemm_smoke(layer=layer, role=role, expert=expert, tokens=tokens)
+            print(f"  type: {result.type_name} type_id={result.type_id}")
+            print(f"  blocks_shape: {result.blocks_shape}")
+            print(f"  input_shape: {result.input_shape}")
+            print(f"  output_shape: {result.output_shape}")
+            print(f"  output_dtype: {result.output_dtype}")
+            print(f"  finite: {result.finite}")
+            print(f"  resident_bytes: {_format_bytes(result.resident_bytes)}")
+    except Exception as exc:
+        print("cuda routed block smoke: FAILED")
+        print(f"  - {type(exc).__name__}: {exc}")
+        return 1
+    print("cuda routed block smoke: OK")
     return 0
 
 
@@ -418,6 +480,13 @@ def main() -> int:
     parser.add_argument("--check-layer-limit", type=int, default=1, help="Number of layers to sample for --check-routed-blocks")
     parser.add_argument("--check-expert", type=int, default=0, help="Expert id to sample for --check-routed-blocks")
     parser.add_argument("--check-row-count", type=int, default=1, help="Output rows to sample for --check-routed-blocks")
+    parser.add_argument("--cuda-smoke-routed-blocks", action="store_true", help="Load a small MiniMax-M2 routed expert slice to CUDA and run raw GGUF GEMM smoke")
+    parser.add_argument("--cuda-smoke-layer", type=int, default=0, help="MiniMax-M2 layer id for --cuda-smoke-routed-blocks")
+    parser.add_argument("--cuda-smoke-role", choices=["routed_w1", "routed_w2", "routed_w3"], default="routed_w1", help="Routed role for --cuda-smoke-routed-blocks")
+    parser.add_argument("--cuda-smoke-expert", type=int, default=0, help="Expert id for --cuda-smoke-routed-blocks")
+    parser.add_argument("--cuda-smoke-expert-count", type=int, default=1, help="Number of experts to load into the CUDA resident cache for smoke")
+    parser.add_argument("--cuda-smoke-tokens", type=int, default=1, help="Token rows for the raw GGUF GEMM smoke input")
+    parser.add_argument("--cuda-smoke-device", default="cuda", help="CUDA device for --cuda-smoke-routed-blocks, e.g. cuda or cuda:0")
     parser.add_argument("--gpu-count", type=int, default=4)
     parser.add_argument("--gpu-memory-gib", type=float, default=22.0)
     args = parser.parse_args()
@@ -434,6 +503,7 @@ def main() -> int:
         or args.placement_report
         or args.moe_runtime_report
         or args.check_routed_blocks
+        or args.cuda_smoke_routed_blocks
     ):
         _summarize_bundle(bundle)
     if args.list_tensors:
@@ -453,6 +523,7 @@ def main() -> int:
         or args.validate_runtime_mapping
         or args.moe_runtime_report
         or args.check_routed_blocks
+        or args.cuda_smoke_routed_blocks
     ):
         spec = detect_spec(bundle, args.architecture)
 
@@ -483,7 +554,7 @@ def main() -> int:
     if args.placement_report:
         assert report is not None
         _print_placement_report(report)
-    if args.moe_runtime_report or args.check_routed_blocks:
+    if args.moe_runtime_report or args.check_routed_blocks or args.cuda_smoke_routed_blocks:
         assert spec is not None
         if spec.architecture != "minimax-m2":
             print(
@@ -493,9 +564,11 @@ def main() -> int:
             )
             status = max(status, 1)
         else:
-            plan = _print_moe_runtime_report(bundle, gpu_count=args.gpu_count, gpu_memory_gib=args.gpu_memory_gib)
-            if not plan.ok:
-                status = max(status, 1)
+            plan = None
+            if args.moe_runtime_report or args.check_routed_blocks:
+                plan = _print_moe_runtime_report(bundle, gpu_count=args.gpu_count, gpu_memory_gib=args.gpu_memory_gib)
+                if not plan.ok:
+                    status = max(status, 1)
             if args.check_routed_blocks:
                 status = max(status, _check_minimax_routed_blocks(
                     bundle,
@@ -503,6 +576,19 @@ def main() -> int:
                     expert=args.check_expert,
                     row_count=args.check_row_count,
                 ))
+            if args.cuda_smoke_routed_blocks:
+                if plan is not None and not plan.ok:
+                    status = max(status, 1)
+                else:
+                    status = max(status, _cuda_smoke_minimax_routed_blocks(
+                        bundle,
+                        layer=args.cuda_smoke_layer,
+                        role=args.cuda_smoke_role,
+                        expert=args.cuda_smoke_expert,
+                        expert_count=args.cuda_smoke_expert_count,
+                        tokens=args.cuda_smoke_tokens,
+                        device=args.cuda_smoke_device,
+                    ))
     return status
 
 

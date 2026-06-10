@@ -100,7 +100,14 @@ def write_gguf(
     path.write_bytes(bytes(buf))
 
 
-def minimax_metadata(*, n_layers: int = 2, hidden: int = 8, vocab: int = 16, experts: int = 4) -> dict[str, Any]:
+def minimax_metadata(
+    *,
+    n_layers: int = 2,
+    hidden: int = 8,
+    vocab: int = 16,
+    experts: int = 4,
+    inter: int = 4,
+) -> dict[str, Any]:
     return {
         "general.architecture": "minimax-m2",
         "minimax-m2.block_count": n_layers,
@@ -115,16 +122,22 @@ def minimax_metadata(*, n_layers: int = 2, hidden: int = 8, vocab: int = 16, exp
         "minimax-m2.rope.freq_base": 5000000.0,
         "minimax-m2.expert_count": experts,
         "minimax-m2.expert_used_count": 2,
-        "minimax-m2.expert_feed_forward_length": 4,
+        "minimax-m2.expert_feed_forward_length": inter,
         "minimax-m2.expert_gating_func": 2,
         "minimax-m2.attention.layer_norm_rms_epsilon": 0.00001,
     }
 
 
-def minimax_tensors(*, n_layers: int = 2, hidden: int = 8, vocab: int = 16, experts: int = 4) -> list[tuple[str, tuple[int, ...], int]]:
+def minimax_tensors(
+    *,
+    n_layers: int = 2,
+    hidden: int = 8,
+    vocab: int = 16,
+    experts: int = 4,
+    inter: int = 4,
+) -> list[tuple[str, tuple[int, ...], int]]:
     q = 8
     kv = 4
-    inter = 4
     tensors: list[tuple[str, tuple[int, ...], int]] = [
         ("token_embd.weight", (hidden, vocab), GGML_Q4_K),
         ("output.weight", (hidden, vocab), GGML_Q4_K),
@@ -152,16 +165,28 @@ def minimax_tensors(*, n_layers: int = 2, hidden: int = 8, vocab: int = 16, expe
     return tensors
 
 
-def write_minimax_bundle(root: Path, *, n_layers: int = 2) -> Path:
+def write_minimax_bundle(
+    root: Path,
+    *,
+    n_layers: int = 2,
+    hidden: int = 8,
+    vocab: int = 16,
+    experts: int = 4,
+    inter: int = 4,
+) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     write_gguf(
         root / "tiny-minimax-00001-of-00002.gguf",
-        metadata={**minimax_metadata(n_layers=n_layers), "split.no": 0, "split.count": 2},
+        metadata={
+            **minimax_metadata(n_layers=n_layers, hidden=hidden, vocab=vocab, experts=experts, inter=inter),
+            "split.no": 0,
+            "split.count": 2,
+        },
         tensors=[],
     )
     write_gguf(
         root / "tiny-minimax-00002-of-00002.gguf",
         metadata={"split.no": 1, "split.count": 2},
-        tensors=minimax_tensors(n_layers=n_layers),
+        tensors=minimax_tensors(n_layers=n_layers, hidden=hidden, vocab=vocab, experts=experts, inter=inter),
     )
     return root

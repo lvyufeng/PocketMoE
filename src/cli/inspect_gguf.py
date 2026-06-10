@@ -330,6 +330,73 @@ def _print_placement_report(report: CapabilityReport) -> None:
         print(f"  [{decision.status}] {decision.name}:{est} {decision.reason}")
 
 
+def _print_moe_runtime_report(bundle: GGUFBundle, *, gpu_count: int, gpu_memory_gib: float):
+    from src.runtime.minimax_m2_moe import build_minimax_m2_moe_runtime_plan
+
+    plan = build_minimax_m2_moe_runtime_plan(bundle, gpu_count=gpu_count, gpu_memory_gib=gpu_memory_gib)
+    print("\nmoe runtime report:")
+    print(f"  architecture: {plan.architecture}")
+    print(f"  minimax_moe_runtime: {plan.status}")
+    print(f"  ok: {plan.ok}")
+    print(f"  layers: {plan.params.n_layers}")
+    print(f"  routed tensors: {plan.routed_tensor_count} / expected {plan.expected_routed_tensor_count}")
+    print(f"  moe tensors: {plan.moe_tensor_count} / expected {plan.expected_moe_tensor_count}")
+    print(f"  routed bytes: {_format_bytes(plan.routed_bytes)}")
+    print(f"  moe bytes: {_format_bytes(plan.moe_bytes)}")
+    print("  role counts:")
+    for role, count in sorted(plan.tensor_role_counts.items()):
+        print(f"    {role:16s} {count:6d} {_format_bytes(plan.bytes_by_role.get(role, 0))}")
+    print("  routed types:")
+    for type_name, count in sorted(plan.routed_type_counts.items()):
+        print(f"    {type_name:12s} {count:6d}")
+    print("  skipped/deferred dense components:")
+    skipped_by_role = Counter((item.role, item.type_name, item.reason) for item in plan.skipped_tensors)
+    for (role, type_name, reason), count in sorted(skipped_by_role.items()):
+        print(f"    [{type_name}] {role:16s} {count:6d}: {reason}")
+    print("  placements:")
+    for decision in plan.placements:
+        est = ""
+        if decision.estimated_bytes is not None:
+            est += f" total={_format_bytes(decision.estimated_bytes)}"
+        if decision.estimated_bytes_per_gpu is not None:
+            est += f" per_gpu={_format_bytes(decision.estimated_bytes_per_gpu)}"
+        print(f"    [{decision.status}] {decision.name}:{est} {decision.reason}")
+    print("  generation: deferred (MiniMax-M2 full attention/q4/q5 runtime is not implemented yet)")
+    if plan.warnings:
+        print("  warnings:")
+        for warning in plan.warnings[:20]:
+            print(f"    - {warning}")
+    if plan.errors:
+        print("  errors:")
+        for error in plan.errors[:80]:
+            print(f"    - {error}")
+    return plan
+
+
+def _check_minimax_routed_blocks(bundle: GGUFBundle, *, layer_limit: int, expert: int, row_count: int) -> int:
+    from src.runtime.minimax_m2_moe import MiniMaxM2RoutedBlockLoader, ROUTED_ROLES, build_minimax_m2_moe_runtime_plan
+
+    plan = build_minimax_m2_moe_runtime_plan(bundle)
+    if not plan.ok:
+        print("\nrouted block check: FAILED")
+        for error in plan.errors[:20]:
+            print(f"  - {error}")
+        return 1
+    layers = min(max(int(layer_limit), 0), plan.params.n_layers)
+    rows = max(int(row_count), 1)
+    print("\nrouted block check:")
+    print(f"  layers_checked: {layers}")
+    print(f"  expert: {expert}")
+    print(f"  row_count: {rows}")
+    with MiniMaxM2RoutedBlockLoader(bundle, plan=plan) as loader:
+        for layer in range(layers):
+            for role in sorted(ROUTED_ROLES):
+                blocks, type_name, in_dim = loader.read_expert_role_blocks(layer, role, expert=int(expert), row_count=rows)
+                print(f"  layer={layer} role={role} type={type_name} in_dim={in_dim} blocks_shape={tuple(blocks.shape)}")
+    print("routed block check: OK")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Inspect a GGUF file or sharded GGUF bundle without loading tensor payloads.")
     parser.add_argument("--gguf-path", required=True)
@@ -346,6 +413,11 @@ def main() -> int:
     parser.add_argument("--validate-spec", action="store_true")
     parser.add_argument("--capability-report", action="store_true")
     parser.add_argument("--placement-report", action="store_true")
+    parser.add_argument("--moe-runtime-report", action="store_true", help="Report MiniMax-M2 MoE-only runtime readiness")
+    parser.add_argument("--check-routed-blocks", action="store_true", help="Read a tiny MiniMax-M2 routed expert block slice to validate payload offsets")
+    parser.add_argument("--check-layer-limit", type=int, default=1, help="Number of layers to sample for --check-routed-blocks")
+    parser.add_argument("--check-expert", type=int, default=0, help="Expert id to sample for --check-routed-blocks")
+    parser.add_argument("--check-row-count", type=int, default=1, help="Output rows to sample for --check-routed-blocks")
     parser.add_argument("--gpu-count", type=int, default=4)
     parser.add_argument("--gpu-memory-gib", type=float, default=22.0)
     args = parser.parse_args()
@@ -354,7 +426,15 @@ def main() -> int:
         raise FileNotFoundError(args.gguf_path)
 
     bundle = read_gguf_bundle(args.gguf_path)
-    if args.summary or not (args.list_tensors or args.spec_summary or args.validate_spec or args.capability_report or args.placement_report):
+    if args.summary or not (
+        args.list_tensors
+        or args.spec_summary
+        or args.validate_spec
+        or args.capability_report
+        or args.placement_report
+        or args.moe_runtime_report
+        or args.check_routed_blocks
+    ):
         _summarize_bundle(bundle)
     if args.list_tensors:
         _print_tensors(bundle, args.limit, args.contains)
@@ -365,7 +445,15 @@ def main() -> int:
 
     spec = None
     report = None
-    if args.spec_summary or args.validate_spec or args.capability_report or args.placement_report or args.validate_runtime_mapping:
+    if (
+        args.spec_summary
+        or args.validate_spec
+        or args.capability_report
+        or args.placement_report
+        or args.validate_runtime_mapping
+        or args.moe_runtime_report
+        or args.check_routed_blocks
+    ):
         spec = detect_spec(bundle, args.architecture)
 
     if args.validate_runtime_mapping:
@@ -374,7 +462,7 @@ def main() -> int:
             print(
                 "runtime mapping: FAILED\n"
                 f"  - runtime mapping/generation is currently implemented for deepseek4 only, got {spec.architecture!r}; "
-                "use --validate-spec for header/logical tensor validation",
+                "use --validate-spec for header/logical tensor validation or --moe-runtime-report for MiniMax-M2 MoE-only readiness",
                 flush=True,
             )
             status = max(status, 1)
@@ -395,6 +483,26 @@ def main() -> int:
     if args.placement_report:
         assert report is not None
         _print_placement_report(report)
+    if args.moe_runtime_report or args.check_routed_blocks:
+        assert spec is not None
+        if spec.architecture != "minimax-m2":
+            print(
+                "\nmoe runtime report: FAILED\n"
+                f"  - MoE runtime readiness report is currently implemented for minimax-m2 only, got {spec.architecture!r}",
+                flush=True,
+            )
+            status = max(status, 1)
+        else:
+            plan = _print_moe_runtime_report(bundle, gpu_count=args.gpu_count, gpu_memory_gib=args.gpu_memory_gib)
+            if not plan.ok:
+                status = max(status, 1)
+            if args.check_routed_blocks:
+                status = max(status, _check_minimax_routed_blocks(
+                    bundle,
+                    layer_limit=args.check_layer_limit,
+                    expert=args.check_expert,
+                    row_count=args.check_row_count,
+                ))
     return status
 
 

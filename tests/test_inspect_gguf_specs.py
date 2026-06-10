@@ -64,6 +64,54 @@ def test_inspect_minimax_runtime_mapping_fails_clearly(tmp_path: Path) -> None:
     assert "--validate-spec" in result.stdout
 
 
+
+
+def test_inspect_minimax_moe_runtime_report(tmp_path: Path) -> None:
+    root = write_minimax_bundle(tmp_path / "bundle", n_layers=1)
+
+    result = _run_inspect(
+        "--gguf-path",
+        str(root),
+        "--architecture",
+        "minimax-m2",
+        "--moe-runtime-report",
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "moe runtime report:" in result.stdout
+    assert "minimax_moe_runtime: candidate" in result.stdout
+    assert "layers: 1" in result.stdout
+    assert "routed tensors: 3 / expected 3" in result.stdout
+    assert "moe tensors: 6 / expected 6" in result.stdout
+    assert "q4_k embedding/head" in result.stdout
+    assert "q5_k attention" in result.stdout
+    assert "generation: deferred" in result.stdout
+
+
+def test_inspect_minimax_check_routed_blocks(tmp_path: Path) -> None:
+    root = write_minimax_bundle(tmp_path / "bundle", n_layers=1, hidden=256, inter=256)
+
+    result = _run_inspect(
+        "--gguf-path",
+        str(root),
+        "--architecture",
+        "minimax-m2",
+        "--check-routed-blocks",
+        "--check-layer-limit",
+        "1",
+        "--check-row-count",
+        "1",
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "routed block check:" in result.stdout
+    assert "layer=0 role=routed_w1 type=iq2_xxs" in result.stdout
+    assert "layer=0 role=routed_w2 type=iq2_xxs" in result.stdout
+    assert "layer=0 role=routed_w3 type=iq2_xxs" in result.stdout
+    assert "blocks_shape=(1, 1, 66)" in result.stdout
+    assert "routed block check: OK" in result.stdout
+
+
 def test_inspect_legacy_ds4_summary_and_q2_validation_still_work(tmp_path: Path) -> None:
     path = tmp_path / "ds4-empty.gguf"
     write_gguf(

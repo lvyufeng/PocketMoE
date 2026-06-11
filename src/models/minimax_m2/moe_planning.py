@@ -4,10 +4,10 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from src.gguf.bundle import GGUFBundle
+from src.loader.gguf.bundle import GGUFBundle
 from src.models.minimax_m2.spec import MiniMaxM2Spec
-from src.models.moe.placement import HardwareProfile, heterogeneous_expert_decision, lowbit_device_resident_decision
-from src.models.moe.spec import MoEArchitectureParams, PlacementDecision
+from src.components.moe.placement import HardwareProfile, heterogeneous_expert_decision, lowbit_device_resident_decision
+from src.components.moe.spec import MoEArchitectureParams, PlacementDecision
 
 
 MINIMAX_M2_ARCHITECTURE = "minimax-m2"

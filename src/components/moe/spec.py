@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from src.gguf.bundle import GGUFBundle
+from src.loader.gguf.bundle import GGUFBundle
 
 
 @dataclass(frozen=True)

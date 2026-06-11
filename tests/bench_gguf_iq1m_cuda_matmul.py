@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.gguf.tensor_reader import GGUFTensorDataReader, get_iq1_grid_tensor
+from src.loader.gguf.tensor_reader import GGUFTensorDataReader, get_iq1_grid_tensor
 from src.kernels.cuda_loader import load_cuda_kernel
 
 DEFAULT_GGUF = "/mnt/data1/dsv4_inference/.tmp/dsv4-dynamic-iq1m-antirez.gguf"

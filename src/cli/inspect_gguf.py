@@ -5,11 +5,11 @@ import json
 import os
 from collections import Counter, defaultdict
 
-from src.gguf.bundle import GGUFBundle, read_gguf_bundle
-from src.gguf.ds4_mapping import validate_ds4_tensor_mappings
-from src.gguf.reader import GGUFArraySummary
-from src.models.moe.registry import detect_spec, known_architectures
-from src.models.moe.spec import CapabilityReport, SpecValidation
+from src.loader.gguf.bundle import GGUFBundle, read_gguf_bundle
+from src.loader.mappings.deepseek_v4 import validate_ds4_tensor_mappings
+from src.loader.gguf.reader import GGUFArraySummary
+from src.components.moe.registry import detect_spec, known_architectures
+from src.components.moe.spec import CapabilityReport, SpecValidation
 
 
 DS4_Q2_TYPES = {
@@ -375,7 +375,7 @@ def _print_moe_runtime_report(bundle: GGUFBundle, *, gpu_count: int, gpu_memory_
 
 def _check_minimax_routed_blocks(bundle: GGUFBundle, *, layer_limit: int, expert: int, row_count: int) -> int:
     from src.models.minimax_m2.moe_planning import ROUTED_ROLES, build_minimax_m2_moe_runtime_plan
-    from src.runtime.moe.minimax_m2 import MiniMaxM2RoutedBlockLoader
+    from src.models.minimax_m2.moe_runtime import MiniMaxM2RoutedBlockLoader
 
     plan = build_minimax_m2_moe_runtime_plan(bundle)
     if not plan.ok:
@@ -411,7 +411,7 @@ def _cuda_smoke_minimax_routed_blocks(
     import torch
 
     from src.models.minimax_m2.moe_planning import build_minimax_m2_moe_runtime_plan
-    from src.runtime.moe.minimax_m2 import MiniMaxM2DeviceResidentCache
+    from src.models.minimax_m2.moe_runtime import MiniMaxM2DeviceResidentCache
 
     if not torch.cuda.is_available():
         print("\ncuda routed block smoke: FAILED")

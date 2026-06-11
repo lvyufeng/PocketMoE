@@ -2,8 +2,8 @@ import time
 
 import torch
 
-from src.gguf.tensor_reader import GGUFTensorDataReader, get_iq2xxs_signed_grid_tensor
-from src.runtime.moe.cpu_backend import _apply_native_runtime_config, _load_native_mod
+from src.loader.gguf.tensor_reader import GGUFTensorDataReader, get_iq2xxs_signed_grid_tensor
+from src.components.moe.cpu_backend import _apply_native_runtime_config, _load_native_mod
 
 
 GGUF_PATH = "/mnt/data1/dsv4_inference/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf"

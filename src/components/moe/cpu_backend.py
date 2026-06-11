@@ -73,7 +73,7 @@ def _layer_imatrix_capture_enabled(layer_idx: int | None) -> bool:
     if layer_idx is None or not _env_enabled("DEEPSEEK_IMATRIX_CAPTURE"):
         return False
     try:
-        from src.gguf.imatrix import collector
+        from src.loader.gguf.imatrix import collector
 
         c = collector()
         layer = int(layer_idx)
@@ -147,6 +147,46 @@ def _load_native_mod():
         return module
     except Exception:
         return None
+
+
+def run_native_int8_loop(
+    shm_name: str,
+    w1_layers: torch.Tensor,
+    w2_layers: torch.Tensor,
+    w3_layers: torch.Tensor,
+    s1_layers: torch.Tensor,
+    s2_layers: torch.Tensor,
+    s3_layers: torch.Tensor,
+    n_layers: int,
+    dim: int,
+    topk: int,
+    inter_dim: int,
+    n_routed_experts: int,
+    output_slots: int,
+    swiglu_limit: float,
+    use_v2: bool = True,
+) -> None:
+    """Drive the persistent native int8 MoE server loop against an existing shared memory segment."""
+    native_mod = _load_native_mod()
+    loop_name = "cpu_moe_server_loop_int8_v2" if use_v2 else "cpu_moe_server_loop_int8"
+    if native_mod is None or not hasattr(native_mod, loop_name):
+        raise RuntimeError(f"native {loop_name} is unavailable")
+    getattr(native_mod, loop_name)(
+        shm_name,
+        w1_layers.data_ptr(),
+        w2_layers.data_ptr(),
+        w3_layers.data_ptr(),
+        s1_layers.data_ptr(),
+        s2_layers.data_ptr(),
+        s3_layers.data_ptr(),
+        int(n_layers),
+        int(dim),
+        int(topk),
+        int(inter_dim),
+        int(n_routed_experts),
+        int(output_slots),
+        float(swiglu_limit),
+    )
 
 
 class _PersistentWorkerTask:
@@ -1345,7 +1385,7 @@ class CPURoutedExpertsBackend:
         if cached is not None:
             return cached
         try:
-            from src.gguf.tensor_reader import get_cached_gguf_tensor_reader
+            from src.loader.gguf.tensor_reader import get_cached_gguf_tensor_reader
         except Exception:
             return None
         reader = get_cached_gguf_tensor_reader(backing.gguf_path)
@@ -1366,7 +1406,7 @@ class CPURoutedExpertsBackend:
         if self._native_mod is None or not hasattr(self._native_mod, "gguf_routes_forward"):
             return self._run_reference_forward(input_cpu, expert_ids_cpu, weights_cpu, output_cpu)
         try:
-            from src.gguf.tensor_reader import get_iq2xxs_signed_grid_tensor
+            from src.loader.gguf.tensor_reader import get_iq2xxs_signed_grid_tensor
         except Exception:
             return self._run_reference_forward(input_cpu, expert_ids_cpu, weights_cpu, output_cpu)
 
@@ -1741,8 +1781,7 @@ def start_in_process_cpu_moe_server(
         if _INPROC_SERVER is not None:
             return _INPROC_SERVER.shm_name
 
-        from src.runtime.moe.ipc import CPUMoESharedMemory
-        from src.runtime.moe.cpu_server import run_native_int8_loop
+        from src.components.moe.ipc import CPUMoESharedMemory
 
         if shm_name is None:
             shm_name = os.getenv("DEEPSEEK_CPU_MOE_SERVER_SHM", f"dsv4_cpu_moe_inproc_{os.getpid()}")

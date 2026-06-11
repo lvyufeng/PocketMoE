@@ -1,6 +1,6 @@
 from argparse import ArgumentParser
 
-from src.runtime.generation import main
+from src.models.deepseek_v4.generation import main
 
 
 def parse_args():

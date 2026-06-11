@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from src.gguf.bundle import read_gguf_bundle, resolve_gguf_bundle
+from src.loader.gguf.bundle import read_gguf_bundle, resolve_gguf_bundle
 from tests.gguf_test_utils import GGML_F32, write_gguf, write_minimax_bundle
 
 

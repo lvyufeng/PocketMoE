@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from src.gguf.bundle import GGUFBundle
-from src.models.moe.spec import MoEModelSpec
+from src.loader.gguf.bundle import GGUFBundle
+from src.components.moe.spec import MoEModelSpec
 
 
 _SPECS: dict[str, MoEModelSpec] | None = None

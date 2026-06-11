@@ -12,7 +12,7 @@ from typing import BinaryIO, Iterable
 
 import numpy as np
 
-from src.gguf.reader import GGUF_MAGIC, GGUFReader, GGML_TYPES, align_up, tensor_nbytes
+from src.loader.gguf.reader import GGUF_MAGIC, GGUFReader, GGML_TYPES, align_up, tensor_nbytes
 
 
 FP4_TABLE = np.array(

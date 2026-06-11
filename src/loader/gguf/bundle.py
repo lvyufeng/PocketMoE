@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from src.gguf.reader import GGML_TYPES, GGUFFile, GGUFReader, GGUFTensorInfo
+from src.loader.gguf.reader import GGML_TYPES, GGUFFile, GGUFReader, GGUFTensorInfo
 
 
 _SHARD_RE = re.compile(r"^(?P<prefix>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$")

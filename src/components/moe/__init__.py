@@ -1,7 +1,7 @@
 """Common MoE model spec framework."""
 
-from src.models.moe.registry import detect_spec, get_spec, known_architectures
-from src.models.moe.spec import (
+from src.components.moe.registry import detect_spec, get_spec, known_architectures
+from src.components.moe.spec import (
     CapabilityItem,
     CapabilityReport,
     MoEArchitectureParams,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from argparse import ArgumentParser
 
-from src.gguf.imatrix import merge_imatrix_files
+from src.loader.gguf.imatrix import merge_imatrix_files
 
 
 def parse_args():

@@ -13,8 +13,8 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.autograd.profiler import record_function
 
-from src.runtime.moe.cpu_backend import CPURoutedExpertsBackend, start_in_process_cpu_moe_server
-from src.runtime.moe.gpu_prefill_backend import GPUPrefillMoEBackend
+from src.components.moe.cpu_backend import CPURoutedExpertsBackend, start_in_process_cpu_moe_server
+from src.components.moe.gpu_prefill_backend import GPUPrefillMoEBackend
 from src.kernels.ops import act_quant, fp4_act_quant, fp8_gemm, fp4_gemm, sparse_attn, hc_split_sinkhorn, Packed4BitWeightAlongK, _quantize_int8_weight_torch, soft_bf16_weight_gemm_int8, soft_bf16_weight_gemm_int8_pair_cuda_ext, _SHARED_EXPERT_PAIR_INT8_CUDA, _dequant_fp4_weight_torch, soft_fp8_blockfp8_weight_dequant, q8_0_weight_gemm
 from src.kernels.cuda_loader import load_cuda_kernel
 
@@ -134,7 +134,7 @@ def _get_cpu_moe_server_shm_name() -> str:
 
 def _get_cpu_moe_server_ipc(dim: int, topk: int):
     global _cpu_moe_server_ipc, _cpu_moe_server_ipc_name
-    from src.runtime.moe.ipc import CPUMoESharedMemory
+    from src.components.moe.ipc import CPUMoESharedMemory
     name = _get_cpu_moe_server_shm_name()
     if _cpu_moe_server_ipc is None or _cpu_moe_server_ipc_name != name:
         _cpu_moe_server_ipc = CPUMoESharedMemory(name, dim, topk, create=False)
@@ -580,7 +580,7 @@ def _routed_imatrix_capture_enabled(layer_id: int | None, role: str) -> bool:
     if layer_id is None or os.getenv("DEEPSEEK_IMATRIX_CAPTURE", "0").lower() not in {"1", "true", "yes"}:
         return False
     try:
-        from src.gguf.imatrix import collector
+        from src.loader.gguf.imatrix import collector
         return collector().should_capture(int(layer_id), role)
     except Exception:
         return False
@@ -590,7 +590,7 @@ def _maybe_capture_routed_imatrix(layer_id: int | None, expert_id: int | None, r
     if not _routed_imatrix_capture_enabled(layer_id, role):
         return
     try:
-        from src.gguf.imatrix import capture_routed_expert
+        from src.loader.gguf.imatrix import capture_routed_expert
         capture_routed_expert(layer_id, expert_id, role, x)
     except Exception as exc:
         if os.getenv("DEEPSEEK_IMATRIX_VERBOSE", "0").lower() in {"1", "true", "yes"}:
@@ -1865,14 +1865,14 @@ class Expert(nn.Module):
         return None
 
     def _gguf_cuda_grid(self, device: torch.device) -> torch.Tensor:
-        from src.gguf.tensor_reader import get_iq2xxs_signed_grid_tensor
+        from src.loader.gguf.tensor_reader import get_iq2xxs_signed_grid_tensor
 
         if self._gguf_cuda_iq2_grid is None or self._gguf_cuda_iq2_grid.device != device:
             self._gguf_cuda_iq2_grid = get_iq2xxs_signed_grid_tensor().to(device=device, non_blocking=False).contiguous()
         return self._gguf_cuda_iq2_grid
 
     def _gguf_cuda_iq1_grid_tensor(self, device: torch.device) -> torch.Tensor:
-        from src.gguf.tensor_reader import get_iq1_grid_tensor
+        from src.loader.gguf.tensor_reader import get_iq1_grid_tensor
 
         if self._gguf_cuda_iq1_grid is None or self._gguf_cuda_iq1_grid.device != device:
             self._gguf_cuda_iq1_grid = get_iq1_grid_tensor().to(device=device, non_blocking=False).contiguous()
@@ -2084,8 +2084,8 @@ class Expert(nn.Module):
         if not self._gguf_fused_expert_enabled or self._gguf_raw_backing is None:
             return None
         try:
-            from src.gguf.tensor_reader import get_iq2xxs_signed_grid_tensor
-            from src.runtime.moe.cpu_backend import _load_native_mod, _apply_native_runtime_config
+            from src.loader.gguf.tensor_reader import get_iq2xxs_signed_grid_tensor
+            from src.components.moe.cpu_backend import _load_native_mod, _apply_native_runtime_config
 
             native_mod = self._gguf_native_mod
             if native_mod is None:
@@ -2156,8 +2156,8 @@ class Expert(nn.Module):
         if not self._gguf_raw_matmul_enabled or self._gguf_raw_backing is None:
             return None
         try:
-            from src.gguf.tensor_reader import get_iq2xxs_signed_grid_tensor
-            from src.runtime.moe.cpu_backend import _load_native_mod, _apply_native_runtime_config
+            from src.loader.gguf.tensor_reader import get_iq2xxs_signed_grid_tensor
+            from src.components.moe.cpu_backend import _load_native_mod, _apply_native_runtime_config
 
             native_mod = self._gguf_native_mod
             if native_mod is None:
@@ -2202,7 +2202,7 @@ class Expert(nn.Module):
     def _forward_cpu_gguf(self, x_cpu: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self._gguf_raw_backing is None:
             raise RuntimeError("GGUF raw backing is not attached")
-        from src.gguf.tensor_reader import get_cached_gguf_tensor_reader
+        from src.loader.gguf.tensor_reader import get_cached_gguf_tensor_reader
 
         profile = self._gguf_profile_enabled and self._gguf_profile_count < self._gguf_profile_limit
         # imatrix capture only *records* the w1/w3 input (x_cpu) and the w2 input
@@ -2574,7 +2574,7 @@ class Expert(nn.Module):
     def forward_cuda_gguf(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor | None:
         if self._gguf_raw_backing is None:
             return None
-        from src.gguf.tensor_reader import get_cached_gguf_tensor_reader
+        from src.loader.gguf.tensor_reader import get_cached_gguf_tensor_reader
 
         reader = get_cached_gguf_tensor_reader(self._gguf_raw_backing.gguf_path)
         return self._gguf_cuda_fused_forward(reader, x, weights)
@@ -2802,7 +2802,7 @@ class MoE(nn.Module):
         if first_expert is None:
             return
 
-        from src.gguf.tensor_reader import get_cached_gguf_tensor_reader
+        from src.loader.gguf.tensor_reader import get_cached_gguf_tensor_reader
 
         t0 = time.perf_counter() if self._gguf_layer_stage_profile else 0.0
         host_cache = self._gguf_layer_stage_host_cache
@@ -2906,7 +2906,7 @@ class MoE(nn.Module):
         if not expert_ids or not self._has_gguf_raw_experts() or device.type != "cuda":
             return 0
         try:
-            from src.gguf.tensor_reader import get_cached_gguf_tensor_reader
+            from src.loader.gguf.tensor_reader import get_cached_gguf_tensor_reader
 
             first_expert = next((expert for expert in self.experts if expert is not None and expert._gguf_raw_backing is not None), None)
             if first_expert is None:
@@ -3278,7 +3278,7 @@ class MoE(nn.Module):
                 t_ids = time.perf_counter()
 
         try:
-            from src.gguf.tensor_reader import get_cached_gguf_tensor_reader
+            from src.loader.gguf.tensor_reader import get_cached_gguf_tensor_reader
 
             first_expert = next((expert for expert in self.experts if expert is not None and expert._gguf_raw_backing is not None), None)
             if first_expert is None:
@@ -3438,7 +3438,7 @@ class MoE(nn.Module):
                 offset += count
         reader = None
         try:
-            from src.gguf.tensor_reader import get_cached_gguf_tensor_reader
+            from src.loader.gguf.tensor_reader import get_cached_gguf_tensor_reader
             first_expert = next((expert for expert in self.experts if expert is not None and expert._gguf_raw_backing is not None), None)
             if first_expert is not None:
                 reader = get_cached_gguf_tensor_reader(first_expert._gguf_raw_backing.gguf_path)
@@ -3792,7 +3792,7 @@ class MoE(nn.Module):
                 if staged_ready:
                     self.release_gguf_gpu_prefill_moe()
                 try:
-                    from src.gguf.tensor_reader import get_cached_gguf_tensor_reader
+                    from src.loader.gguf.tensor_reader import get_cached_gguf_tensor_reader
                     first_expert = next((expert for expert in self.experts if expert is not None and expert._gguf_raw_backing is not None), None)
                     if first_expert is not None:
                         reader = get_cached_gguf_tensor_reader(first_expert._gguf_raw_backing.gguf_path)
@@ -4620,7 +4620,7 @@ class Transformer(nn.Module):
         global world_size, rank, tp_world_size, tp_rank, default_dtype, scale_fmt, scale_dtype
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
-        from src.runtime.deepseek_v4.partition import (
+        from src.models.deepseek_v4.partition import (
             assert_baseline_compatible_env,
             is_layer_pp_policy,
             log_partition_layout,

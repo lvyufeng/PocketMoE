@@ -56,8 +56,8 @@ import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
 
-from src.runtime.moe.shared_weights import SharedCPUMoEWeightArena
-from src.runtime.generation import (
+from src.components.moe.shared_weights import SharedCPUMoEWeightArena
+from src.models.deepseek_v4.generation import (
     _bind_shared_cpu_moe_weights,
     _cpu_affinity_for_rank,
     _enable_numa_interleave,
@@ -110,7 +110,7 @@ def _setup_cpu_runtime(routed_experts_device: str, local_rank: int, world_size: 
         os.environ.setdefault("OMP_PROC_BIND", "spread")
     else:
         os.environ.setdefault("OMP_PROC_BIND", "close")
-    import src.runtime.moe.cpu_backend as cpu_routed_backend
+    import src.components.moe.cpu_backend as cpu_routed_backend
 
     cpu_routed_backend.configure_cpu_routed_runtime(omp_threads=cpu_threads)
     torch.set_num_threads(1)

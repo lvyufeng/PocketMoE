@@ -6,8 +6,8 @@ from typing import Any
 
 import torch
 
-from src.gguf.bundle import GGUFBundle, read_gguf_bundle
-from src.gguf.tensor_reader import GGUFTensorDataReader
+from src.loader.gguf.bundle import GGUFBundle, read_gguf_bundle
+from src.loader.gguf.tensor_reader import GGUFTensorDataReader
 from src.models.minimax_m2.moe_planning import (
     MINIMAX_M2_ARCHITECTURE,
     ROUTED_ROLES,
@@ -174,11 +174,11 @@ def _canonical_cuda_device(device: str | torch.device) -> torch.device:
 
 def _gguf_cuda_quant_grid(type_name: str, device: torch.device) -> torch.Tensor:
     if type_name == "iq2_xxs":
-        from src.gguf.tensor_reader import get_iq2xxs_signed_grid_tensor
+        from src.loader.gguf.tensor_reader import get_iq2xxs_signed_grid_tensor
 
         return get_iq2xxs_signed_grid_tensor().to(device=device, non_blocking=False).contiguous()
     if type_name == "iq1_m":
-        from src.gguf.tensor_reader import get_iq1_grid_tensor
+        from src.loader.gguf.tensor_reader import get_iq1_grid_tensor
 
         return get_iq1_grid_tensor().to(device=device, non_blocking=False).contiguous()
     return torch.empty(0, dtype=torch.int8, device=device)

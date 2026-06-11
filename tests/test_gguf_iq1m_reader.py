@@ -7,9 +7,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from src.gguf.iq1_grid import iq1_grid_i8
-from src.gguf.reader import GGUF_MAGIC, GGUFReader, align_up, tensor_nbytes
-from src.gguf.tensor_reader import GGUFTensorDataReader
+from src.loader.gguf.iq1_grid import iq1_grid_i8
+from src.loader.gguf.reader import GGUF_MAGIC, GGUFReader, align_up, tensor_nbytes
+from src.loader.gguf.tensor_reader import GGUFTensorDataReader
 
 
 ROOT = Path(__file__).resolve().parent

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.models.moe.spec import PlacementDecision
+from src.components.moe.spec import PlacementDecision
 
 
 @dataclass(frozen=True)

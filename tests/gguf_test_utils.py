@@ -4,7 +4,7 @@ import struct
 from pathlib import Path
 from typing import Any
 
-from src.gguf.reader import GGUF_MAGIC, align_up, tensor_nbytes
+from src.loader.gguf.reader import GGUF_MAGIC, align_up, tensor_nbytes
 
 GGUF_VERSION = 3
 GGML_F32 = 0

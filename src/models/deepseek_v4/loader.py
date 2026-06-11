@@ -4,11 +4,19 @@ from collections import defaultdict
 
 import torch
 
-from src.gguf.ds4_mapping import validate_ds4_tensor_mappings
-from src.gguf.reader import GGUFReader
-from src.gguf.tensor_reader import GGUFTensorDataReader
+from src.loader.mappings.deepseek_v4 import validate_ds4_tensor_mappings
+from src.loader.gguf.reader import GGUFReader
+from src.loader.gguf.tensor_reader import GGUFTensorDataReader
 from src.kernels.ops import soft_fp8_blockfp8_weight_dequant
-from src.runtime.deepseek_v4.partition import is_layer_pp_policy, shard_q8_0_blocks_for_rank, shard_tensor_for_rank
+from src.loader.safetensors import filter_file_to_keys, iter_safetensors_shards, read_safetensors_index
+from src.models.deepseek_v4.partition import (
+    checkpoint_key_is_needed_for_policy,
+    is_layer_pp_policy,
+    partition_rule_kind,
+    shard_q8_0_blocks_for_rank,
+    shard_shape_for_rank,
+    shard_tensor_for_rank,
+)
 from src.models.deepseek_v4.runtime import Transformer
 
 
@@ -101,6 +109,80 @@ def _copy_float_weight_to_target(
     if weight.shape != target.shape:
         raise ValueError(f"Shape mismatch for {key}: got {tuple(weight.shape)}, expected {tuple(target.shape)}")
     target.copy_(weight.to(device=target.device, dtype=target.dtype))
+
+
+def _dequant_fp4_to_bf16(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    assert weight.dtype in {torch.int8, torch.float4_e2m1fn_x2}, f"Expected packed FP4 storage, got {weight.dtype}"
+    raw = weight.view(torch.uint8)
+    fp4_table = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        dtype=torch.float32,
+        device=weight.device,
+    )
+    low = raw & 0x0F
+    high = (raw >> 4) & 0x0F
+    unpacked = torch.stack([fp4_table[low.long()], fp4_table[high.long()]], dim=-1).flatten(1)
+    scale_f = scale.float().repeat_interleave(32, dim=1)
+    return (unpacked * scale_f).to(torch.bfloat16)
+
+
+def _is_packed_fp4_source(tensor: torch.Tensor, scale: torch.Tensor | None, target: torch.Tensor) -> bool:
+    return (
+        tensor.ndim == 2
+        and scale is not None
+        and scale.ndim == 2
+        and target.dtype == torch.int8
+        and tensor.shape[0] == target.shape[0]
+        and tensor.shape[1] * 2 == target.shape[1]
+    )
+
+
+def _convert_fp4_to_int8(weight: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    bf16_weight = _dequant_fp4_to_bf16(weight, scale)
+    return _quantize_int8_per_row(bf16_weight)
+
+
+def _copy_quantized_weight_to_target(
+    key: str,
+    state_dict: dict[str, torch.Tensor],
+    module,
+    target: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> None:
+    if key.endswith("wo_a.weight") and hasattr(module, "n_local_groups") and hasattr(module, "o_lora_rank"):
+        n_local_groups = module.n_local_groups
+        o_lora_rank = module.o_lora_rank
+        tensor = _dequant_int8_weight(weight, scale).view(n_local_groups * o_lora_rank, -1)
+    else:
+        tensor = _dequant_int8_weight(weight, scale)
+    _copy_float_weight_to_target(key, state_dict, module, target, tensor)
+
+
+def _load_tensor_for_rank(name: str, reader, module, world_size: int, rank: int, partition_policy: str = "legacy") -> torch.Tensor | None:
+    if partition_policy == "layer_pp_4gpu":
+        return reader.get_tensor(name)
+    if not hasattr(reader, "get_slice"):
+        return shard_tensor_for_rank(name, reader.get_tensor(name), module, world_size, rank)
+
+    rule_kind = partition_rule_kind(name, module)
+    if rule_kind == "expert_owned":
+        return shard_tensor_for_rank(name, reader.get_tensor(name), module, world_size, rank)
+    if rule_kind in {"replicated_indexer", "replicated_shared_expert", "replicated_baseline"}:
+        return reader.get_tensor(name)
+
+    tensor_slice = reader.get_slice(name)
+    shape = tuple(tensor_slice.get_shape())
+    shard_dim, start, shard = shard_shape_for_rank(shape, rule_kind, world_size, rank)
+    if shard_dim is None:
+        return reader.get_tensor(name)
+    if len(shape) == 1:
+        return tensor_slice[start:start + shard].contiguous()
+    if len(shape) == 2 and shard_dim == 0:
+        return tensor_slice[start:start + shard, :].contiguous()
+    if len(shape) == 2 and shard_dim == 1:
+        return tensor_slice[:, start:start + shard].contiguous()
+    return reader.get_tensor(name)
 
 
 def _maybe_bind_routed_int8_arena(
@@ -415,3 +497,179 @@ def load_gguf_model(model: Transformer, gguf_path: str, world_size: int, rank: i
     )
     if missing:
         raise ValueError(f"Missing {len(missing)} parameters from GGUF load, e.g. {missing[:10]}")
+
+
+def load_original_hf_model(model: Transformer, ckpt_path: str, world_size: int, rank: int) -> None:
+    state_dict = model.state_dict()
+    state_keys = set(state_dict.keys())
+    name_to_module = dict(model.named_modules())
+    loaded = set()
+    index = read_safetensors_index(ckpt_path)
+
+    partition_policy = getattr(model, "partition_policy", "legacy")
+    n_layers = getattr(model, "n_layers", None)
+    filtered_file_to_keys = filter_file_to_keys(
+        index.file_to_keys,
+        lambda key: checkpoint_key_is_needed_for_policy(
+            key, state_keys, name_to_module, partition_policy, world_size, rank, n_layers
+        ),
+    )
+
+    for file_idx, total_files, file_name, keys, reader in iter_safetensors_shards(index, filtered_file_to_keys, device="cpu"):
+        print(f"load shard {file_idx}/{total_files}: {file_name}", flush=True)
+        for key in keys:
+            if key in loaded:
+                continue
+            module_name, _, _ = key.rpartition('.')
+            module = name_to_module.get(module_name)
+            if module is None:
+                continue
+
+            _maybe_bind_routed_int8_arena(key, state_dict, name_to_module)
+            _maybe_bind_routed_fp4_arena(key, state_dict, name_to_module)
+            target = state_dict[key]
+            tensor = _load_tensor_for_rank(key, reader, module, world_size, rank, partition_policy)
+            scale_key = f"{key[:-7]}.scale"
+            scale_tensor = (
+                _load_tensor_for_rank(scale_key, reader, module, world_size, rank, partition_policy)
+                if key.endswith(".weight") and scale_key in index.weight_map
+                else None
+            )
+
+            if key.endswith(".weight") and tensor.dtype == torch.int8 and target.dtype != torch.int8 and not (
+                scale_tensor is not None and scale_tensor.ndim == 2 and tensor.ndim == 2
+            ):
+                if hasattr(module, "set_preloaded_wo_a_int8") and key.endswith("wo_a.weight") and getattr(module, "wo_a_int8_enabled", False):
+                    weight = tensor
+                    scale = scale_tensor
+                    if weight is None or scale is None:
+                        continue
+                    module.set_preloaded_wo_a_int8(weight, scale)
+                    loaded.add(key)
+                    loaded.add(scale_key)
+                    continue
+                if hasattr(module, "enable_online_int8") and getattr(module, "online_int8_enabled", False):
+                    weight = tensor
+                    scale = scale_tensor
+                    if weight is None or scale is None:
+                        continue
+                    module.set_preloaded_int8(weight, scale)
+                    loaded.add(key)
+                    loaded.add(scale_key)
+                    continue
+                weight = tensor
+                scale = scale_tensor
+                if weight is None or scale is None:
+                    continue
+                _copy_quantized_weight_to_target(key, state_dict, module, target, weight, scale)
+                loaded.add(key)
+                loaded.add(scale_key)
+                continue
+
+            if key.endswith(".weight") and tensor is not None and _is_packed_fp4_source(tensor, scale_tensor, target):
+                weight = tensor
+                scale = scale_tensor
+                if weight is None or scale is None:
+                    continue
+                quant_device = _cuda_quant_device()
+                if quant_device is not None:
+                    weight = weight.to(device=quant_device, non_blocking=True)
+                    scale = scale.to(device=quant_device, non_blocking=True)
+                w_q, w_s = _convert_fp4_to_int8(weight, scale)
+                _copy_int8_weight_and_scale(key, state_dict, module, target, w_q, w_s)
+                loaded.add(key)
+                loaded.add(scale_key)
+                continue
+
+            if key.endswith("wo_a.weight") and tensor is not None and tensor.dtype == torch.float8_e4m3fn and target.dtype != torch.int8:
+                weight = tensor
+                scale = scale_tensor
+                if weight is None or scale is None:
+                    continue
+                wo_a_bf16 = soft_fp8_blockfp8_weight_dequant(weight, scale)
+                if wo_a_bf16.shape != target.shape:
+                    wo_a_bf16 = wo_a_bf16.unflatten(0, (-1, 128)).unflatten(-1, (-1, 128))
+                    wo_a_bf16 = wo_a_bf16.flatten(2, 3).flatten(0, 1)
+                if hasattr(module, "set_preloaded_wo_a_int8") and getattr(module, "wo_a_int8_enabled", False):
+                    wo_a_bf16_f = wo_a_bf16.float()
+                    row_scale = wo_a_bf16_f.abs().amax(dim=1).clamp_min(1e-6) / 127.0
+                    wo_a_q = torch.clamp(torch.round(wo_a_bf16_f / row_scale.unsqueeze(1)), -127, 127).to(torch.int8).contiguous()
+                    wo_a_s = row_scale.float().contiguous()
+                    module.set_preloaded_wo_a_int8(wo_a_q, wo_a_s)
+                else:
+                    if wo_a_bf16.shape != target.shape:
+                        raise ValueError(f"Shape mismatch for {key}: got {tuple(wo_a_bf16.shape)}, expected {tuple(target.shape)}")
+                    target.copy_(wo_a_bf16.to(device=target.device, dtype=target.dtype))
+                loaded.add(key)
+                loaded.add(scale_key)
+                continue
+
+            if key.endswith("wo_a.weight") and tensor is not None and tensor.dtype == torch.int8 and target.dtype == torch.bfloat16:
+                weight = tensor
+                scale = scale_tensor
+                if weight is None or scale is None:
+                    continue
+                wo_a_bf16 = _dequant_int8_weight(weight, scale)
+                if wo_a_bf16.shape != target.shape:
+                    wo_a_bf16 = wo_a_bf16.view(-1, target.shape[1])
+                if wo_a_bf16.shape != target.shape:
+                    raise ValueError(f"Shape mismatch for {key}: got {tuple(wo_a_bf16.shape)}, expected {tuple(target.shape)}")
+                target.copy_(wo_a_bf16.to(device=target.device, dtype=target.dtype))
+                loaded.add(key)
+                loaded.add(scale_key)
+                continue
+
+            if key.endswith(".weight") and tensor is not None and tensor.dtype == torch.float8_e4m3fn and target.dtype == torch.int8:
+                weight = tensor
+                scale = scale_tensor
+                if weight is None or scale is None:
+                    continue
+                w_bf16 = soft_fp8_blockfp8_weight_dequant(weight, scale).float()
+                w_q, w_s = _quantize_int8_per_row(w_bf16)
+                _copy_int8_weight_and_scale(key, state_dict, module, target, w_q, w_s)
+                loaded.add(key)
+                loaded.add(scale_key)
+                continue
+
+            if target.dtype == torch.float4_e2m1fn_x2:
+                weight = tensor
+                if weight is None:
+                    continue
+                target.view(torch.uint8).copy_(weight.view(torch.uint8).to(device=target.device))
+                loaded.add(key)
+                if scale_tensor is not None:
+                    scale = scale_tensor
+                    if scale is not None:
+                        _copy_scale_tensor(key, state_dict, module, scale)
+                        loaded.add(scale_key)
+                continue
+
+            if tensor is None:
+                continue
+            if tensor.shape != target.shape:
+                raise ValueError(f"Shape mismatch for {key}: got {tuple(tensor.shape)}, expected {tuple(target.shape)}")
+            target.copy_(tensor.to(device=target.device, dtype=target.dtype))
+            loaded.add(key)
+            if scale_tensor is not None and scale_key not in loaded:
+                scale = scale_tensor
+                if scale is not None:
+                    _copy_scale_tensor(key, state_dict, module, scale)
+                    loaded.add(scale_key)
+
+    loaded.update({"mtp.0.embed.weight", "mtp.0.head.weight"})
+    missing = sorted(set(state_dict.keys()) - loaded)
+    if missing:
+        raise ValueError(f"Missing {len(missing)} parameters from original HF checkpoint load, e.g. {missing[:10]}")
+
+
+def load_model(model: Transformer, ckpt_path: str, world_size: int, rank: int, ckpt_format: str = "auto") -> None:
+    resolved = ckpt_format
+    if resolved == "auto":
+        resolved = "gguf" if ckpt_path.endswith(".gguf") else "safetensors"
+    if resolved == "safetensors":
+        load_original_hf_model(model, ckpt_path, world_size, rank)
+        return
+    if resolved == "gguf":
+        load_gguf_model(model, ckpt_path, world_size, rank)
+        return
+    raise ValueError(f"Unsupported checkpoint format: {ckpt_format}")

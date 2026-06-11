@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from src.gguf.bundle import read_gguf_bundle
-from src.models.moe.registry import detect_spec, get_spec, known_architectures
+from src.loader.gguf.bundle import read_gguf_bundle
+from src.components.moe.registry import detect_spec, get_spec, known_architectures
 from tests.gguf_test_utils import write_gguf, write_minimax_bundle
 
 

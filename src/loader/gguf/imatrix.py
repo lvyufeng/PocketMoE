@@ -11,7 +11,7 @@ from typing import BinaryIO, Sequence
 import numpy as np
 import torch
 
-from src.gguf.reader import GGUF_MAGIC, align_up
+from src.loader.gguf.reader import GGUF_MAGIC, align_up
 
 
 GGUF_VERSION = 3
@@ -189,7 +189,7 @@ def merge_imatrix_files(
     merged: dict[str, _Stats] = {}
     inferred_chunk_size = chunk_size
     for path in inputs:
-        from src.gguf.tensor_reader import GGUFTensorDataReader
+        from src.loader.gguf.tensor_reader import GGUFTensorDataReader
 
         with GGUFTensorDataReader(str(path)) as reader:
             if reader.gguf.metadata.get("general.type") != "imatrix":

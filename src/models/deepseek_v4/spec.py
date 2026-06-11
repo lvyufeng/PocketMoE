@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 
-from src.gguf.bundle import GGUFBundle
-from src.models.moe.capability import capability_status_for_role
-from src.models.moe.placement import HardwareProfile, heterogeneous_expert_decision, lowbit_device_resident_decision
-from src.models.moe.spec import (
+from src.loader.gguf.bundle import GGUFBundle
+from src.components.moe.capability import capability_status_for_role
+from src.components.moe.placement import HardwareProfile, heterogeneous_expert_decision, lowbit_device_resident_decision
+from src.components.moe.spec import (
     CapabilityItem,
     CapabilityReport,
     MoEArchitectureParams,
@@ -76,7 +76,7 @@ class DeepSeekV4Spec:
         return "other"
 
     def build_tensor_mappings(self, bundle: GGUFBundle) -> list[TensorMapping]:
-        from src.gguf.ds4_mapping import build_ds4_tensor_mappings
+        from src.loader.mappings.deepseek_v4 import build_ds4_tensor_mappings
 
         mappings = []
         for item in build_ds4_tensor_mappings(bundle):

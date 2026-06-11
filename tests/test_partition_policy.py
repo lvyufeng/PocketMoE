@@ -9,7 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from src.models.deepseek_v4 import runtime as tr
-from src.runtime.deepseek_v4.partition import (
+from src.models.deepseek_v4.partition import (
     POLICY_BASELINE_4GPU,
     POLICY_LEGACY,
     assert_baseline_compatible_env,

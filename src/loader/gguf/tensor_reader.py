@@ -10,7 +10,7 @@ from typing import Iterable
 import numpy as np
 import torch
 
-from src.gguf.reader import GGUFFile, GGUFReader, GGUFTensorInfo
+from src.loader.gguf.reader import GGUFFile, GGUFReader, GGUFTensorInfo
 
 
 _GGUF_READER_PROFILE = os.getenv("DEEPSEEK_GGUF_READER_PROFILE", "0").lower() in {"1", "true", "yes"}
@@ -142,7 +142,7 @@ def get_iq2xxs_signed_grid_tensor() -> torch.Tensor:
 
 @lru_cache(maxsize=1)
 def get_iq1_grid_tensor() -> torch.Tensor:
-    from src.gguf.iq1_grid import iq1_grid_i8
+    from src.loader.gguf.iq1_grid import iq1_grid_i8
 
     return torch.from_numpy(iq1_grid_i8().copy()).contiguous().to(device="cpu")
 
@@ -522,7 +522,7 @@ class GGUFTensorDataReader:
         delta = np.where(qh_parts & 0x08 == 0, np.float32(0.125), np.float32(-0.125))
         delta = delta.reshape((n_blocks, -1, 2, 2, 1))
 
-        from src.gguf.iq1_grid import iq1_grid_i8
+        from src.loader.gguf.iq1_grid import iq1_grid_i8
 
         grid = iq1_grid_i8().astype(np.float32, copy=False)[qidx.reshape(-1)].reshape((n_blocks, -1, 2, 2, 8))
         out = (dl * (grid + delta)).reshape((rows, blocks_per_row, 256))

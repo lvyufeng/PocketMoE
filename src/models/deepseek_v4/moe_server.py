@@ -9,12 +9,11 @@ import time
 os.environ["CUDA_VISIBLE_DEVICES"] = os.getenv("DEEPSEEK_CPU_MOE_SERVER_CUDA_VISIBLE_DEVICES", "")
 
 import torch
-from safetensors import safe_open
-
-from src.runtime.moe.ipc import CPUMoESharedMemory
-from src.runtime.moe.shared_weights import SharedCPUMoEWeightArena, SharedCPUMoEWeightSet
+from src.components.moe.ipc import CPUMoESharedMemory
+from src.loader.safetensors import iter_safetensors_shards, read_safetensors_index
+from src.components.moe.shared_weights import SharedCPUMoEWeightArena, SharedCPUMoEWeightSet
 from src.models.deepseek_v4 import runtime as model_module
-from src.runtime.moe.cpu_backend import CPURoutedExpertsBackend, _load_native_mod
+from src.components.moe.cpu_backend import CPURoutedExpertsBackend, run_native_int8_loop
 from src.models.deepseek_v4.runtime import Expert, ModelArgs
 
 
@@ -110,13 +109,11 @@ def _target_for_expert(expert: Expert, proj: str, kind: str):
 
 
 def _load_routed_experts(layers: list[RoutedLayer], ckpt_path: str) -> None:
-    weight_map_path = os.path.join(ckpt_path, "model.safetensors.index.json")
-    with open(weight_map_path) as f:
-        weight_map = json.load(f)["weight_map"]
+    index = read_safetensors_index(ckpt_path)
 
     file_to_keys: dict[str, list[str]] = {}
     expected = set()
-    for key, file_name in weight_map.items():
+    for key, file_name in index.weight_map.items():
         match = _EXPERT_RE.match(key)
         if match is None:
             continue
@@ -127,28 +124,25 @@ def _load_routed_experts(layers: list[RoutedLayer], ckpt_path: str) -> None:
         expected.add(key)
 
     loaded = set()
-    total_files = len(file_to_keys)
-    for file_idx, (file_name, keys) in enumerate(file_to_keys.items(), 1):
+    for file_idx, total_files, file_name, keys, reader in iter_safetensors_shards(index, file_to_keys, device="cpu"):
         print(f"load routed shard {file_idx}/{total_files}: {file_name}", flush=True)
-        file_path = os.path.join(ckpt_path, file_name)
-        with safe_open(file_path, framework="pt", device="cpu") as f:
-            for key in keys:
-                match = _EXPERT_RE.match(key)
-                if match is None:
-                    continue
-                layer_id = int(match.group(1))
-                expert_id = int(match.group(2))
-                proj = match.group(3)
-                kind = match.group(4)
-                target = _target_for_expert(layers[layer_id].experts[expert_id], proj, kind)
-                tensor = f.get_tensor(key)
-                if kind == "weight" and target.dtype == torch.float4_e2m1fn_x2:
-                    target.view(torch.uint8).copy_(tensor.view(torch.uint8).to(device=target.device))
-                else:
-                    if tensor.shape != target.shape:
-                        raise ValueError(f"Shape mismatch for {key}: got {tuple(tensor.shape)}, expected {tuple(target.shape)}")
-                    target.copy_(tensor.to(device=target.device, dtype=target.dtype))
-                loaded.add(key)
+        for key in keys:
+            match = _EXPERT_RE.match(key)
+            if match is None:
+                continue
+            layer_id = int(match.group(1))
+            expert_id = int(match.group(2))
+            proj = match.group(3)
+            kind = match.group(4)
+            target = _target_for_expert(layers[layer_id].experts[expert_id], proj, kind)
+            tensor = reader.get_tensor(key)
+            if kind == "weight" and target.dtype == torch.float4_e2m1fn_x2:
+                target.view(torch.uint8).copy_(tensor.view(torch.uint8).to(device=target.device))
+            else:
+                if tensor.shape != target.shape:
+                    raise ValueError(f"Shape mismatch for {key}: got {tuple(tensor.shape)}, expected {tuple(target.shape)}")
+                target.copy_(tensor.to(device=target.device, dtype=target.dtype))
+            loaded.add(key)
 
     missing = sorted(expected - loaded)
     if missing:
@@ -169,55 +163,6 @@ def _shared_layer_pointer_tensor(shared_weights: SharedCPUMoEWeightSet, name: st
     for layer_id in range(shared_weights.n_layers):
         ptrs[layer_id] = per_layer_tables[layer_id].data_ptr()
     return ptrs, per_layer_tables
-
-
-def run_native_int8_loop(
-    shm_name: str,
-    w1_layers: torch.Tensor,
-    w2_layers: torch.Tensor,
-    w3_layers: torch.Tensor,
-    s1_layers: torch.Tensor,
-    s2_layers: torch.Tensor,
-    s3_layers: torch.Tensor,
-    n_layers: int,
-    dim: int,
-    topk: int,
-    inter_dim: int,
-    n_routed_experts: int,
-    output_slots: int,
-    swiglu_limit: float,
-    use_v2: bool = True,
-) -> None:
-    """Drive the persistent native CPU MoE server loop against an existing shared
-    memory segment.
-
-    The pointer tensors hold per-layer pointers to int8 routed expert weights
-    and scales (one pointer per layer; that pointer points at a ``num_experts``
-    long-tensor of pointers prepared by ``CPURoutedExpertsBackend``). The native
-    loop runs until the ``stop`` flag is set in the shm header. It releases the
-    GIL so it can be invoked from a daemon thread inside a Python process that
-    is also doing other work.
-    """
-    native_mod = _load_native_mod()
-    loop_name = "cpu_moe_server_loop_int8_v2" if use_v2 else "cpu_moe_server_loop_int8"
-    if native_mod is None or not hasattr(native_mod, loop_name):
-        raise RuntimeError(f"native {loop_name} is unavailable")
-    getattr(native_mod, loop_name)(
-        shm_name,
-        w1_layers.data_ptr(),
-        w2_layers.data_ptr(),
-        w3_layers.data_ptr(),
-        s1_layers.data_ptr(),
-        s2_layers.data_ptr(),
-        s3_layers.data_ptr(),
-        int(n_layers),
-        int(dim),
-        int(topk),
-        int(inter_dim),
-        int(n_routed_experts),
-        int(output_slots),
-        float(swiglu_limit),
-    )
 
 
 def main() -> None:
@@ -241,7 +186,7 @@ def main() -> None:
     os.environ["DEEPSEEK_CPU_TOPK_PERSISTENT"] = os.getenv("DEEPSEEK_CPU_TOPK_PERSISTENT", "0")
     os.environ.setdefault("DEEPSEEK_CPU_TOPK_PARALLEL", "0")
 
-    import src.runtime.moe.cpu_backend as cpu_routed_backend
+    import src.components.moe.cpu_backend as cpu_routed_backend
     cpu_routed_backend.configure_cpu_routed_runtime(omp_threads=shard_threads)
     torch.set_num_threads(1)
     torch.set_default_dtype(torch.bfloat16)

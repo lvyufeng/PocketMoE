@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import os
-from typing import Iterable, Iterator
+from typing import Iterator
 
 from safetensors import safe_open
 

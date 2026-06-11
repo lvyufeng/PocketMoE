@@ -3,9 +3,9 @@ from __future__ import annotations
 from collections import Counter
 
 from src.gguf.bundle import GGUFBundle
-from src.moe_model.capability import capability_status_for_role
-from src.moe_model.placement import HardwareProfile, heterogeneous_expert_decision, lowbit_device_resident_decision
-from src.moe_model.spec import (
+from src.models.moe.capability import capability_status_for_role
+from src.models.moe.placement import HardwareProfile, heterogeneous_expert_decision, lowbit_device_resident_decision
+from src.models.moe.spec import (
     CapabilityItem,
     CapabilityReport,
     MoEArchitectureParams,

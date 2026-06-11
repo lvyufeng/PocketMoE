@@ -40,7 +40,7 @@ DEEPSEEK_CPU_MOE_CPP_LOOP_V2="${DEEPSEEK_CPU_MOE_CPP_LOOP_V2:-1}" \
 DEEPSEEK_CPU_MOE_NUMA_INTERLEAVE="${DEEPSEEK_CPU_MOE_NUMA_INTERLEAVE:-1}" \
 OMP_PROC_BIND="${OMP_PROC_BIND:-spread}" \
 PYTHONPATH="$REPO_ROOT" \
-"$PYTHON" -m src.moe.cpu_server \
+"$PYTHON" -m src.runtime.moe.cpu_server \
   --ckpt-path "$CKPT_PATH" \
   --config "$CONFIG" \
   --shm-name "$SHM_NAME" \
@@ -50,7 +50,7 @@ server_pid=$!
 
 cleanup() {
   PYTHONPATH="$REPO_ROOT" "$PYTHON" - <<PY || true
-from src.moe.ipc import CPUMoESharedMemory
+from src.runtime.moe.ipc import CPUMoESharedMemory
 try:
     shm = CPUMoESharedMemory('$SHM_NAME', 7168, 6, create=False)
     req, resp, layer, _stop = shm.read_header()

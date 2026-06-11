@@ -15,7 +15,7 @@ import torch
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 from src.kernels.cuda_loader import load_cuda_kernel  # noqa: E402
 from src.kernels.ops import act_quant  # noqa: E402
-from src.runtime.transformer import apply_rotary_emb, precompute_freqs_cis, RMSNorm  # noqa: E402
+from src.models.deepseek_v4.runtime import apply_rotary_emb, precompute_freqs_cis, RMSNorm  # noqa: E402
 
 
 def make_freqs(seqlen: int, rd: int, device):

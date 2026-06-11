@@ -13,7 +13,7 @@ from src.kernels.cuda_loader import load_cuda_kernel
 from src.kernels.ops import Packed4BitWeightAlongK, _dequant_fp4_weight_torch, _quantize_int8_weight_torch
 
 
-_EXT_DIR = Path(__file__).resolve().parents[2] / "build" / "extensions"
+_EXT_DIR = Path(__file__).resolve().parents[3] / "build" / "extensions"
 _EXT_PATH = _EXT_DIR / "deepseek_cpu_moe_ext.so"
 _NATIVE_MOD = None
 _RUNTIME_OMP_THREADS: int | None = None
@@ -1741,8 +1741,8 @@ def start_in_process_cpu_moe_server(
         if _INPROC_SERVER is not None:
             return _INPROC_SERVER.shm_name
 
-        from src.moe.ipc import CPUMoESharedMemory
-        from src.moe.cpu_server import run_native_int8_loop
+        from src.runtime.moe.ipc import CPUMoESharedMemory
+        from src.runtime.moe.cpu_server import run_native_int8_loop
 
         if shm_name is None:
             shm_name = os.getenv("DEEPSEEK_CPU_MOE_SERVER_SHM", f"dsv4_cpu_moe_inproc_{os.getpid()}")

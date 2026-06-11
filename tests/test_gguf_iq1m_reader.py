@@ -109,7 +109,7 @@ def test_iq1m_reader_decodes_routed_expert_and_raw_blocks(tmp_path: Path) -> Non
 def test_gguf_type_helper_never_maps_iq1m_to_q2k() -> None:
     # IQ1_M now has its own CUDA/native type id and must never be silently
     # treated as Q2_K (type id 1).
-    from src.runtime.transformer import Expert
+    from src.models.deepseek_v4.runtime import Expert
 
     expert = Expert.__new__(Expert)
     assert expert._gguf_type_id("iq2_xxs") == 0

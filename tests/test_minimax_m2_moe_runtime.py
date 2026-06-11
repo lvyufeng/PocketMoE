@@ -6,12 +6,11 @@ import pytest
 import torch
 
 from src.gguf.bundle import read_gguf_bundle
-from src.moe_model.minimax_m2_moe import (
+from src.models.minimax_m2.moe_planning import ROUTED_ROLES, build_minimax_m2_moe_runtime_plan
+from src.runtime.moe.minimax_m2 import (
     GGUF_DEVICE_TYPE_IDS,
     MiniMaxM2DeviceResidentCache,
     MiniMaxM2RoutedBlockLoader,
-    ROUTED_ROLES,
-    build_minimax_m2_moe_runtime_plan,
 )
 from tests.gguf_test_utils import write_minimax_bundle
 

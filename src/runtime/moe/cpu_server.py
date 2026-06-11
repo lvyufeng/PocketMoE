@@ -11,11 +11,11 @@ os.environ["CUDA_VISIBLE_DEVICES"] = os.getenv("DEEPSEEK_CPU_MOE_SERVER_CUDA_VIS
 import torch
 from safetensors import safe_open
 
-from src.moe.ipc import CPUMoESharedMemory
-from src.moe.shared_weights import SharedCPUMoEWeightArena, SharedCPUMoEWeightSet
-from src.models.deepseek_v4 import transformer as model_module
-from src.moe.cpu_backend import CPURoutedExpertsBackend, _load_native_mod
-from src.models.deepseek_v4.transformer import Expert, ModelArgs
+from src.runtime.moe.ipc import CPUMoESharedMemory
+from src.runtime.moe.shared_weights import SharedCPUMoEWeightArena, SharedCPUMoEWeightSet
+from src.models.deepseek_v4 import runtime as model_module
+from src.runtime.moe.cpu_backend import CPURoutedExpertsBackend, _load_native_mod
+from src.models.deepseek_v4.runtime import Expert, ModelArgs
 
 
 def _env_enabled(name: str) -> bool:
@@ -241,7 +241,7 @@ def main() -> None:
     os.environ["DEEPSEEK_CPU_TOPK_PERSISTENT"] = os.getenv("DEEPSEEK_CPU_TOPK_PERSISTENT", "0")
     os.environ.setdefault("DEEPSEEK_CPU_TOPK_PARALLEL", "0")
 
-    import src.moe.cpu_backend as cpu_routed_backend
+    import src.runtime.moe.cpu_backend as cpu_routed_backend
     cpu_routed_backend.configure_cpu_routed_runtime(omp_threads=shard_threads)
     torch.set_num_threads(1)
     torch.set_default_dtype(torch.bfloat16)

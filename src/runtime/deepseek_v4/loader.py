@@ -8,8 +8,8 @@ from src.gguf.ds4_mapping import validate_ds4_tensor_mappings
 from src.gguf.reader import GGUFReader
 from src.gguf.tensor_reader import GGUFTensorDataReader
 from src.kernels.ops import soft_fp8_blockfp8_weight_dequant
-from src.models.deepseek_v4.partition_policy import is_layer_pp_policy, shard_q8_0_blocks_for_rank, shard_tensor_for_rank
-from src.models.deepseek_v4.transformer import Transformer
+from src.runtime.deepseek_v4.partition import is_layer_pp_policy, shard_q8_0_blocks_for_rank, shard_tensor_for_rank
+from src.models.deepseek_v4.runtime import Transformer
 
 
 _ROUTED_ORIGINAL_FORMAT_ROLES = {"routed_w1", "routed_w2", "routed_w3"}

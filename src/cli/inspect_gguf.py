@@ -8,8 +8,8 @@ from collections import Counter, defaultdict
 from src.gguf.bundle import GGUFBundle, read_gguf_bundle
 from src.gguf.ds4_mapping import validate_ds4_tensor_mappings
 from src.gguf.reader import GGUFArraySummary
-from src.moe_model.registry import detect_spec, known_architectures
-from src.moe_model.spec import CapabilityReport, SpecValidation
+from src.models.moe.registry import detect_spec, known_architectures
+from src.models.moe.spec import CapabilityReport, SpecValidation
 
 
 DS4_Q2_TYPES = {
@@ -217,7 +217,7 @@ def _validate_ds4_q2(ds4) -> int:
 def _runtime_state_shapes(config_path: str, routed_experts_device: str) -> dict[str, tuple[int, ...]]:
     import torch
 
-    from src.models.deepseek_v4.transformer import ModelArgs, Transformer
+    from src.models.deepseek_v4.runtime import ModelArgs, Transformer
 
     with open(config_path) as f:
         config_data = json.load(f)
@@ -331,7 +331,7 @@ def _print_placement_report(report: CapabilityReport) -> None:
 
 
 def _print_moe_runtime_report(bundle: GGUFBundle, *, gpu_count: int, gpu_memory_gib: float):
-    from src.moe_model.minimax_m2_moe import build_minimax_m2_moe_runtime_plan
+    from src.models.minimax_m2.moe_planning import build_minimax_m2_moe_runtime_plan
 
     plan = build_minimax_m2_moe_runtime_plan(bundle, gpu_count=gpu_count, gpu_memory_gib=gpu_memory_gib)
     print("\nmoe runtime report:")
@@ -374,7 +374,8 @@ def _print_moe_runtime_report(bundle: GGUFBundle, *, gpu_count: int, gpu_memory_
 
 
 def _check_minimax_routed_blocks(bundle: GGUFBundle, *, layer_limit: int, expert: int, row_count: int) -> int:
-    from src.moe_model.minimax_m2_moe import MiniMaxM2RoutedBlockLoader, ROUTED_ROLES, build_minimax_m2_moe_runtime_plan
+    from src.models.minimax_m2.moe_planning import ROUTED_ROLES, build_minimax_m2_moe_runtime_plan
+    from src.runtime.moe.minimax_m2 import MiniMaxM2RoutedBlockLoader
 
     plan = build_minimax_m2_moe_runtime_plan(bundle)
     if not plan.ok:
@@ -409,7 +410,8 @@ def _cuda_smoke_minimax_routed_blocks(
 ) -> int:
     import torch
 
-    from src.moe_model.minimax_m2_moe import MiniMaxM2DeviceResidentCache, build_minimax_m2_moe_runtime_plan
+    from src.models.minimax_m2.moe_planning import build_minimax_m2_moe_runtime_plan
+    from src.runtime.moe.minimax_m2 import MiniMaxM2DeviceResidentCache
 
     if not torch.cuda.is_available():
         print("\ncuda routed block smoke: FAILED")

@@ -65,7 +65,7 @@ start_external_server() {
     DEEPSEEK_CPU_MOE_NUMA_INTERLEAVE="${DEEPSEEK_CPU_MOE_NUMA_INTERLEAVE:-1}" \
     OMP_PROC_BIND="${OMP_PROC_BIND:-spread}" \
     PYTHONPATH="$REPO_ROOT" \
-    "$PYTHON" -m src.moe.cpu_server \
+    "$PYTHON" -m src.runtime.moe.cpu_server \
       --ckpt-path "$CKPT_PATH" \
       --config "$CONFIG" \
       --shm-name "$DEEPSEEK_CPU_MOE_SERVER_SHM" \

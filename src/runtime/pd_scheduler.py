@@ -229,7 +229,7 @@ class PDScheduler:
                 self._current_runtime_threads = max(1, int(omp_env))
                 os.environ["OMP_NUM_THREADS"] = str(self._current_runtime_threads)
                 try:
-                    import src.moe.cpu_backend as cpu_routed_backend
+                    import src.runtime.moe.cpu_backend as cpu_routed_backend
                     cpu_routed_backend.configure_cpu_routed_runtime(omp_threads=self._current_runtime_threads)
                 except Exception:
                     pass

@@ -90,12 +90,12 @@ def is_replicated_c4_indexer_param(name: str, module) -> bool:
 
 
 def is_column_parallel(module) -> bool:
-    from src.models.deepseek_v4.transformer import ColumnParallelLinear, ParallelEmbedding, ParallelHead
+    from src.models.deepseek_v4.runtime import ColumnParallelLinear, ParallelEmbedding, ParallelHead
     return isinstance(module, (ParallelEmbedding, ParallelHead, ColumnParallelLinear))
 
 
 def is_row_parallel(module) -> bool:
-    from src.models.deepseek_v4.transformer import RowParallelLinear
+    from src.models.deepseek_v4.runtime import RowParallelLinear
     return isinstance(module, RowParallelLinear)
 
 
@@ -108,7 +108,7 @@ def partition_rule_kind(name: str, module) -> str:
         return "column_parallel"
     if is_row_parallel(module):
         return "row_parallel"
-    from src.models.deepseek_v4.transformer import Attention
+    from src.models.deepseek_v4.runtime import Attention
     if isinstance(module, Attention) and name.endswith("attn_sink"):
         return "attn_sink"
     if "shared_experts" in name:
@@ -143,7 +143,7 @@ def shard_shape_for_rank(shape: tuple[int, ...], rule_kind: str, world_size: int
 
 
 def _attn_sink_shard(name: str, tensor: torch.Tensor, module, world_size: int, rank: int) -> torch.Tensor:
-    from src.models.deepseek_v4.transformer import Attention
+    from src.models.deepseek_v4.runtime import Attention
     if not (isinstance(module, Attention) and name.endswith("attn_sink")):
         return tensor
     assert tensor.size(0) % world_size == 0, f"{name} not divisible on dim 0"

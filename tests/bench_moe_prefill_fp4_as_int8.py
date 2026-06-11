@@ -7,7 +7,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import torch
 
 from src.kernels.cuda_loader import load_cuda_kernel
-from src.moe.cpu_backend import _quantize_int8_weight_torch
+from src.runtime.moe.cpu_backend import _quantize_int8_weight_torch
 from tests.bench_moe_prefill_fp4_grouped import _group_routes, _benchmark_cuda
 from tests.test_moe_single_token_fp4 import _dequant_fp4, _make_random_fp4
 from tests.bench_moe_single_token_fp4 import _make_int8_experts

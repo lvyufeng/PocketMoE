@@ -12,20 +12,20 @@ import torch.distributed as dist
 from transformers import AutoTokenizer
 from safetensors import safe_open
 
-from src.moe.shared_weights import SharedCPUMoEWeightArena
+from src.runtime.moe.shared_weights import SharedCPUMoEWeightArena
 from src.runtime.prefix_snapshot import PrefixSnapshotCache
-from src.models.deepseek_v4.partition_policy import (
+from src.runtime.deepseek_v4.partition import (
     checkpoint_key_is_needed_for_policy,
     partition_rule_kind,
     shard_shape_for_rank,
     shard_tensor_for_rank,
 )
-from src.models.deepseek_v4.transformer import (
+from src.models.deepseek_v4.runtime import (
     Transformer,
     ModelArgs,
 )
 from src.kernels.ops import soft_fp8_blockfp8_weight_dequant
-from src.models.deepseek_v4.gguf_loader import load_gguf_model
+from src.runtime.deepseek_v4.loader import load_gguf_model
 from src.encoding.dsv4 import encode_messages, parse_message_from_completion_text
 
 
@@ -1489,7 +1489,7 @@ def main(
             os.environ.setdefault("OMP_PROC_BIND", "spread")
         else:
             os.environ.setdefault("OMP_PROC_BIND", "close")
-        import src.moe.cpu_backend as cpu_routed_backend
+        import src.runtime.moe.cpu_backend as cpu_routed_backend
         cpu_routed_backend.configure_cpu_routed_runtime(omp_threads=cpu_threads)
         torch.set_num_threads(1)
     else:

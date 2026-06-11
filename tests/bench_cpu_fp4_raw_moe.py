@@ -8,8 +8,8 @@ sys.path.insert(0, str(REPO_ROOT))
 import torch
 
 from src.kernels.ops import Packed4BitWeightAlongK
-from src.moe.cpu_backend import _load_native_mod
-from src.runtime.transformer import _pack_fp4_weight_rows_for_tile_decode, fp4_block_size
+from src.runtime.moe.cpu_backend import _load_native_mod
+from src.models.deepseek_v4.runtime import _pack_fp4_weight_rows_for_tile_decode, fp4_block_size
 
 
 def _raw_to_fp4(raw: torch.Tensor) -> torch.Tensor:

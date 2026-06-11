@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 from src.gguf.bundle import GGUFBundle
-from src.moe_model.spec import MoEModelSpec
+from src.models.moe.spec import MoEModelSpec
 
 
 _SPECS: dict[str, MoEModelSpec] | None = None
 
 
 def _init_specs() -> dict[str, MoEModelSpec]:
-    from src.moe_model.ds4_spec import DeepSeekV4Spec
-    from src.moe_model.minimax_m2_spec import MiniMaxM2Spec
+    from src.models.deepseek_v4.spec import DeepSeekV4Spec
+    from src.models.minimax_m2.spec import MiniMaxM2Spec
 
     return {
         DeepSeekV4Spec.architecture: DeepSeekV4Spec(),

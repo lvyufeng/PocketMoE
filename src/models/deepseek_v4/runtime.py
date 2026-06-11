@@ -13,8 +13,8 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.autograd.profiler import record_function
 
-from src.moe.cpu_backend import CPURoutedExpertsBackend, start_in_process_cpu_moe_server
-from src.moe.gpu_prefill_backend import GPUPrefillMoEBackend
+from src.runtime.moe.cpu_backend import CPURoutedExpertsBackend, start_in_process_cpu_moe_server
+from src.runtime.moe.gpu_prefill_backend import GPUPrefillMoEBackend
 from src.kernels.ops import act_quant, fp4_act_quant, fp8_gemm, fp4_gemm, sparse_attn, hc_split_sinkhorn, Packed4BitWeightAlongK, _quantize_int8_weight_torch, soft_bf16_weight_gemm_int8, soft_bf16_weight_gemm_int8_pair_cuda_ext, _SHARED_EXPERT_PAIR_INT8_CUDA, _dequant_fp4_weight_torch, soft_fp8_blockfp8_weight_dequant, q8_0_weight_gemm
 from src.kernels.cuda_loader import load_cuda_kernel
 
@@ -134,7 +134,7 @@ def _get_cpu_moe_server_shm_name() -> str:
 
 def _get_cpu_moe_server_ipc(dim: int, topk: int):
     global _cpu_moe_server_ipc, _cpu_moe_server_ipc_name
-    from src.moe.ipc import CPUMoESharedMemory
+    from src.runtime.moe.ipc import CPUMoESharedMemory
     name = _get_cpu_moe_server_shm_name()
     if _cpu_moe_server_ipc is None or _cpu_moe_server_ipc_name != name:
         _cpu_moe_server_ipc = CPUMoESharedMemory(name, dim, topk, create=False)
@@ -2085,7 +2085,7 @@ class Expert(nn.Module):
             return None
         try:
             from src.gguf.tensor_reader import get_iq2xxs_signed_grid_tensor
-            from src.moe.cpu_backend import _load_native_mod, _apply_native_runtime_config
+            from src.runtime.moe.cpu_backend import _load_native_mod, _apply_native_runtime_config
 
             native_mod = self._gguf_native_mod
             if native_mod is None:
@@ -2157,7 +2157,7 @@ class Expert(nn.Module):
             return None
         try:
             from src.gguf.tensor_reader import get_iq2xxs_signed_grid_tensor
-            from src.moe.cpu_backend import _load_native_mod, _apply_native_runtime_config
+            from src.runtime.moe.cpu_backend import _load_native_mod, _apply_native_runtime_config
 
             native_mod = self._gguf_native_mod
             if native_mod is None:
@@ -4620,7 +4620,7 @@ class Transformer(nn.Module):
         global world_size, rank, tp_world_size, tp_rank, default_dtype, scale_fmt, scale_dtype
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
-        from src.models.deepseek_v4.partition_policy import (
+        from src.runtime.deepseek_v4.partition import (
             assert_baseline_compatible_env,
             is_layer_pp_policy,
             log_partition_layout,

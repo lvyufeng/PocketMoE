@@ -8,7 +8,7 @@ from src.gguf.tensor_reader import GGUFTensorDataReader
 
 def test_layer_capture_helper_respects_collector_filters(monkeypatch) -> None:
     import src.gguf.imatrix as imatrix
-    from src.moe.cpu_backend import _layer_imatrix_capture_enabled
+    from src.runtime.moe.cpu_backend import _layer_imatrix_capture_enabled
 
     monkeypatch.setenv("DEEPSEEK_IMATRIX_CAPTURE", "1")
     monkeypatch.setenv("DEEPSEEK_IMATRIX_LAYERS", "0")

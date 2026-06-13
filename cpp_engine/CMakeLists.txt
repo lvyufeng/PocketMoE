@@ -54,6 +54,7 @@ add_library(dsv4_cpp_core STATIC
     cuda/q2_ops.cu
     cuda/iq1_ops.cu
     cuda/rmsnorm_rope.cu
+    cuda/flashmemory_ops.cu
 )
 
 target_include_directories(dsv4_cpp_core PUBLIC
@@ -91,6 +92,10 @@ set_target_properties(test_gguf_iq1m_reader PROPERTIES RUNTIME_OUTPUT_DIRECTORY 
 add_executable(test_safetensors_reader tests/test_safetensors_reader.cpp)
 target_link_libraries(test_safetensors_reader PRIVATE dsv4_cpp_core)
 set_target_properties(test_safetensors_reader PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_flashmemory_scorer tests/test_flashmemory_scorer.cpp)
+target_link_libraries(test_flashmemory_scorer PRIVATE dsv4_cpp_core)
+set_target_properties(test_flashmemory_scorer PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_safetensors_model tests/test_safetensors_model.cpp)
 target_link_libraries(test_safetensors_model PRIVATE dsv4_cpp_core)

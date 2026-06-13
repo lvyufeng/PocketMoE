@@ -25,6 +25,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
+#include <map>
+#include <fstream>
 #include <vector>
 
 namespace dsv4 {
@@ -54,6 +56,89 @@ const std::string& check_safetensors_path(const std::string& dir) {
     }
     return dir;
 }
+
+std::string shape_to_string(const std::vector<uint64_t>& shape) {
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i) oss << ",";
+        oss << shape[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+
+bool flashmemory_dtype_allowed(SafeDType dtype) {
+    return dtype == SafeDType::F32 || dtype == SafeDType::BF16 || dtype == SafeDType::F16;
+}
+
+struct FlashMemoryPluginMetadata {
+    std::vector<std::string> layers;
+    int n_heads = 128;
+    int head_dim = 128;
+    int q_lora_rank = 2048;
+    int hidden_dim = 4096;
+    int rope_dim = 64;
+    uint64_t total_weight_bytes = 0;
+};
+
+FlashMemoryPluginMetadata inspect_flashmemory_checkpoint_metadata(const std::string& ckpt_path) {
+    SafeTensorsShard shard(ckpt_path);
+    std::map<std::string, std::vector<std::string>> by_layer;
+    const std::string prefix = "retrievers.";
+    for (const auto& [name, info] : shard.tensors()) {
+        if (name.rfind(prefix, 0) != 0) continue;
+        const size_t layer_start = prefix.size();
+        const size_t dot = name.find('.', layer_start);
+        if (dot == std::string::npos || dot == layer_start) continue;
+        const std::string layer = name.substr(layer_start, dot - layer_start);
+        by_layer[layer].push_back(name.substr(dot + 1));
+    }
+    if (by_layer.empty()) {
+        throw std::runtime_error("FlashMemory plugin checkpoint is not in retrievers.l{ID}.* format: " + ckpt_path);
+    }
+
+    FlashMemoryPluginMetadata meta;
+    const std::vector<std::string> required = {
+        "wq_a.weight",
+        "wq_b.weight",
+        "q_norm_weight",
+        "weights_proj.weight",
+    };
+    auto require_info = [&](const std::string& tensor) -> const SafeTensorInfo& {
+        const SafeTensorInfo* info = shard.find_tensor(tensor);
+        if (info == nullptr) throw std::runtime_error("FlashMemory plugin missing tensor: " + tensor);
+        if (!flashmemory_dtype_allowed(info->dtype)) {
+            throw std::runtime_error("FlashMemory plugin unsupported dtype for " + tensor + ": " + safe_dtype_name(info->dtype));
+        }
+        return *info;
+    };
+    auto require_shape = [&](const SafeTensorInfo& info, const std::vector<uint64_t>& expected) {
+        if (info.shape != expected) {
+            throw std::runtime_error("FlashMemory plugin tensor shape mismatch for " + info.name +
+                                     ": got " + shape_to_string(info.shape) +
+                                     " expected " + shape_to_string(expected));
+        }
+        meta.total_weight_bytes += info.nbytes;
+    };
+
+    for (const auto& [layer, _names] : by_layer) {
+        for (const std::string& suffix : required) {
+            (void)require_info("retrievers." + layer + "." + suffix);
+        }
+        const auto& wq_a = require_info("retrievers." + layer + ".wq_a.weight");
+        const auto& wq_b = require_info("retrievers." + layer + ".wq_b.weight");
+        const auto& q_norm = require_info("retrievers." + layer + ".q_norm_weight");
+        const auto& weights_proj = require_info("retrievers." + layer + ".weights_proj.weight");
+        require_shape(wq_a, {static_cast<uint64_t>(meta.q_lora_rank), static_cast<uint64_t>(meta.hidden_dim)});
+        require_shape(wq_b, {static_cast<uint64_t>(meta.n_heads * meta.head_dim), static_cast<uint64_t>(meta.q_lora_rank)});
+        require_shape(q_norm, {static_cast<uint64_t>(meta.q_lora_rank)});
+        require_shape(weights_proj, {static_cast<uint64_t>(meta.n_heads), static_cast<uint64_t>(meta.hidden_dim)});
+        meta.layers.push_back(layer);
+    }
+    return meta;
+}
+
 
 struct Fp4Handle {
     SafeTensorsShard shard;
@@ -6692,6 +6777,16 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     const int gguf_kv_swap_validate = env_int_or_default("DSV4_GGUF_KV_SWAP_VALIDATE", 0);
     const bool gguf_kv_swap_test_allow_topk_reduction =
         env_int_or_default("DSV4_GGUF_KV_SWAP_TEST_ALLOW_TOPK_REDUCTION", 0) != 0;
+    const bool gguf_flashmemory_plugin = env_int_or_default("DSV4_GGUF_FLASHMEMORY_PLUGIN", 0) != 0;
+    const int gguf_flashmemory_metadata_only = env_int_or_default("DSV4_GGUF_FLASHMEMORY_METADATA_ONLY", 1);
+    const char* gguf_flashmemory_ckpt_env = std::getenv("DSV4_GGUF_FLASHMEMORY_CKPT");
+    const std::string gguf_flashmemory_ckpt = gguf_flashmemory_ckpt_env == nullptr ? std::string() : std::string(gguf_flashmemory_ckpt_env);
+    if (gguf_flashmemory_plugin && gguf_flashmemory_metadata_only != 0 && gguf_flashmemory_metadata_only != 1)
+        throw std::runtime_error("DSV4_GGUF_FLASHMEMORY_METADATA_ONLY must be 0 or 1");
+    if (gguf_flashmemory_plugin && gguf_flashmemory_ckpt.empty())
+        throw std::runtime_error("DSV4_GGUF_FLASHMEMORY_PLUGIN requires DSV4_GGUF_FLASHMEMORY_CKPT=/path/flashmemory_ds_v4.safetensors");
+    if (gguf_flashmemory_plugin && gguf_flashmemory_metadata_only == 0)
+        throw std::runtime_error("FlashMemory retriever runtime scoring is not wired yet; use DSV4_GGUF_FLASHMEMORY_METADATA_ONLY=1 for the paper-reproduction plugin skeleton");
     if (gguf_kv_swap_requested && !gguf_sparse_compressor)
         throw std::runtime_error("DSV4_GGUF_KV_SWAP requires DSV4_GGUF_SPARSE_COMPRESSOR=1");
     if (gguf_kv_swap_requested && gguf_kv_swap_pinned_mib <= 0)
@@ -6715,6 +6810,27 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         throw std::runtime_error("DSV4_GGUF_SPARSE_WINDOW must be > 0");
     if (gguf_sparse_compressor && (gguf_sparse_attn_threshold < 0 || gguf_sparse_attn_threshold > gguf_sparse_window))
         throw std::runtime_error("DSV4_GGUF_SPARSE_ATTN_THRESHOLD must be in [0, DSV4_GGUF_SPARSE_WINDOW]");
+    if (gguf_flashmemory_plugin) {
+        FlashMemoryPluginMetadata fm = inspect_flashmemory_checkpoint_metadata(gguf_flashmemory_ckpt);
+        if (tp_rank == 0) {
+            std::ostringstream layers;
+            for (size_t i = 0; i < fm.layers.size(); ++i) {
+                if (i) layers << ",";
+                layers << fm.layers[i];
+            }
+            std::cout << "gguf_flashmemory_plugin=1 metadata_only=1"
+                      << " ckpt=" << gguf_flashmemory_ckpt
+                      << " layers=" << layers.str()
+                      << " n_heads=" << fm.n_heads
+                      << " head_dim=" << fm.head_dim
+                      << " q_lora_rank=" << fm.q_lora_rank
+                      << " hidden_dim=" << fm.hidden_dim
+                      << " rope_dim=" << fm.rope_dim
+                      << " weight_mib=" << (static_cast<double>(fm.total_weight_bytes) / (1024.0 * 1024.0))
+                      << " runtime_scoring=0"
+                      << "\n";
+        }
+    }
     if (gguf_mem_profile) gguf_log_mem("after_context_init", tp_rank);
 
     auto upload_u8 = [](const void* src, size_t bytes) {

@@ -168,6 +168,7 @@ const uint8_t* SafeTensorsShard::tensor_data(const SafeTensorInfo& info) const {
 std::string safe_dtype_name(SafeDType dtype) {
     switch (dtype) {
         case SafeDType::BF16: return "BF16";
+        case SafeDType::F16: return "F16";
         case SafeDType::F32: return "F32";
         case SafeDType::I64: return "I64";
         case SafeDType::I8: return "I8";
@@ -180,6 +181,7 @@ std::string safe_dtype_name(SafeDType dtype) {
 
 SafeDType safe_dtype_from_string(const std::string& dtype) {
     if (dtype == "BF16") return SafeDType::BF16;
+    if (dtype == "F16") return SafeDType::F16;
     if (dtype == "F32") return SafeDType::F32;
     if (dtype == "I64") return SafeDType::I64;
     if (dtype == "I8") return SafeDType::I8;
@@ -191,6 +193,7 @@ SafeDType safe_dtype_from_string(const std::string& dtype) {
 uint64_t safe_dtype_size(SafeDType dtype) {
     switch (dtype) {
         case SafeDType::BF16: return 2;
+        case SafeDType::F16: return 2;
         case SafeDType::F32: return 4;
         case SafeDType::I64: return 8;
         case SafeDType::I8: return 1;

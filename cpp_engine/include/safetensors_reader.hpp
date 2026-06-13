@@ -13,6 +13,7 @@ namespace dsv4 {
 
 enum class SafeDType {
     BF16,
+    F16,
     F32,
     I64,
     I8,

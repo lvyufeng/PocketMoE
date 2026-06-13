@@ -3851,10 +3851,16 @@ void gguf_kv_swap_in_selected(GgufKvSwapLayerState* st,
                               float* d_kv_cache,
                               int* d_kv_indices,
                               int window_len,
-                              int extra_count) {
+                              int extra_count,
+                              cudaStream_t copy_stream,
+                              cudaEvent_t stage_event,
+                              bool async_h2d) {
     if (st == nullptr || !st->enabled || extra_count <= 0) return;
     if (extra_count > st->gpu_chunks) {
         throw std::runtime_error("GGUF KV swap selected more chunks than GPU staging capacity");
+    }
+    if (async_h2d && (copy_stream == nullptr || stage_event == nullptr)) {
+        throw std::runtime_error("GGUF KV swap async H2D requested without copy stream/event");
     }
     std::vector<int> h_indices(static_cast<size_t>(extra_count));
     check_cuda(cudaMemcpy(h_indices.data(), d_kv_indices + window_len,
@@ -3862,6 +3868,7 @@ void gguf_kv_swap_in_selected(GgufKvSwapLayerState* st,
                           cudaMemcpyDeviceToHost),
                "GGUF KV swap copy selected indices");
     const size_t bytes = static_cast<size_t>(st->kv_dim) * sizeof(float);
+    bool queued_async_work = false;
     for (int i = 0; i < extra_count; ++i) {
         const int logical = h_indices[static_cast<size_t>(i)] - st->window;
         if (logical < 0 || logical >= st->compressed_cap) {
@@ -3880,16 +3887,37 @@ void gguf_kv_swap_in_selected(GgufKvSwapLayerState* st,
             physical = gguf_kv_swap_acquire_slot(*st, logical);
             const float* h_src = st->h_compressed_kv + static_cast<size_t>(logical) * st->kv_dim;
             float* d_dst = d_kv_cache + static_cast<size_t>(st->window + physical) * st->kv_dim;
-            check_cuda(cudaMemcpy(d_dst, h_src, bytes, cudaMemcpyHostToDevice),
-                       "GGUF KV swap load compressed chunk");
+            if (async_h2d) {
+                check_cuda(cudaMemcpyAsync(d_dst, h_src, bytes, cudaMemcpyHostToDevice, copy_stream),
+                           "GGUF KV swap async load compressed chunk");
+                queued_async_work = true;
+            } else {
+                check_cuda(cudaMemcpy(d_dst, h_src, bytes, cudaMemcpyHostToDevice),
+                           "GGUF KV swap load compressed chunk");
+            }
             st->h2d_bytes += bytes;
         }
         h_indices[static_cast<size_t>(i)] = st->window + physical;
     }
-    check_cuda(cudaMemcpy(d_kv_indices + window_len, h_indices.data(),
-                          static_cast<size_t>(extra_count) * sizeof(int),
-                          cudaMemcpyHostToDevice),
-               "GGUF KV swap rewrite selected indices");
+    if (async_h2d) {
+        if (queued_async_work) {
+            check_cuda(cudaEventRecord(stage_event, copy_stream),
+                       "record GGUF KV swap stage event");
+        }
+        check_cuda(cudaMemcpy(d_kv_indices + window_len, h_indices.data(),
+                              static_cast<size_t>(extra_count) * sizeof(int),
+                              cudaMemcpyHostToDevice),
+                   "GGUF KV swap rewrite selected indices");
+        if (queued_async_work) {
+            check_cuda(cudaStreamWaitEvent(nullptr, stage_event, 0),
+                       "default stream wait GGUF KV swap stage event");
+        }
+    } else {
+        check_cuda(cudaMemcpy(d_kv_indices + window_len, h_indices.data(),
+                              static_cast<size_t>(extra_count) * sizeof(int),
+                              cudaMemcpyHostToDevice),
+                   "GGUF KV swap rewrite selected indices");
+    }
 }
 
 struct GgufLayerDeviceWeights {
@@ -3931,6 +3959,9 @@ struct GgufLayerDeviceWeights {
     const GgufIndexerDeviceWeights* indexer = nullptr;
     GgufSparseLayerState* sparse_state = nullptr;
     GgufKvSwapLayerState* kv_swap = nullptr;
+    cudaStream_t kv_swap_stream = nullptr;
+    cudaEvent_t kv_swap_stage_event = nullptr;
+    bool kv_swap_async_h2d = false;
     int compress_ratio = 0;
     int sparse_window_size = 0;
     int sparse_attn_threshold = 0;
@@ -4221,7 +4252,10 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
                 }
             }
             gguf_kv_swap_in_selected(w.kv_swap, s.d_kv_cache, s.d_kv_indices,
-                                     window_len, extra_count);
+                                     window_len, extra_count,
+                                     w.kv_swap_stream,
+                                     w.kv_swap_stage_event,
+                                     w.kv_swap_async_h2d);
             const int index_count = window_len + extra_count;
             s.sparse_kv_index_count = index_count;
             s.sparse_attn_used = true;
@@ -6664,6 +6698,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         throw std::runtime_error("DSV4_GGUF_KV_SWAP_PINNED_MIB must be > 0");
     if (gguf_kv_swap_requested && gguf_kv_swap_gpu_chunks_env < 0)
         throw std::runtime_error("DSV4_GGUF_KV_SWAP_GPU_CHUNKS must be >= 0");
+    if (gguf_kv_swap_requested && gguf_kv_swap_sync != 0 && gguf_kv_swap_sync != 1)
+        throw std::runtime_error("DSV4_GGUF_KV_SWAP_SYNC must be 0 or 1");
     const int gguf_sparse_window = env_int_or_default(
         "DSV4_GGUF_SPARSE_WINDOW",
         static_cast<int>(ctx.config.window_size == 0 ? 128 : ctx.config.window_size));
@@ -7326,6 +7362,18 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     if (gguf_mem_profile) gguf_log_mem("after_scratch", tp_rank);
     gguf_check_min_free("after_scratch", tp_rank, gguf_min_free_mib);
 
+    // Optional GGUF KV swap copy stream. Only used when the plugin is enabled
+    // and DSV4_GGUF_KV_SWAP_SYNC=0; the default sync=1 path is unchanged.
+    const bool gguf_kv_swap_async_h2d = gguf_kv_swap_enabled && gguf_kv_swap_sync == 0;
+    cudaStream_t gguf_kv_swap_copy_stream = nullptr;
+    cudaEvent_t gguf_kv_swap_stage_event = nullptr;
+    if (gguf_kv_swap_async_h2d) {
+        check_cuda(cudaStreamCreateWithFlags(&gguf_kv_swap_copy_stream, cudaStreamNonBlocking),
+                   "create gguf kv swap copy stream");
+        check_cuda(cudaEventCreateWithFlags(&gguf_kv_swap_stage_event, cudaEventDisableTiming),
+                   "create gguf kv swap stage event");
+    }
+
     // Dedicated copy stream for staging (H2D for routed Q2 experts). Currently
     // neutral in wall-time (staging is on the critical path between gate D2H
     // and MoE compute; nothing on default stream can overlap with it within a
@@ -7513,6 +7561,9 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             lw.indexer = (layer_sparse_enabled && d_indexer_w[L].present) ? &d_indexer_w[L] : nullptr;
             lw.sparse_state = (layer_sparse_enabled && d_sparse_state[L].compressor_kv != nullptr) ? &d_sparse_state[L] : nullptr;
             lw.kv_swap = (layer_sparse_enabled && d_kv_swap_state[L].enabled) ? &d_kv_swap_state[L] : nullptr;
+            lw.kv_swap_stream = (lw.kv_swap != nullptr && gguf_kv_swap_async_h2d) ? gguf_kv_swap_copy_stream : nullptr;
+            lw.kv_swap_stage_event = (lw.kv_swap != nullptr && gguf_kv_swap_async_h2d) ? gguf_kv_swap_stage_event : nullptr;
+            lw.kv_swap_async_h2d = (lw.kv_swap != nullptr && gguf_kv_swap_async_h2d);
             lw.compress_ratio = layer_sparse_enabled ? d_compressor_w[L].ratio : 0;
             lw.sparse_window_size = layer_sparse_enabled ? gguf_sparse_window : 0;
             lw.sparse_attn_threshold = layer_sparse_enabled ? gguf_sparse_attn_threshold : 0;
@@ -8326,6 +8377,10 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         cudaEventDestroy(gguf_moe_stage_event);
         cudaEventDestroy(gguf_moe_consume_event);
         cudaStreamDestroy(gguf_moe_copy_stream);
+    }
+    if (gguf_kv_swap_async_h2d) {
+        cudaEventDestroy(gguf_kv_swap_stage_event);
+        cudaStreamDestroy(gguf_kv_swap_copy_stream);
     }
     if (gguf_registered) cudaHostUnregister(gguf_base);
     return r;

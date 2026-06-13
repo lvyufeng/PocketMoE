@@ -331,9 +331,13 @@ def _print_placement_report(report: CapabilityReport) -> None:
 
 
 def _print_moe_runtime_report(bundle: GGUFBundle, *, gpu_count: int, gpu_memory_gib: float):
-    from src.models.minimax_m2.moe_planning import build_minimax_m2_moe_runtime_plan
+    from src.models.minimax_m2.moe_planning import (
+        build_minimax_m2_moe_runtime_plan,
+        build_minimax_m2_tp_routed_resident_plan,
+    )
 
     plan = build_minimax_m2_moe_runtime_plan(bundle, gpu_count=gpu_count, gpu_memory_gib=gpu_memory_gib)
+    tp_plan = build_minimax_m2_tp_routed_resident_plan(bundle, tp_world=gpu_count, gpu_memory_gib=gpu_memory_gib)
     print("\nmoe runtime report:")
     print(f"  architecture: {plan.architecture}")
     print(f"  minimax_moe_runtime: {plan.status}")
@@ -361,7 +365,19 @@ def _print_moe_runtime_report(bundle: GGUFBundle, *, gpu_count: int, gpu_memory_
         if decision.estimated_bytes_per_gpu is not None:
             est += f" per_gpu={_format_bytes(decision.estimated_bytes_per_gpu)}"
         print(f"    [{decision.status}] {decision.name}:{est} {decision.reason}")
-    print("  generation: deferred (MiniMax-M2 full attention/q4/q5 runtime is not implemented yet)")
+    print("  tp routed-resident plan:")
+    print(f"    [{tp_plan.status}] tp_world={tp_plan.tp_world} gpu_memory={tp_plan.gpu_memory_gib:.1f}GiB")
+    print(f"    routed_bytes: {_format_bytes(tp_plan.routed_bytes)}")
+    print(f"    non_routed_moe_bytes: {_format_bytes(tp_plan.non_routed_moe_bytes)}")
+    print(f"    usable_per_gpu: {_format_bytes(tp_plan.usable_bytes_per_gpu)}")
+    for rank in tp_plan.ranks:
+        print(
+            f"    rank={rank.tp_rank} experts=[{rank.expert_start},{rank.expert_start + rank.expert_count}) "
+            f"routed={_format_bytes(rank.routed_resident_bytes)} "
+            f"non_routed_moe={_format_bytes(rank.replicated_non_routed_moe_bytes)} "
+            f"estimated={_format_bytes(rank.estimated_bytes_per_gpu)} fits={rank.fits}"
+        )
+    print("  generation: candidate (MiniMax-M2 TP raw-block CUDA greedy runtime is implemented)")
     if plan.warnings:
         print("  warnings:")
         for warning in plan.warnings[:20]:

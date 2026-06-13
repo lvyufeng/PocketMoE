@@ -277,6 +277,13 @@ torch::Tensor gguf_quant_gemm_pair_forward_cuda(
     int64_t type_id1,
     const torch::Tensor& signed_grid);
 
+torch::Tensor gguf_quant_embedding_forward_cuda(
+    const torch::Tensor& token_ids,
+    const torch::Tensor& blocks,
+    int64_t row_elems,
+    int64_t type_id,
+    const torch::Tensor& signed_grid);
+
 torch::Tensor gguf_moe_prefill_grouped_forward_cuda(
     const torch::Tensor& x,
     const torch::Tensor& route_tokens,
@@ -368,10 +375,12 @@ bool int8_gemm_imma_enabled() {
 }
 
 int64_t gguf_quant_block_bytes_for_type(int64_t type_id) {
-    if (type_id == 0) return 66;   // iq2_xxs
-    if (type_id == 1) return 84;   // q2_k
-    if (type_id == 2) return 56;   // iq1_m
-    TORCH_CHECK(false, "type_id must be 0 (iq2_xxs), 1 (q2_k), or 2 (iq1_m)");
+    if (type_id == 0) return 66;    // iq2_xxs
+    if (type_id == 1) return 84;    // q2_k
+    if (type_id == 2) return 56;    // iq1_m
+    if (type_id == 3) return 144;   // q4_k
+    if (type_id == 4) return 176;   // q5_k
+    TORCH_CHECK(false, "type_id must be 0 (iq2_xxs), 1 (q2_k), 2 (iq1_m), 3 (q4_k), or 4 (q5_k)");
 }
 
 void check_gguf_quant_grid(const torch::Tensor& grid, int64_t type_id, const char* name) {
@@ -523,7 +532,7 @@ torch::Tensor gguf_quant_gemm_forward(
     const torch::Tensor& signed_grid) {
     TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "x must have shape [M, K] or [B, S, K]");
     TORCH_CHECK(blocks.dim() == 3, "blocks must have shape [N, K_blocks, block_bytes]");
-    TORCH_CHECK(type_id == 0 || type_id == 1 || type_id == 2, "type_id must be 0 (iq2_xxs), 1 (q2_k), or 2 (iq1_m)");
+    TORCH_CHECK(type_id >= 0 && type_id <= 4, "type_id must be 0 (iq2_xxs), 1 (q2_k), 2 (iq1_m), 3 (q4_k), or 4 (q5_k)");
     TORCH_CHECK(row_elems > 0, "row_elems must be positive");
     TORCH_CHECK(x.size(-1) == row_elems, "inner dimension mismatch");
     TORCH_CHECK(blocks.size(1) * 256 >= row_elems, "blocks do not cover row_elems");
@@ -548,7 +557,7 @@ torch::Tensor gguf_quant_gemm_prefill_forward(
     const torch::Tensor& signed_grid) {
     TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "x must have shape [M, K] or [B, S, K]");
     TORCH_CHECK(blocks.dim() == 3, "blocks must have shape [N, K_blocks, block_bytes]");
-    TORCH_CHECK(type_id == 0 || type_id == 1 || type_id == 2, "type_id must be 0 (iq2_xxs), 1 (q2_k), or 2 (iq1_m)");
+    TORCH_CHECK(type_id >= 0 && type_id <= 4, "type_id must be 0 (iq2_xxs), 1 (q2_k), 2 (iq1_m), 3 (q4_k), or 4 (q5_k)");
     TORCH_CHECK(row_elems > 0, "row_elems must be positive");
     TORCH_CHECK(x.size(-1) == row_elems, "inner dimension mismatch");
     TORCH_CHECK(blocks.size(1) * 256 >= row_elems, "blocks do not cover row_elems");
@@ -575,8 +584,8 @@ torch::Tensor gguf_quant_gemm_pair_forward(
     const torch::Tensor& signed_grid) {
     TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "x must have shape [M, K] or [B, S, K]");
     TORCH_CHECK(blocks0.dim() == 3 && blocks1.dim() == 3, "blocks must have shape [N, K_blocks, block_bytes]");
-    TORCH_CHECK(type_id0 == 0 || type_id0 == 1 || type_id0 == 2, "type_id0 must be 0, 1, or 2");
-    TORCH_CHECK(type_id1 == 0 || type_id1 == 1 || type_id1 == 2, "type_id1 must be 0, 1, or 2");
+    TORCH_CHECK(type_id0 >= 0 && type_id0 <= 4, "type_id0 must be 0..4");
+    TORCH_CHECK(type_id1 >= 0 && type_id1 <= 4, "type_id1 must be 0..4");
     TORCH_CHECK(!(type_id0 == 0 && type_id1 == 2) && !(type_id0 == 2 && type_id1 == 0), "paired GEMM cannot mix iq2_xxs and iq1_m because they require different grids");
     TORCH_CHECK(row_elems0 > 0 && row_elems1 > 0, "row_elems must be positive");
     TORCH_CHECK(row_elems0 == row_elems1, "paired GGUF GEMM requires matching input dimensions");
@@ -608,6 +617,27 @@ torch::Tensor gguf_quant_gemm_pair_forward(
         row_elems1,
         type_id1,
         signed_grid);
+}
+
+
+torch::Tensor gguf_quant_embedding_forward(
+    const torch::Tensor& token_ids,
+    const torch::Tensor& blocks,
+    int64_t row_elems,
+    int64_t type_id,
+    const torch::Tensor& signed_grid) {
+    TORCH_CHECK(token_ids.dim() == 1 || token_ids.dim() == 2, "token_ids must have shape [T] or [B, S]");
+    TORCH_CHECK(blocks.dim() == 3, "blocks must have shape [V, K_blocks, block_bytes]");
+    TORCH_CHECK(type_id == 3 || type_id == 4, "gguf_quant_embedding_forward currently supports q4_k/q5_k selected-row dequant only");
+    TORCH_CHECK(row_elems > 0, "row_elems must be positive");
+    TORCH_CHECK(blocks.size(1) * 256 >= row_elems, "blocks do not cover row_elems");
+    TORCH_CHECK(blocks.size(2) == gguf_quant_block_bytes_for_type(type_id), "unexpected GGUF block size for type_id");
+    TORCH_CHECK(token_ids.is_cuda() && blocks.is_cuda(), "token_ids and blocks must be CUDA tensors");
+    TORCH_CHECK(token_ids.is_contiguous() && blocks.is_contiguous(), "token_ids and blocks must be contiguous");
+    TORCH_CHECK(token_ids.scalar_type() == torch::kInt64, "token_ids must be int64");
+    check_tensor(blocks, "blocks", torch::kUInt8);
+    check_gguf_quant_grid(signed_grid, type_id, "signed_grid");
+    return gguf_quant_embedding_forward_cuda(token_ids, blocks, row_elems, type_id, signed_grid);
 }
 
 torch::Tensor gguf_moe_prefill_grouped_forward(
@@ -1820,9 +1850,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_finalize_reduce_forward", &moe_finalize_reduce_forward, "finalize reduced MoE output with shared expert add and dtype cast (CUDA)");
     m.def("q8_0_gemm_forward", &q8_0_gemm_forward, "raw GGUF q8_0 GEMM forward (CUDA)");
     m.def("gguf_q2k_gemm_dp4a_forward", &gguf_q2k_gemm_dp4a_forward, "raw GGUF q2_k GEMM forward using Q8 activation + DP4A (CUDA)");
-    m.def("gguf_quant_gemm_forward", &gguf_quant_gemm_forward, "raw GGUF iq2_xxs/q2_k GEMM forward (CUDA)");
-    m.def("gguf_quant_gemm_prefill_forward", &gguf_quant_gemm_prefill_forward, "prefill-only raw GGUF iq2_xxs/q2_k GEMM forward (CUDA)");
-    m.def("gguf_quant_gemm_pair_forward", &gguf_quant_gemm_pair_forward, "paired raw GGUF iq2_xxs/q2_k GEMM forward (CUDA)");
+    m.def("gguf_quant_gemm_forward", &gguf_quant_gemm_forward, "raw GGUF iq2_xxs/q2_k/iq1_m/q4_k/q5_k GEMM forward (CUDA)");
+    m.def("gguf_quant_gemm_prefill_forward", &gguf_quant_gemm_prefill_forward, "prefill-only raw GGUF iq2_xxs/q2_k/iq1_m/q4_k/q5_k GEMM forward (CUDA)");
+    m.def("gguf_quant_gemm_pair_forward", &gguf_quant_gemm_pair_forward, "paired raw GGUF iq2_xxs/q2_k/iq1_m/q4_k/q5_k GEMM forward (CUDA)");
+    m.def("gguf_quant_embedding_forward", &gguf_quant_embedding_forward, "selected-row raw GGUF quantized embedding forward (CUDA)");
     m.def("gguf_moe_prefill_grouped_forward", &gguf_moe_prefill_grouped_forward, "raw GGUF routed grouped MoE prefill forward (CUDA)");
     m.def("gguf_moe_single_token_iq2_q2k_forward", &gguf_moe_single_token_iq2_q2k_forward, "single-token GGUF IQ2_XXS/Q2_K routed MoE forward (CUDA)");
     m.def("gguf_moe_single_token_iq1m_forward", &gguf_moe_single_token_iq1m_forward, "single-token GGUF IQ1_M routed MoE forward (CUDA)");

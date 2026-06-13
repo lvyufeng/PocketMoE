@@ -58,9 +58,9 @@ def test_inspect_minimax_spec_summary_validation_and_reports(tmp_path: Path) -> 
     assert "n_routed_experts: 4" in result.stdout
     assert "top_k: 2" in result.stdout
     assert "ok: True" in result.stdout
-    assert "[deferred] embedding:q4_k" in result.stdout
-    assert "[deferred] attn_q:q5_k" in result.stdout
-    assert "[deferred] routed_w1:iq2_xxs" in result.stdout
+    assert "[supported] embedding:q4_k" in result.stdout
+    assert "[supported] attn_q:q5_k" in result.stdout
+    assert "[supported] routed_w1:iq2_xxs" in result.stdout
     assert "[candidate] all_device_lowbit" in result.stdout
     assert "[candidate] heterogeneous_routed_experts" in result.stdout
 
@@ -97,7 +97,7 @@ def test_inspect_minimax_moe_runtime_report(tmp_path: Path) -> None:
     assert "moe tensors: 6 / expected 6" in result.stdout
     assert "q4_k embedding/head" in result.stdout
     assert "q5_k attention" in result.stdout
-    assert "generation: deferred" in result.stdout
+    assert "generation: candidate" in result.stdout
 
 
 def test_inspect_minimax_check_routed_blocks(tmp_path: Path) -> None:

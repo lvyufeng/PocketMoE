@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from typing import TYPE_CHECKING
 
 from src.loader.gguf.bundle import GGUFBundle
 from src.components.moe.capability import capability_status_for_role
@@ -18,6 +19,11 @@ from src.components.moe.spec import (
     metadata_float,
     metadata_int,
 )
+
+if TYPE_CHECKING:
+    import torch
+
+    from src.runtime.generation import GGUFTokenRuntime
 
 
 class MiniMaxM2Spec:
@@ -164,7 +170,7 @@ class MiniMaxM2Spec:
             seen.add(key)
             status, reason = capability_status_for_role(role, tensor.type_name, architecture=self.architecture)
             caps.append(CapabilityItem(f"{role}:{tensor.type_name}", status, reason))
-        caps.append(CapabilityItem("generation", "deferred", "MiniMax-M2 generation is not implemented yet"))
+        caps.append(CapabilityItem("generation", "candidate", "MiniMax-M2 TP4 raw-block CUDA greedy generation is implemented"))
 
         tensor_bytes = sum(int(t.nbytes or 0) for t in bundle.tensors)
         routed_bytes = sum(
@@ -186,4 +192,64 @@ class MiniMaxM2Spec:
             bytes_by_role=bytes_by_role,
             capabilities=caps,
             placements=placements,
+        )
+
+    def build_token_runtime(
+        self,
+        bundle: GGUFBundle,
+        *,
+        world: int,
+        rank: int,
+        device: "torch.device",
+        dtype: "torch.dtype",
+        n_layers: int | None,
+        gpu_memory_gib: float,
+    ) -> "GGUFTokenRuntime":
+        """Build the TP rank-local MiniMax-M2 model for raw-block CUDA decode.
+
+        Deferred imports keep this spec cheap to import for inspection/registry
+        use; the heavy MiniMax runtime is only pulled in when actually loading.
+        """
+        import time
+
+        from src.runtime.generation import GGUFTokenRuntime
+        from src.models.minimax_m2.gguf_model import load_minimax_m2_gguf_model
+        from src.models.minimax_m2.moe_planning import (
+            build_minimax_m2_tp_routed_resident_plan,
+            minimax_m2_tp_expert_range,
+        )
+
+        if world > 1:
+            tp_plan = build_minimax_m2_tp_routed_resident_plan(
+                bundle, tp_world=world, gpu_memory_gib=float(gpu_memory_gib)
+            )
+            if not tp_plan.ok:
+                raise RuntimeError(f"MiniMax-M2 TP plan is not valid: {tp_plan.errors[:5]}")
+            rplan = tp_plan.ranks[rank]
+            expert_start, expert_count = rplan.expert_start, rplan.expert_count
+        else:
+            expert_start, expert_count = minimax_m2_tp_expert_range(
+                metadata_int(bundle.metadata, "minimax-m2.expert_count", 256), 1, 0
+            )
+
+        t_load = time.perf_counter()
+        model, _info = load_minimax_m2_gguf_model(
+            bundle,
+            device=device,
+            dtype=dtype,
+            n_layers=n_layers,
+            expert_start=expert_start,
+            expert_count=expert_count,
+            preload_moe=True,
+        )
+        load_seconds = time.perf_counter() - t_load
+
+        eos = bundle.metadata.get("tokenizer.ggml.eos_token_id")
+        eos_id = int(eos) if isinstance(eos, int) else None
+        return GGUFTokenRuntime(
+            model=model,
+            expert_start=int(expert_start),
+            expert_count=int(expert_count),
+            eos_token_id=eos_id,
+            load_seconds=float(load_seconds),
         )

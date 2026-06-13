@@ -92,11 +92,15 @@ _DENSE_DTYPES = {
 }
 
 # Quantized routed/matrix block geometry: type_name -> (block_elems, block_bytes).
-# Mirrors GGML_QUANT_SIZES for the types we decode in pure Python.
+# Mirrors GGML_QUANT_SIZES for the raw GGUF block formats supported by
+# runtime readers.  Q4_K/Q5_K are used by MiniMax dense tensors; keep them as
+# raw blocks in runtime and use reference dequant only in tests.
 _QUANT_BLOCK_META = {
     "q2_k": (256, 84),
     "iq2_xxs": (256, 66),
     "iq1_m": (256, 56),
+    "q4_k": (256, 144),
+    "q5_k": (256, 176),
 }
 
 
@@ -117,9 +121,22 @@ def _product(values: Iterable[int]) -> int:
 def _storage_shape(dimensions: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(reversed(tuple(int(dim) for dim in dimensions)))
 
-
 def _f16_bytes_to_f32(data: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(data).view("<f2").astype(np.float32).reshape(data.shape[:-1])
+
+
+def _get_scale_min_k4(scales: np.ndarray, idx: int) -> tuple[np.ndarray, np.ndarray]:
+    """Decode GGML K-quant 6-bit scale/min pair for Q4_K/Q5_K.
+
+    Mirrors llama.cpp/ggml `get_scale_min_k4()` exactly.  `scales` has
+    trailing dimension 12 and returns arrays broadcast over the leading dims.
+    """
+    if idx < 4:
+        return scales[..., idx] & 63, scales[..., idx + 4] & 63
+    return (
+        (scales[..., idx + 4] & 0x0F) | ((scales[..., idx - 4] >> 6) << 4),
+        (scales[..., idx + 4] >> 4) | ((scales[..., idx] >> 6) << 4),
+    )
 
 
 @lru_cache(maxsize=1)
@@ -375,6 +392,61 @@ class GGUFTensorDataReader:
         row_bytes = blocks_per_row * 34
         return self._read_q8_0_block_rows(tensor.absolute_offset + row_start * row_bytes, row_elems, row_count)
 
+    def read_quantized_matrix_blocks(self, name: str | GGUFTensorInfo) -> tuple[torch.Tensor, str, int]:
+        tensor = self._tensor(name)
+        if len(tensor.dimensions) != 2:
+            raise ValueError(f"{tensor.name} is not a 2D quantized matrix tensor")
+        if tensor.type_name not in _QUANT_BLOCK_META:
+            raise NotImplementedError(f"raw quantized matrix blocks for {tensor.name} ({tensor.type_name}) are not supported")
+        row_elems = int(tensor.dimensions[0])
+        rows = int(tensor.dimensions[1])
+        return self._read_quantized_matrix_block_rows(tensor.absolute_offset, row_elems, rows, tensor.type_name), tensor.type_name, row_elems
+
+    def read_quantized_matrix_block_rows(
+        self,
+        name: str | GGUFTensorInfo,
+        row_start: int,
+        row_count: int,
+    ) -> tuple[torch.Tensor, str, int]:
+        tensor = self._tensor(name)
+        if len(tensor.dimensions) != 2:
+            raise ValueError(f"{tensor.name} is not a 2D quantized matrix tensor")
+        if tensor.type_name not in _QUANT_BLOCK_META:
+            raise NotImplementedError(f"raw quantized matrix blocks for {tensor.name} ({tensor.type_name}) are not supported")
+        rows = int(tensor.dimensions[1])
+        if row_start < 0 or row_count < 0 or row_start + row_count > rows:
+            raise ValueError(f"row range [{row_start}, {row_start + row_count}) is outside {tensor.name} rows={rows}")
+        row_elems = int(tensor.dimensions[0])
+        block_elems, block_bytes = _quant_block_meta(tensor.type_name)
+        blocks_per_row = math.ceil(row_elems / block_elems)
+        row_bytes = blocks_per_row * block_bytes
+        offset = tensor.absolute_offset + int(row_start) * row_bytes
+        return self._read_quantized_matrix_block_rows(offset, row_elems, row_count, tensor.type_name), tensor.type_name, row_elems
+
+    def read_quantized_matrix_rows_reference(
+        self,
+        name: str | GGUFTensorInfo,
+        row_start: int,
+        row_count: int,
+    ) -> torch.Tensor:
+        """Decode a small quantized matrix row slice for correctness tests.
+
+        This is intentionally a reference path.  Runtime hot paths must keep
+        GGUF q4_k/q5_k weights in raw block form and use CUDA kernels instead
+        of resident fp32/bf16 expansion.
+        """
+        tensor = self._tensor(name)
+        if len(tensor.dimensions) != 2:
+            raise ValueError(f"{tensor.name} is not a 2D quantized matrix tensor")
+        rows = int(tensor.dimensions[1])
+        if row_start < 0 or row_count < 0 or row_start + row_count > rows:
+            raise ValueError(f"row range [{row_start}, {row_start + row_count}) is outside {tensor.name} rows={rows}")
+        row_elems = int(tensor.dimensions[0])
+        block_elems, block_bytes = _quant_block_meta(tensor.type_name)
+        blocks_per_row = math.ceil(row_elems / block_elems)
+        offset = tensor.absolute_offset + int(row_start) * blocks_per_row * block_bytes
+        return self._read_quantized_matrix(tensor, offset, row_elems, int(row_count), tensor.type_name)
+
     def _read_q8_0_rows(self, tensor: GGUFTensorInfo, row_start: int, row_count: int) -> torch.Tensor:
         row_elems = int(tensor.dimensions[0])
         blocks_per_row = math.ceil(row_elems / 32)
@@ -397,6 +469,14 @@ class GGUFTensorDataReader:
         blocks = np.frombuffer(data, dtype=np.uint8).reshape(rows, blocks_per_row, 34).copy()
         return torch.from_numpy(blocks).to(device="cpu")
 
+    def _read_quantized_matrix_block_rows(self, offset: int, row_elems: int, rows: int, type_name: str) -> torch.Tensor:
+        block_elems, block_bytes = _quant_block_meta(type_name)
+        blocks_per_row = math.ceil(int(row_elems) / block_elems)
+        nbytes = int(rows) * blocks_per_row * block_bytes
+        data = self._read_at(offset, nbytes)
+        blocks = np.frombuffer(data, dtype=np.uint8).reshape(int(rows), blocks_per_row, block_bytes).copy()
+        return torch.from_numpy(blocks).to(device="cpu")
+
     def _read_quantized_matrix(self, tensor: GGUFTensorInfo, offset: int, in_dim: int, out_dim: int, type_name: str) -> torch.Tensor:
         if in_dim % 256 != 0:
             raise ValueError(f"{tensor.name} in_dim={in_dim} is not divisible by 256")
@@ -407,6 +487,10 @@ class GGUFTensorDataReader:
             values = self._read_iq2_xxs_rows(offset, out_dim, blocks_per_row)
         elif type_name == "iq1_m":
             values = self._read_iq1_m_rows(offset, out_dim, blocks_per_row)
+        elif type_name == "q4_k":
+            values = self._read_q4_k_rows(offset, out_dim, blocks_per_row)
+        elif type_name == "q5_k":
+            values = self._read_q5_k_rows(offset, out_dim, blocks_per_row)
         else:
             raise NotImplementedError(type_name)
         return torch.from_numpy(values.reshape(out_dim, blocks_per_row * 256)[:, :in_dim].copy())
@@ -477,6 +561,88 @@ class GGUFTensorDataReader:
             _GGUF_READER_PROFILE_COUNT += 1
             print(
                 f"gguf_reader_profile type=iq2_xxs rows={rows} blocks_per_row={blocks_per_row} bytes={nbytes} "
+                f"read={t_read - t0:.6f}s decode={t_done - t_read:.6f}s total={t_done - t0:.6f}s",
+                flush=True,
+            )
+        return out
+
+    def _read_q4_k_rows(self, offset: int, rows: int, blocks_per_row: int) -> np.ndarray:
+        """Reference-decode Q4_K rows to float32 using llama.cpp/ggml layout."""
+        global _GGUF_READER_PROFILE_COUNT
+        profile = _GGUF_READER_PROFILE and _GGUF_READER_PROFILE_COUNT < _GGUF_READER_PROFILE_LIMIT
+        t0 = time.perf_counter() if profile else 0.0
+        nbytes = rows * blocks_per_row * 144
+        data = self._read_at(offset, nbytes)
+        if profile:
+            t_read = time.perf_counter()
+        blocks = np.frombuffer(data, dtype=np.uint8).reshape(rows, blocks_per_row, 144)
+        d = _f16_bytes_to_f32(blocks[:, :, 0:2])
+        dmin = _f16_bytes_to_f32(blocks[:, :, 2:4])
+        scales = blocks[:, :, 4:16]
+        qs = blocks[:, :, 16:144]
+        out = np.empty((rows, blocks_per_row, 256), dtype=np.float32)
+        for pair in range(4):
+            q = qs[:, :, pair * 32:(pair + 1) * 32]
+            sc, mn = _get_scale_min_k4(scales, pair * 2)
+            out[:, :, pair * 64:pair * 64 + 32] = (
+                d[:, :, None] * sc.astype(np.float32)[:, :, None] * (q & 0x0F).astype(np.float32)
+                - dmin[:, :, None] * mn.astype(np.float32)[:, :, None]
+            )
+            sc, mn = _get_scale_min_k4(scales, pair * 2 + 1)
+            out[:, :, pair * 64 + 32:pair * 64 + 64] = (
+                d[:, :, None] * sc.astype(np.float32)[:, :, None] * (q >> 4).astype(np.float32)
+                - dmin[:, :, None] * mn.astype(np.float32)[:, :, None]
+            )
+        if profile:
+            t_done = time.perf_counter()
+            _GGUF_READER_PROFILE_COUNT += 1
+            print(
+                f"gguf_reader_profile type=q4_k rows={rows} blocks_per_row={blocks_per_row} bytes={nbytes} "
+                f"read={t_read - t0:.6f}s decode={t_done - t_read:.6f}s total={t_done - t0:.6f}s",
+                flush=True,
+            )
+        return out
+
+    def _read_q5_k_rows(self, offset: int, rows: int, blocks_per_row: int) -> np.ndarray:
+        """Reference-decode Q5_K rows to float32 using llama.cpp/ggml layout."""
+        global _GGUF_READER_PROFILE_COUNT
+        profile = _GGUF_READER_PROFILE and _GGUF_READER_PROFILE_COUNT < _GGUF_READER_PROFILE_LIMIT
+        t0 = time.perf_counter() if profile else 0.0
+        nbytes = rows * blocks_per_row * 176
+        data = self._read_at(offset, nbytes)
+        if profile:
+            t_read = time.perf_counter()
+        blocks = np.frombuffer(data, dtype=np.uint8).reshape(rows, blocks_per_row, 176)
+        d = _f16_bytes_to_f32(blocks[:, :, 0:2])
+        dmin = _f16_bytes_to_f32(blocks[:, :, 2:4])
+        scales = blocks[:, :, 4:16]
+        qh = blocks[:, :, 16:48]
+        qs = blocks[:, :, 48:176]
+        out = np.empty((rows, blocks_per_row, 256), dtype=np.float32)
+        u1 = 1
+        u2 = 2
+        for pair in range(4):
+            q = qs[:, :, pair * 32:(pair + 1) * 32]
+            high = qh[:, :, :32]
+            sc, mn = _get_scale_min_k4(scales, pair * 2)
+            q_low = (q & 0x0F).astype(np.float32) + np.where((high & u1) != 0, 16.0, 0.0).astype(np.float32)
+            out[:, :, pair * 64:pair * 64 + 32] = (
+                d[:, :, None] * sc.astype(np.float32)[:, :, None] * q_low
+                - dmin[:, :, None] * mn.astype(np.float32)[:, :, None]
+            )
+            sc, mn = _get_scale_min_k4(scales, pair * 2 + 1)
+            q_high = (q >> 4).astype(np.float32) + np.where((high & u2) != 0, 16.0, 0.0).astype(np.float32)
+            out[:, :, pair * 64 + 32:pair * 64 + 64] = (
+                d[:, :, None] * sc.astype(np.float32)[:, :, None] * q_high
+                - dmin[:, :, None] * mn.astype(np.float32)[:, :, None]
+            )
+            u1 <<= 2
+            u2 <<= 2
+        if profile:
+            t_done = time.perf_counter()
+            _GGUF_READER_PROFILE_COUNT += 1
+            print(
+                f"gguf_reader_profile type=q5_k rows={rows} blocks_per_row={blocks_per_row} bytes={nbytes} "
                 f"read={t_read - t0:.6f}s decode={t_done - t_read:.6f}s total={t_done - t0:.6f}s",
                 flush=True,
             )

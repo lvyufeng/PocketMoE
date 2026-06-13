@@ -6,7 +6,12 @@ import pytest
 import torch
 
 from src.loader.gguf.bundle import read_gguf_bundle
-from src.models.minimax_m2.moe_planning import ROUTED_ROLES, build_minimax_m2_moe_runtime_plan
+from src.models.minimax_m2.moe_planning import (
+    ROUTED_ROLES,
+    build_minimax_m2_moe_runtime_plan,
+    build_minimax_m2_tp_routed_resident_plan,
+    minimax_m2_tp_expert_range,
+)
 from src.models.minimax_m2.moe_runtime import (
     GGUF_DEVICE_TYPE_IDS,
     MiniMaxM2DeviceResidentCache,
@@ -64,8 +69,32 @@ def test_minimax_moe_runtime_plan_reports_dense_skips(tmp_path: Path) -> None:
     assert ("attn_k", "q5_k") in skipped
     assert ("attn_v", "q5_k") in skipped
     assert ("attn_o", "q5_k") in skipped
-    assert "deferred" in skipped[("embedding", "q4_k")]
-    assert "GQA runtime" in skipped[("attn_q", "q5_k")]
+    assert "full MiniMax raw-block CUDA runtime" in skipped[("embedding", "q4_k")]
+    assert "full MiniMax raw-block CUDA runtime" in skipped[("attn_q", "q5_k")]
+
+
+def test_minimax_tp4_expert_ranges_are_even() -> None:
+    ranges = [minimax_m2_tp_expert_range(256, 4, rank) for rank in range(4)]
+
+    assert ranges == [(0, 64), (64, 64), (128, 64), (192, 64)]
+
+
+def test_minimax_tp_routed_resident_plan_estimates_rank_local_bytes(tmp_path: Path) -> None:
+    root = write_minimax_bundle(tmp_path / "bundle", n_layers=2, hidden=256, inter=256, experts=4)
+    bundle = read_gguf_bundle(root)
+    moe_plan = build_minimax_m2_moe_runtime_plan(bundle, gpu_count=2)
+    tp_plan = build_minimax_m2_tp_routed_resident_plan(bundle, tp_world=2, gpu_memory_gib=22.0)
+
+    assert tp_plan.ok, tp_plan.errors
+    assert tp_plan.status == "candidate"
+    assert tp_plan.tp_world == 2
+    assert len(tp_plan.ranks) == 2
+    assert [(rank.expert_start, rank.expert_count) for rank in tp_plan.ranks] == [(0, 2), (2, 2)]
+    assert tp_plan.routed_bytes == moe_plan.routed_bytes
+    assert tp_plan.non_routed_moe_bytes == moe_plan.moe_bytes - moe_plan.routed_bytes
+    assert all(rank.fits for rank in tp_plan.ranks)
+    assert all(rank.estimated_bytes_per_gpu == rank.routed_resident_bytes + rank.replicated_non_routed_moe_bytes for rank in tp_plan.ranks)
+    assert sum(rank.routed_resident_bytes for rank in tp_plan.ranks) == tp_plan.routed_bytes
 
 
 def test_minimax_routed_block_loader_reads_small_slice(tmp_path: Path) -> None:

@@ -47,11 +47,11 @@ def test_minimax_capability_marks_runtime_deferred_but_placement_candidate(tmp_p
     caps = {item.name: item for item in report.capabilities}
     placements = {item.name: item for item in report.placements}
 
-    assert caps["embedding:q4_k"].status == "deferred"
-    assert caps["attn_q:q5_k"].status == "deferred"
-    assert caps["routed_w1:iq2_xxs"].status == "deferred"
-    assert caps["generation"].status == "deferred"
-    assert "MiniMax" in caps["generation"].reason
+    assert caps["embedding:q4_k"].status == "supported"
+    assert caps["attn_q:q5_k"].status == "supported"
+    assert caps["routed_w1:iq2_xxs"].status == "supported"
+    assert caps["generation"].status == "candidate"
+    assert "MiniMax-M2" in caps["generation"].reason
     assert report.tensor_type_counts["iq2_xxs"] == 3
     assert report.tensor_type_counts["q5_k"] == 4
     assert placements["all_device_lowbit"].status == "candidate"
@@ -113,4 +113,4 @@ def test_real_minimax_m27_bundle_validates_when_available() -> None:
     assert bundle.tensor_count == 809
     assert validation.ok, validation.errors[:20]
     assert report.tensor_type_counts["iq2_xxs"] == 62 * 3
-    assert any(item.name == "generation" and item.status == "deferred" for item in report.capabilities)
+    assert any(item.name == "generation" and item.status == "candidate" for item in report.capabilities)

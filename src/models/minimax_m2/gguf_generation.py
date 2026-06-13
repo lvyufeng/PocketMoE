@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 
 from src.loader.gguf.bundle import read_gguf_bundle
-from src.models.minimax_m2.loader import load_minimax_m2_gguf_model
+from src.models.minimax_m2.gguf_model import load_minimax_m2_gguf_model
 from src.models.minimax_m2.moe_planning import build_minimax_m2_tp_routed_resident_plan, minimax_m2_tp_expert_range
 
 

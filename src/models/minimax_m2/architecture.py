@@ -1,27 +1,19 @@
 from __future__ import annotations
 
-import os
 import math
+import os
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from src.loader.gguf.bundle import GGUFBundle
-from src.models.minimax_m2.spec import MiniMaxM2Spec
-from src.models.minimax_m2.moe_runtime import MiniMaxM2DeviceResidentCache
+from src.components.gguf.quantized_ops import QuantizedGGUFEmbedding, QuantizedGGUFLinear
+from src.components.gguf.tp_logits import distributed_argmax_local_logits, gather_sharded_logits
 from src.kernels.cuda_loader import load_cuda_kernel
-
-
-GGUF_DENSE_TYPE_IDS = {
-    "iq2_xxs": 0,
-    "q2_k": 1,
-    "iq1_m": 2,
-    "q4_k": 3,
-    "q5_k": 4,
-}
+from src.loader.gguf.bundle import GGUFBundle
+from src.models.minimax_m2.moe_runtime import MiniMaxM2DeviceResidentCache
+from src.models.minimax_m2.spec import MiniMaxM2Spec
 
 
 @dataclass(frozen=True)
@@ -62,21 +54,6 @@ class MiniMaxM2Args:
         )
 
 
-@dataclass(frozen=True)
-class QuantizedGGUFTensor:
-    source_name: str
-    blocks: torch.Tensor
-    type_name: str
-    type_id: int
-    row_elems: int
-    out_dim: int
-    row_start: int = 0
-
-    @property
-    def nbytes(self) -> int:
-        return int(self.blocks.numel() * self.blocks.element_size())
-
-
 class RMSNorm:
     def __init__(self, weight: torch.Tensor, eps: float, *, out_dtype: torch.dtype = torch.float16):
         self.weight = weight.float().contiguous()
@@ -87,95 +64,6 @@ class RMSNorm:
         xf = x.float()
         inv = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         y = xf * inv * self.weight
-        return y.to(self.out_dtype)
-
-
-class QuantizedGGUFLinear:
-    def __init__(self, tensor: QuantizedGGUFTensor, *, out_dtype: torch.dtype = torch.float16):
-        self.tensor = tensor
-        self.out_dtype = out_dtype
-        self._cuda = load_cuda_kernel()
-        if self._cuda is None:
-            raise RuntimeError("CUDA extension is required for QuantizedGGUFLinear")
-        self._grid = torch.empty(0, dtype=torch.int8, device=tensor.blocks.device)
-
-    @property
-    def in_dim(self) -> int:
-        return int(self.tensor.row_elems)
-
-    @property
-    def out_dim(self) -> int:
-        return int(self.tensor.out_dim)
-
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        if x.size(-1) != self.in_dim:
-            raise ValueError(f"{self.tensor.source_name}: expected input dim {self.in_dim}, got {x.size(-1)}")
-        rows = int(x.numel() // self.in_dim)
-        x_contig = x.contiguous()
-        if rows > 1:
-            y = self._cuda.gguf_quant_gemm_prefill_forward(
-                x_contig,
-                self.tensor.blocks,
-                int(self.tensor.row_elems),
-                int(self.tensor.type_id),
-                self._grid,
-            )
-        else:
-            y = self._cuda.gguf_quant_gemm_forward(
-                x_contig,
-                self.tensor.blocks,
-                int(self.tensor.row_elems),
-                int(self.tensor.type_id),
-                self._grid,
-            )
-        return y.to(self.out_dtype)
-
-    @staticmethod
-    def pair(first: "QuantizedGGUFLinear", second: "QuantizedGGUFLinear", x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if first.in_dim != second.in_dim:
-            raise ValueError(f"paired GGUF GEMM requires matching input dims, got {first.in_dim} and {second.in_dim}")
-        if first.out_dim != second.out_dim:
-            raise ValueError(f"paired GGUF GEMM requires matching output dims, got {first.out_dim} and {second.out_dim}")
-        if first.tensor.type_id != second.tensor.type_id:
-            raise ValueError(f"paired GGUF GEMM requires matching type ids, got {first.tensor.type_id} and {second.tensor.type_id}")
-        if x.size(-1) != first.in_dim:
-            raise ValueError(f"paired GGUF GEMM expected input dim {first.in_dim}, got {x.size(-1)}")
-        y0, y1 = first._cuda.gguf_quant_gemm_pair_forward(
-            x.contiguous(),
-            first.tensor.blocks,
-            int(first.tensor.row_elems),
-            int(first.tensor.type_id),
-            second.tensor.blocks,
-            int(second.tensor.row_elems),
-            int(second.tensor.type_id),
-            first._grid,
-        )
-        return y0.to(first.out_dtype), y1.to(second.out_dtype)
-
-
-class QuantizedGGUFEmbedding:
-    def __init__(self, tensor: QuantizedGGUFTensor, *, out_dtype: torch.dtype = torch.float16):
-        self.tensor = tensor
-        self.out_dtype = out_dtype
-        self._cuda = load_cuda_kernel()
-        if self._cuda is None:
-            raise RuntimeError("CUDA extension is required for QuantizedGGUFEmbedding")
-        self._grid = torch.empty(0, dtype=torch.int8, device=tensor.blocks.device)
-
-    @property
-    def dim(self) -> int:
-        return int(self.tensor.row_elems)
-
-    def __call__(self, token_ids: torch.Tensor) -> torch.Tensor:
-        if token_ids.dtype != torch.long:
-            token_ids = token_ids.to(torch.long)
-        y = self._cuda.gguf_quant_embedding_forward(
-            token_ids.contiguous(),
-            self.tensor.blocks,
-            int(self.tensor.row_elems),
-            int(self.tensor.type_id),
-            self._grid,
-        )
         return y.to(self.out_dtype)
 
 
@@ -429,42 +317,6 @@ class MiniMaxTransformer:
         for layer in self.layers:
             layer.reset_cache(batch_size, max_seq_len)
 
-    def _distributed_argmax_local_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        local_values, local_indices = torch.max(logits, dim=-1)
-        local_indices = local_indices.to(torch.long) + int(self.lm_head.tensor.row_start)
-        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-            world = dist.get_world_size()
-            all_values = [torch.empty_like(local_values) for _ in range(world)]
-            all_indices = [torch.empty_like(local_indices) for _ in range(world)]
-            dist.all_gather(all_values, local_values.contiguous())
-            dist.all_gather(all_indices, local_indices.contiguous())
-            values = torch.stack(all_values, dim=0)
-            indices = torch.stack(all_indices, dim=0)
-            best_rank = torch.argmax(values, dim=0)
-            return indices.gather(0, best_rank.unsqueeze(0)).squeeze(0)
-        return local_indices
-
-    def _gather_local_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        if self.lm_head.tensor.out_dim == self.args.vocab_size and int(self.lm_head.tensor.row_start) == 0:
-            return logits
-        if not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
-            return logits
-        world = dist.get_world_size()
-        local_n = torch.tensor([int(logits.size(-1))], device=logits.device, dtype=torch.long)
-        all_n = [torch.empty_like(local_n) for _ in range(world)]
-        dist.all_gather(all_n, local_n)
-        sizes = [int(item.item()) for item in all_n]
-        max_n = max(sizes)
-        if int(logits.size(-1)) < max_n:
-            pad = torch.empty((*logits.shape[:-1], max_n - int(logits.size(-1))), device=logits.device, dtype=logits.dtype)
-            logits_send = torch.cat((logits, pad), dim=-1).contiguous()
-        else:
-            logits_send = logits.contiguous()
-        gathered = [torch.empty_like(logits_send) for _ in range(world)]
-        dist.all_gather(gathered, logits_send)
-        parts = [part[..., :sizes[i]] for i, part in enumerate(gathered)]
-        return torch.cat(parts, dim=-1)
-
     @torch.inference_mode()
     def forward(
         self,
@@ -486,13 +338,13 @@ class MiniMaxTransformer:
         logits_input = h if keep_all_positions else h[:, -1:, :]
         logits = self.lm_head(logits_input).float()
         if return_next_token:
-            next_token = self._distributed_argmax_local_logits(logits)
+            next_token = distributed_argmax_local_logits(logits, row_start=int(self.lm_head.tensor.row_start))
             if not keep_all_positions:
                 next_token = next_token[:, -1]
             if return_hidden:
                 return next_token, (h if keep_all_positions else h[:, -1:, :])
             return next_token
-        logits = self._gather_local_logits(logits)
+        logits = gather_sharded_logits(logits, full_out_dim=int(self.args.vocab_size), row_start=int(self.lm_head.tensor.row_start))
         if return_hidden:
             return logits, h
         return logits

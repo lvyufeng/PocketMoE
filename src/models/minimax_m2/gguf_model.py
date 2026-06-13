@@ -7,28 +7,27 @@ from typing import Any
 
 import torch
 
-from src.loader.gguf.bundle import GGUFBundle, GGUFTensorRef, read_gguf_bundle
-from src.loader.gguf.tensor_reader import GGUFTensorDataReader
-from src.models.minimax_m2.moe_runtime import MiniMaxM2DeviceResidentCache
-from src.models.minimax_m2.runtime import (
-    GGUF_DENSE_TYPE_IDS,
+from src.components.gguf.quantized_ops import QuantizedGGUFEmbedding, QuantizedGGUFLinear
+from src.components.gguf.tp_logits import tp_vocab_row_range
+from src.loader.gguf.bundle import GGUFBundle, read_gguf_bundle
+from src.loader.gguf.quantized_loader import GGUFQuantizedTensorLoader
+from src.loader.gguf.quantized_tensor import QuantizedGGUFTensor
+from src.models.minimax_m2.architecture import (
     MiniMaxAttention,
     MiniMaxBlock,
     MiniMaxM2Args,
     MiniMaxMoE,
     MiniMaxTransformer,
-    QuantizedGGUFEmbedding,
-    QuantizedGGUFLinear,
-    QuantizedGGUFTensor,
 )
+from src.models.minimax_m2.moe_runtime import MiniMaxM2DeviceResidentCache
 
 
-class MiniMaxM2GGUFLoader:
-    """Load MiniMax-M2 GGUF tensors for the raw-block CUDA runtime.
+class MiniMaxM2GGUFModelLoader:
+    """Assemble MiniMax-M2 modules from a GGUF checkpoint.
 
-    Dense q4_k/q5_k tensors are copied as uint8 GGUF blocks.  This loader never
-    expands q4_k/q5_k into resident fp16/fp32 matrices; CPU dequant remains only
-    a test/reference helper in tensor_reader.py.
+    GGUF file/block loading is delegated to ``src.loader.gguf``.  CUDA kernel
+    wrappers are delegated to ``src.components.gguf``.  This class only maps
+    MiniMax tensor names into model modules.
     """
 
     def __init__(
@@ -54,115 +53,33 @@ class MiniMaxM2GGUFLoader:
         self.expert_start = int(expert_start)
         self.expert_count = expert_count
         self.preload_moe = bool(preload_moe)
-        self._readers: dict[str, GGUFTensorDataReader] = {}
+        self._gguf_loader = GGUFQuantizedTensorLoader(self.bundle, device=self.device)
 
     def close(self) -> None:
-        for reader in self._readers.values():
-            reader.close()
-        self._readers.clear()
+        self._gguf_loader.close()
 
-    def __enter__(self) -> "MiniMaxM2GGUFLoader":
+    def __enter__(self) -> "MiniMaxM2GGUFModelLoader":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
-    def _tensor_ref(self, name: str) -> GGUFTensorRef:
-        try:
-            return self.bundle.tensors_by_name[name]
-        except KeyError as exc:
-            raise KeyError(f"MiniMax-M2 GGUF tensor not found: {name}") from exc
-
-    def _reader_for(self, tensor: GGUFTensorRef) -> GGUFTensorDataReader:
-        reader = self._readers.get(tensor.shard_path)
-        if reader is None:
-            reader = GGUFTensorDataReader(tensor.shard_path)
-            self._readers[tensor.shard_path] = reader
-        return reader
-
     def _read_dense(self, name: str) -> torch.Tensor:
-        tensor = self._tensor_ref(name)
-        values = self._reader_for(tensor).read_tensor(tensor.name)
-        return values.to(device=self.device, dtype=torch.float32, non_blocking=False).contiguous()
+        return self._gguf_loader.read_dense(name, dtype=torch.float32)
 
     def _read_quant(self, name: str, expected_type: str) -> QuantizedGGUFTensor:
-        tensor = self._tensor_ref(name)
-        if tensor.type_name != expected_type:
-            raise ValueError(f"{name} expected {expected_type}, got {tensor.type_name}")
-        blocks, type_name, row_elems = self._reader_for(tensor).read_quantized_matrix_blocks(tensor.name)
-        if type_name != expected_type:
-            raise RuntimeError(f"{name} reader type mismatch: expected={expected_type} got={type_name}")
-        try:
-            type_id = GGUF_DENSE_TYPE_IDS[type_name]
-        except KeyError as exc:
-            raise NotImplementedError(f"GGUF type {type_name!r} is not supported by the MiniMax runtime") from exc
-        cuda_blocks = blocks.to(device=self.device, non_blocking=False).contiguous()
-        return QuantizedGGUFTensor(
-            source_name=name,
-            blocks=cuda_blocks,
-            type_name=type_name,
-            type_id=int(type_id),
-            row_elems=int(row_elems),
-            out_dim=int(cuda_blocks.shape[0]),
-        )
-
-    def _read_quant_rows(
-        self,
-        name: str,
-        expected_type: str,
-        row_start: int,
-        row_count: int,
-    ) -> QuantizedGGUFTensor:
-        tensor = self._tensor_ref(name)
-        if tensor.type_name != expected_type:
-            raise ValueError(f"{name} expected {expected_type}, got {tensor.type_name}")
-        blocks, type_name, row_elems = self._reader_for(tensor).read_quantized_matrix_block_rows(
-            tensor.name,
-            int(row_start),
-            int(row_count),
-        )
-        if type_name != expected_type:
-            raise RuntimeError(f"{name} reader type mismatch: expected={expected_type} got={type_name}")
-        try:
-            type_id = GGUF_DENSE_TYPE_IDS[type_name]
-        except KeyError as exc:
-            raise NotImplementedError(f"GGUF type {type_name!r} is not supported by the MiniMax runtime") from exc
-        cuda_blocks = blocks.to(device=self.device, non_blocking=False).contiguous()
-        return QuantizedGGUFTensor(
-            source_name=name,
-            blocks=cuda_blocks,
-            type_name=type_name,
-            type_id=int(type_id),
-            row_elems=int(row_elems),
-            out_dim=int(cuda_blocks.shape[0]),
-            row_start=int(row_start),
-        )
-
-    @staticmethod
-    def _rank_row_range(total_rows: int, world: int, rank: int) -> tuple[int, int]:
-        total_rows = int(total_rows)
-        world = int(world)
-        rank = int(rank)
-        if total_rows <= 0:
-            raise ValueError(f"total_rows must be positive, got {total_rows}")
-        if world <= 0:
-            raise ValueError(f"world must be positive, got {world}")
-        if rank < 0 or rank >= world:
-            raise ValueError(f"rank {rank} outside [0, {world})")
-        start = (total_rows * rank) // world
-        end = (total_rows * (rank + 1)) // world
-        return start, end - start
+        return self._gguf_loader.read_quant(name, expected_type)
 
     def _read_lm_head_quant(self) -> QuantizedGGUFTensor:
-        tensor = self._tensor_ref("output.weight")
+        tensor = self._gguf_loader.tensor_ref("output.weight")
         total_rows = int(tensor.dimensions[1])
         shard_head = os.getenv("MINIMAX_M2_TP_SHARD_LM_HEAD", "1").lower() not in {"0", "false", "no"}
         dist_ready = torch.distributed.is_available() and torch.distributed.is_initialized()
         world = torch.distributed.get_world_size() if dist_ready else 1
         rank = torch.distributed.get_rank() if dist_ready else 0
         if shard_head and world > 1:
-            row_start, row_count = self._rank_row_range(total_rows, world, rank)
-            return self._read_quant_rows("output.weight", "q4_k", row_start, row_count)
+            row_start, row_count = tp_vocab_row_range(total_rows, world, rank)
+            return self._gguf_loader.read_quant_rows("output.weight", "q4_k", row_start, row_count)
         return self._read_quant("output.weight", "q4_k")
 
     def load(self) -> MiniMaxTransformer:
@@ -229,6 +146,10 @@ class MiniMaxM2GGUFLoader:
         )
 
 
+# Backward-compatible alias for early PR revisions and local scripts.
+MiniMaxM2GGUFLoader = MiniMaxM2GGUFModelLoader
+
+
 def load_minimax_m2_gguf_model(
     gguf_path: str | Path | GGUFBundle,
     *,
@@ -240,7 +161,7 @@ def load_minimax_m2_gguf_model(
     preload_moe: bool = True,
 ) -> tuple[MiniMaxTransformer, dict[str, Any]]:
     start = time.perf_counter()
-    loader = MiniMaxM2GGUFLoader(
+    loader = MiniMaxM2GGUFModelLoader(
         gguf_path,
         device=device,
         dtype=dtype,

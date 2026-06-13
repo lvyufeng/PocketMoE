@@ -1,12 +1,27 @@
 #include "cuda_ops.hpp"
 
 #include <cuda_runtime.h>
+#include <sm_61_intrinsics.h>
 
 #include <algorithm>
 #include <cmath>
 
 namespace dsv4 {
 namespace {
+
+__device__ __forceinline__ int dsv4_dp4a_i8(int a, int b, int acc) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 610)
+    return __dp4a(a, b, acc);
+#else
+    const unsigned ua = static_cast<unsigned>(a);
+    const unsigned ub = static_cast<unsigned>(b);
+    acc += static_cast<int>(static_cast<int8_t>(ua & 0xffu)) * static_cast<int>(static_cast<int8_t>(ub & 0xffu));
+    acc += static_cast<int>(static_cast<int8_t>((ua >> 8) & 0xffu)) * static_cast<int>(static_cast<int8_t>((ub >> 8) & 0xffu));
+    acc += static_cast<int>(static_cast<int8_t>((ua >> 16) & 0xffu)) * static_cast<int>(static_cast<int8_t>((ub >> 16) & 0xffu));
+    acc += static_cast<int>(static_cast<int8_t>((ua >> 24) & 0xffu)) * static_cast<int>(static_cast<int8_t>((ub >> 24) & 0xffu));
+    return acc;
+#endif
+}
 
 __global__ void gguf_route_slots_from_indices_kernel(
     const int64_t* __restrict__ indices,
@@ -1242,7 +1257,7 @@ __global__ void wo_a_int8_decode_gemm_kernel(
     const int8_t* w_row = weight_q + static_cast<size_t>(row) * group_dim;
     const int* w_i32 = reinterpret_cast<const int*>(w_row);
     int acc = 0;
-    for (int i = 0; i < packs; ++i) acc = __dp4a(x_shared[i], w_i32[i], acc);
+    for (int i = 0; i < packs; ++i) acc = dsv4_dp4a_i8(x_shared[i], w_i32[i], acc);
     y[row] = static_cast<float>(acc) * x_scale[group] * weight_scale[row];
 }
 

@@ -100,6 +100,14 @@ float e8m0_to_float(uint8_t code) {
     return std::exp2(static_cast<float>(static_cast<int>(code) - 127));
 }
 
+struct ReduceBreakdown {
+    bool enabled = false;
+    double pre_sync_ms = 0.0;
+    double pack_ms = 0.0;
+    double nccl_ms = 0.0;
+    double unpack_ms = 0.0;
+};
+
 #ifdef DSV4_HAVE_NCCL
 struct BF16AllReduceScratch {
     uint16_t* d_bf16 = nullptr;
@@ -115,14 +123,6 @@ struct BF16AllReduceScratch {
         if (err != cudaSuccess) throw std::runtime_error(std::string("cudaMalloc bf16 all-reduce scratch: ") + cudaGetErrorString(err));
         capacity = count;
     }
-};
-
-struct ReduceBreakdown {
-    bool enabled = false;
-    double pre_sync_ms = 0.0;
-    double pack_ms = 0.0;
-    double nccl_ms = 0.0;
-    double unpack_ms = 0.0;
 };
 
 void all_reduce_sum_fp32_via_bf16_inplace(
@@ -3744,6 +3744,154 @@ struct GgufSparseLayerState {
     float* indexer_comp_score = nullptr;
 };
 
+struct GgufKvSwapLayerState {
+    bool enabled = false;
+    float* h_compressed_kv = nullptr;
+    int compressed_cap = 0;
+    int gpu_chunks = 0;
+    int kv_dim = 0;
+    int window = 0;
+    std::vector<uint8_t> host_ready;
+    std::vector<int> gpu_slot_logical;
+    std::unordered_map<int, int> slot_by_logical;
+    std::list<int> slot_lru;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t h2d_bytes = 0;
+    uint64_t d2h_bytes = 0;
+    uint64_t swap_outs = 0;
+    ~GgufKvSwapLayerState() { release(); }
+
+    void init(int compressed_cap_in, int gpu_chunks_in, int kv_dim_in, int window_in) {
+        release();
+        enabled = compressed_cap_in > 0 && gpu_chunks_in > 0 && kv_dim_in > 0 && window_in > 0;
+        if (!enabled) return;
+        compressed_cap = compressed_cap_in;
+        gpu_chunks = std::min(gpu_chunks_in, compressed_cap_in);
+        kv_dim = kv_dim_in;
+        window = window_in;
+        const size_t bytes = static_cast<size_t>(compressed_cap) * static_cast<size_t>(kv_dim) * sizeof(float);
+        check_cuda(cudaMallocHost(reinterpret_cast<void**>(&h_compressed_kv), bytes),
+                   "cudaMallocHost GGUF KV swap compressed cache");
+        host_ready.assign(static_cast<size_t>(compressed_cap), 0);
+        gpu_slot_logical.assign(static_cast<size_t>(gpu_chunks), -1);
+        slot_by_logical.clear();
+        slot_lru.clear();
+        hits = misses = h2d_bytes = d2h_bytes = swap_outs = 0;
+    }
+
+    void release() {
+        if (h_compressed_kv != nullptr) cudaFreeHost(h_compressed_kv);
+        h_compressed_kv = nullptr;
+        enabled = false;
+        compressed_cap = gpu_chunks = kv_dim = window = 0;
+        host_ready.clear();
+        gpu_slot_logical.clear();
+        slot_by_logical.clear();
+        slot_lru.clear();
+    }
+};
+
+void gguf_kv_swap_touch_slot(GgufKvSwapLayerState& st, int slot) {
+    auto it = std::find(st.slot_lru.begin(), st.slot_lru.end(), slot);
+    if (it != st.slot_lru.end()) st.slot_lru.erase(it);
+    st.slot_lru.push_front(slot);
+}
+
+int gguf_kv_swap_acquire_slot(GgufKvSwapLayerState& st, int logical) {
+    auto found = st.slot_by_logical.find(logical);
+    if (found != st.slot_by_logical.end()) {
+        gguf_kv_swap_touch_slot(st, found->second);
+        ++st.hits;
+        return found->second;
+    }
+    int slot = -1;
+    for (int i = 0; i < st.gpu_chunks; ++i) {
+        if (st.gpu_slot_logical[static_cast<size_t>(i)] < 0) { slot = i; break; }
+    }
+    if (slot < 0) {
+        if (st.slot_lru.empty()) throw std::runtime_error("GGUF KV swap LRU empty");
+        slot = st.slot_lru.back();
+        st.slot_lru.pop_back();
+        const int old_logical = st.gpu_slot_logical[static_cast<size_t>(slot)];
+        if (old_logical >= 0) st.slot_by_logical.erase(old_logical);
+    }
+    st.gpu_slot_logical[static_cast<size_t>(slot)] = logical;
+    st.slot_by_logical[logical] = slot;
+    gguf_kv_swap_touch_slot(st, slot);
+    ++st.misses;
+    return slot;
+}
+
+int gguf_kv_swap_stage_new_chunk(GgufKvSwapLayerState* st,
+                                 float* d_kv_cache,
+                                 int logical,
+                                 int fallback_slot) {
+    if (st == nullptr || !st->enabled) return fallback_slot;
+    if (logical < 0 || logical >= st->compressed_cap) return -1;
+    const int physical = gguf_kv_swap_acquire_slot(*st, logical);
+    return st->window + physical;
+}
+
+void gguf_kv_swap_store_chunk(GgufKvSwapLayerState* st,
+                              const float* d_slot,
+                              int logical) {
+    if (st == nullptr || !st->enabled) return;
+    if (logical < 0 || logical >= st->compressed_cap) return;
+    const size_t bytes = static_cast<size_t>(st->kv_dim) * sizeof(float);
+    float* h_dst = st->h_compressed_kv + static_cast<size_t>(logical) * st->kv_dim;
+    check_cuda(cudaMemcpy(h_dst, d_slot, bytes, cudaMemcpyDeviceToHost),
+               "GGUF KV swap store compressed chunk");
+    st->host_ready[static_cast<size_t>(logical)] = 1;
+    st->d2h_bytes += bytes;
+    ++st->swap_outs;
+}
+
+void gguf_kv_swap_in_selected(GgufKvSwapLayerState* st,
+                              float* d_kv_cache,
+                              int* d_kv_indices,
+                              int window_len,
+                              int extra_count) {
+    if (st == nullptr || !st->enabled || extra_count <= 0) return;
+    if (extra_count > st->gpu_chunks) {
+        throw std::runtime_error("GGUF KV swap selected more chunks than GPU staging capacity");
+    }
+    std::vector<int> h_indices(static_cast<size_t>(extra_count));
+    check_cuda(cudaMemcpy(h_indices.data(), d_kv_indices + window_len,
+                          static_cast<size_t>(extra_count) * sizeof(int),
+                          cudaMemcpyDeviceToHost),
+               "GGUF KV swap copy selected indices");
+    const size_t bytes = static_cast<size_t>(st->kv_dim) * sizeof(float);
+    for (int i = 0; i < extra_count; ++i) {
+        const int logical = h_indices[static_cast<size_t>(i)] - st->window;
+        if (logical < 0 || logical >= st->compressed_cap) {
+            throw std::runtime_error("GGUF KV swap selected chunk out of range");
+        }
+        if (st->host_ready.empty() || st->host_ready[static_cast<size_t>(logical)] == 0) {
+            throw std::runtime_error("GGUF KV swap selected chunk before it was stored");
+        }
+        auto found = st->slot_by_logical.find(logical);
+        int physical = -1;
+        if (found != st->slot_by_logical.end()) {
+            physical = found->second;
+            gguf_kv_swap_touch_slot(*st, physical);
+            ++st->hits;
+        } else {
+            physical = gguf_kv_swap_acquire_slot(*st, logical);
+            const float* h_src = st->h_compressed_kv + static_cast<size_t>(logical) * st->kv_dim;
+            float* d_dst = d_kv_cache + static_cast<size_t>(st->window + physical) * st->kv_dim;
+            check_cuda(cudaMemcpy(d_dst, h_src, bytes, cudaMemcpyHostToDevice),
+                       "GGUF KV swap load compressed chunk");
+            st->h2d_bytes += bytes;
+        }
+        h_indices[static_cast<size_t>(i)] = st->window + physical;
+    }
+    check_cuda(cudaMemcpy(d_kv_indices + window_len, h_indices.data(),
+                          static_cast<size_t>(extra_count) * sizeof(int),
+                          cudaMemcpyHostToDevice),
+               "GGUF KV swap rewrite selected indices");
+}
+
 struct GgufLayerDeviceWeights {
     const uint16_t* d_attn_gamma = nullptr;
     const uint16_t* d_q_gamma = nullptr;
@@ -3782,10 +3930,12 @@ struct GgufLayerDeviceWeights {
     const GgufCompressorDeviceWeights* compressor = nullptr;
     const GgufIndexerDeviceWeights* indexer = nullptr;
     GgufSparseLayerState* sparse_state = nullptr;
+    GgufKvSwapLayerState* kv_swap = nullptr;
     int compress_ratio = 0;
     int sparse_window_size = 0;
     int sparse_attn_threshold = 0;
     int index_topk = 0;
+    int logical_compressed_cap = 0;
 };
 
 struct GgufLayerDims {
@@ -3907,8 +4057,11 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
                                           offset, write_slot, comp.state_cols))
             throw std::runtime_error("GGUF sparse compressor state update failed");
         if ((position + 1) % comp.ratio == 0) {
-            const int compressed_slot = w.sparse_window_size + position / comp.ratio;
-            if (compressed_slot < s.cache_capacity) {
+            const int logical_compressed = position / comp.ratio;
+            const int compressed_slot = gguf_kv_swap_stage_new_chunk(
+                w.kv_swap, s.d_kv_cache, logical_compressed,
+                w.sparse_window_size + logical_compressed);
+            if (compressed_slot >= 0 && compressed_slot < s.cache_capacity) {
                 float* d_pooled_slot = s.d_kv_cache + static_cast<size_t>(compressed_slot) * d.kv_dim;
                 if (!compressor_pool_cuda(w.sparse_state->compressor_kv,
                                           w.sparse_state->compressor_score,
@@ -3926,6 +4079,7 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
                 if (d.head_dim > d.rope_dim &&
                     !fp8_act_quant_dequant_cuda(d_pooled_slot, d.head_dim - d.rope_dim, 64))
                     throw std::runtime_error("GGUF sparse compressed kv act quant failed");
+                gguf_kv_swap_store_chunk(w.kv_swap, d_pooled_slot, logical_compressed);
             }
             if (comp.overlap && !compressor_shift_overlap_state_cuda(
                     w.sparse_state->compressor_kv, w.sparse_state->compressor_score,
@@ -4029,7 +4183,9 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
                                               /*compressed_offset=*/window))
                 throw std::runtime_error("build GGUF sparse window indices failed");
             const int compressed_ready = (position + 1) / w.compress_ratio;
-            const int compressed_cap = std::max(0, s.cache_capacity - window);
+            const int compressed_cap = w.logical_compressed_cap > 0
+                ? w.logical_compressed_cap
+                : std::max(0, s.cache_capacity - window);
             int extra_count = 0;
             if (w.indexer != nullptr && w.indexer->present && compressed_ready > 0 &&
                 w.sparse_state->indexer_kv_cache != nullptr && s.d_index_scores != nullptr &&
@@ -4051,12 +4207,21 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
                     throw std::runtime_error("GGUF sparse indexer topk failed");
                 extra_count = keep;
             } else {
-                extra_count = std::min(compressed_ready, compressed_cap);
-                if (extra_count > 0 && !build_decode_kv_indices_cuda(
-                        s.d_kv_indices + window_len, /*window_start=*/0, /*window_len=*/0,
-                        window, extra_count, window))
-                    throw std::runtime_error("build GGUF sparse compressed indices failed");
+                if (w.kv_swap != nullptr && w.kv_swap->enabled) {
+                    if (compressed_ready > 0) {
+                        throw std::runtime_error("GGUF KV swap requires sparse indexer selected chunks");
+                    }
+                    extra_count = 0;
+                } else {
+                    extra_count = std::min(compressed_ready, compressed_cap);
+                    if (extra_count > 0 && !build_decode_kv_indices_cuda(
+                            s.d_kv_indices + window_len, /*window_start=*/0, /*window_len=*/0,
+                            window, extra_count, window))
+                        throw std::runtime_error("build GGUF sparse compressed indices failed");
+                }
             }
+            gguf_kv_swap_in_selected(w.kv_swap, s.d_kv_cache, s.d_kv_indices,
+                                     window_len, extra_count);
             const int index_count = window_len + extra_count;
             s.sparse_kv_index_count = index_count;
             s.sparse_attn_used = true;
@@ -6486,6 +6651,19 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     // compressor + all compressed slots already cuts 32K attention scans by ~4x,
     // while the GGUF indexer matvec path is not optimized yet.
     const bool gguf_sparse_indexer = env_int_or_default("DSV4_GGUF_SPARSE_INDEXER", 0) != 0;
+    const bool gguf_kv_swap_requested = env_int_or_default("DSV4_GGUF_KV_SWAP", 0) != 0;
+    const int gguf_kv_swap_gpu_chunks_env = env_int_or_default("DSV4_GGUF_KV_SWAP_GPU_CHUNKS", 0);
+    const int gguf_kv_swap_pinned_mib = env_int_or_default("DSV4_GGUF_KV_SWAP_PINNED_MIB", 16384);
+    const int gguf_kv_swap_sync = env_int_or_default("DSV4_GGUF_KV_SWAP_SYNC", 1);
+    const int gguf_kv_swap_validate = env_int_or_default("DSV4_GGUF_KV_SWAP_VALIDATE", 0);
+    const bool gguf_kv_swap_test_allow_topk_reduction =
+        env_int_or_default("DSV4_GGUF_KV_SWAP_TEST_ALLOW_TOPK_REDUCTION", 0) != 0;
+    if (gguf_kv_swap_requested && !gguf_sparse_compressor)
+        throw std::runtime_error("DSV4_GGUF_KV_SWAP requires DSV4_GGUF_SPARSE_COMPRESSOR=1");
+    if (gguf_kv_swap_requested && gguf_kv_swap_pinned_mib <= 0)
+        throw std::runtime_error("DSV4_GGUF_KV_SWAP_PINNED_MIB must be > 0");
+    if (gguf_kv_swap_requested && gguf_kv_swap_gpu_chunks_env < 0)
+        throw std::runtime_error("DSV4_GGUF_KV_SWAP_GPU_CHUNKS must be >= 0");
     const int gguf_sparse_window = env_int_or_default(
         "DSV4_GGUF_SPARSE_WINDOW",
         static_cast<int>(ctx.config.window_size == 0 ? 128 : ctx.config.window_size));
@@ -6826,12 +7004,56 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     const int generate_total_positions = static_cast<int>(seed_tokens.size()) + std::max(0, max_new_tokens - 1);
     const int total_positions = std::max(generate_total_positions, decode_only_context > 0 ? decode_only_context : 0);
     int max_sparse_compressed_cap = 0;
+    std::vector<int> layer_compressed_cap(n_layers, 0);
     if (gguf_sparse_compressor) {
         for (int L = 0; L < n_layers; ++L) {
             if (!d_compressor_w[L].present || d_compressor_w[L].ratio <= 0) continue;
-            max_sparse_compressed_cap = std::max(
-                max_sparse_compressed_cap,
-                (std::max(1, total_positions) + d_compressor_w[L].ratio - 1) / d_compressor_w[L].ratio);
+            layer_compressed_cap[L] =
+                (std::max(1, total_positions) + d_compressor_w[L].ratio - 1) / d_compressor_w[L].ratio;
+            max_sparse_compressed_cap = std::max(max_sparse_compressed_cap, layer_compressed_cap[L]);
+        }
+    }
+    std::vector<int> layer_kv_swap_gpu_chunks(n_layers, 0);
+    const int full_index_topk = static_cast<int>(ctx.config.index_topk == 0 ? 0 : ctx.config.index_topk);
+    std::vector<int> layer_index_topk(n_layers, full_index_topk);
+    bool gguf_kv_swap_enabled = false;
+    uint64_t gguf_kv_swap_pinned_bytes = 0;
+    if (gguf_kv_swap_requested) {
+        if (!gguf_sparse_indexer) {
+            throw std::runtime_error("DSV4_GGUF_KV_SWAP requires DSV4_GGUF_SPARSE_INDEXER=1 for phase-1 correctness");
+        }
+        if (ctx.config.index_topk == 0) {
+            throw std::runtime_error("DSV4_GGUF_KV_SWAP requires a non-zero index_topk");
+        }
+        const int default_gpu_chunks = std::max<int>(1, static_cast<int>(ctx.config.index_topk));
+        if (gguf_kv_swap_gpu_chunks_env > 0 && gguf_kv_swap_gpu_chunks_env < default_gpu_chunks &&
+            !gguf_kv_swap_test_allow_topk_reduction) {
+            throw std::runtime_error("DSV4_GGUF_KV_SWAP_GPU_CHUNKS must be >= index_topk to avoid reducing retrieval coverage; set DSV4_GGUF_KV_SWAP_TEST_ALLOW_TOPK_REDUCTION=1 only for small-context tests");
+        }
+        for (int L = 0; L < n_layers; ++L) {
+            if (!d_compressor_w[L].present || d_compressor_w[L].ratio <= 0 || !d_indexer_w[L].present) continue;
+            const int cap = layer_compressed_cap[L];
+            if (cap <= 0) continue;
+            int chunks = gguf_kv_swap_gpu_chunks_env > 0 ? gguf_kv_swap_gpu_chunks_env : default_gpu_chunks;
+            chunks = std::max(1, std::min(chunks, cap));
+            if (chunks >= cap) continue;  // Full resident is smaller/same and preserves the original path.
+            layer_kv_swap_gpu_chunks[L] = chunks;
+            if (gguf_kv_swap_test_allow_topk_reduction) {
+                layer_index_topk[L] = std::min(full_index_topk, chunks);
+            }
+            gguf_kv_swap_pinned_bytes += static_cast<uint64_t>(cap) * static_cast<uint64_t>(kv_dim) * sizeof(float);
+            gguf_kv_swap_enabled = true;
+        }
+        const uint64_t pinned_cap_bytes = static_cast<uint64_t>(gguf_kv_swap_pinned_mib) * 1024ULL * 1024ULL;
+        if (gguf_kv_swap_enabled && gguf_kv_swap_pinned_bytes > pinned_cap_bytes) {
+            std::ostringstream oss;
+            oss << "DSV4_GGUF_KV_SWAP pinned cache exceeds cap: required_mib="
+                << (static_cast<double>(gguf_kv_swap_pinned_bytes) / (1024.0 * 1024.0))
+                << " cap_mib=" << gguf_kv_swap_pinned_mib;
+            throw std::runtime_error(oss.str());
+        }
+        if (!gguf_kv_swap_enabled && tp_rank == 0) {
+            std::cout << "gguf_kv_swap=0 reason=no_layer_with_compressed_cap_gt_gpu_chunks\n";
         }
     }
     std::vector<int> layer_cache_capacity(n_layers, std::max(1, total_positions));
@@ -6840,10 +7062,11 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         max_layer_cache_capacity = 1;
         for (int L = 0; L < n_layers; ++L) {
             if (d_compressor_w[L].present && d_compressor_w[L].ratio > 0) {
-                const int compressed_cap =
-                    (std::max(1, total_positions) + d_compressor_w[L].ratio - 1) /
-                    d_compressor_w[L].ratio;
-                layer_cache_capacity[L] = std::max(1, gguf_sparse_window + std::max(1, compressed_cap));
+                const int compressed_cap = layer_compressed_cap[L];
+                const int resident_compressed = layer_kv_swap_gpu_chunks[L] > 0
+                    ? layer_kv_swap_gpu_chunks[L]
+                    : std::max(1, compressed_cap);
+                layer_cache_capacity[L] = std::max(1, gguf_sparse_window + resident_compressed);
             } else {
                 // Layers without compressor still run dense cached attention and
                 // need direct position-addressable KV storage.
@@ -6863,6 +7086,23 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                               static_cast<size_t>(layer_cache_capacity[L]) *
                                   static_cast<size_t>(kv_dim) * sizeof(float)),
                    "memset d_kv_cache");
+    }
+    std::vector<GgufKvSwapLayerState> d_kv_swap_state(n_layers);
+    if (gguf_kv_swap_enabled) {
+        for (int L = 0; L < n_layers; ++L) {
+            if (layer_kv_swap_gpu_chunks[L] <= 0) continue;
+            d_kv_swap_state[L].init(layer_compressed_cap[L], layer_kv_swap_gpu_chunks[L], kv_dim, gguf_sparse_window);
+        }
+    }
+    if (gguf_mem_profile && tp_rank == 0) {
+        std::cout << "gguf_kv_swap=" << (gguf_kv_swap_enabled ? 1 : 0)
+                  << " requested=" << (gguf_kv_swap_requested ? 1 : 0)
+                  << " pinned_mib=" << (static_cast<double>(gguf_kv_swap_pinned_bytes) / (1024.0 * 1024.0))
+                  << " cap_mib=" << gguf_kv_swap_pinned_mib
+                  << " sync=" << gguf_kv_swap_sync
+                  << " validate=" << gguf_kv_swap_validate
+                  << " test_allow_topk_reduction=" << (gguf_kv_swap_test_allow_topk_reduction ? 1 : 0)
+                  << "\n";
     }
     if (gguf_sparse_compressor) {
         for (int L = 0; L < n_layers; ++L) {
@@ -7272,10 +7512,12 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             lw.compressor = layer_sparse_enabled ? &d_compressor_w[L] : nullptr;
             lw.indexer = (layer_sparse_enabled && d_indexer_w[L].present) ? &d_indexer_w[L] : nullptr;
             lw.sparse_state = (layer_sparse_enabled && d_sparse_state[L].compressor_kv != nullptr) ? &d_sparse_state[L] : nullptr;
+            lw.kv_swap = (layer_sparse_enabled && d_kv_swap_state[L].enabled) ? &d_kv_swap_state[L] : nullptr;
             lw.compress_ratio = layer_sparse_enabled ? d_compressor_w[L].ratio : 0;
             lw.sparse_window_size = layer_sparse_enabled ? gguf_sparse_window : 0;
             lw.sparse_attn_threshold = layer_sparse_enabled ? gguf_sparse_attn_threshold : 0;
-            lw.index_topk = static_cast<int>(ctx.config.index_topk == 0 ? 0 : ctx.config.index_topk);
+            lw.index_topk = layer_sparse_enabled ? layer_index_topk[L] : 0;
+            lw.logical_compressed_cap = layer_sparse_enabled ? layer_compressed_cap[L] : 0;
             ld.rope_theta = static_cast<float>(ctx.config.rope_theta);
             if (gguf_sparse_compressor) {
                 ls.d_kv_indices = d_kv_indices;
@@ -7995,6 +8237,33 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                     per_step_total, per_layer_attn, per_layer_stage, per_layer_moe,
                     prof_indexed_attn_steps, avg_index_count,
                     prof_sparse_attn_layer_steps, avg_sparse_index_count);
+    }
+
+    if (gguf_mem_profile && gguf_kv_swap_enabled && tp_rank == 0) {
+        uint64_t hits = 0, misses = 0, h2d = 0, d2h = 0, swap_outs = 0;
+        int swap_layers = 0;
+        int gpu_chunks_total = 0;
+        int compressed_cap_total = 0;
+        for (const auto& st : d_kv_swap_state) {
+            if (!st.enabled) continue;
+            ++swap_layers;
+            gpu_chunks_total += st.gpu_chunks;
+            compressed_cap_total += st.compressed_cap;
+            hits += st.hits;
+            misses += st.misses;
+            h2d += st.h2d_bytes;
+            d2h += st.d2h_bytes;
+            swap_outs += st.swap_outs;
+        }
+        std::cout << "gguf_kv_swap_stats layers=" << swap_layers
+                  << " gpu_chunks_total=" << gpu_chunks_total
+                  << " compressed_cap_total=" << compressed_cap_total
+                  << " hits=" << hits
+                  << " misses=" << misses
+                  << " h2d_mib=" << (static_cast<double>(h2d) / (1024.0 * 1024.0))
+                  << " d2h_mib=" << (static_cast<double>(d2h) / (1024.0 * 1024.0))
+                  << " swap_outs=" << swap_outs
+                  << "\n";
     }
 
     // ===== cleanup =====

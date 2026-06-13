@@ -164,7 +164,7 @@ class MiniMaxM2Spec:
             seen.add(key)
             status, reason = capability_status_for_role(role, tensor.type_name, architecture=self.architecture)
             caps.append(CapabilityItem(f"{role}:{tensor.type_name}", status, reason))
-        caps.append(CapabilityItem("generation", "deferred", "MiniMax-M2 generation is not implemented yet"))
+        caps.append(CapabilityItem("generation", "candidate", "MiniMax-M2 TP4 raw-block CUDA greedy generation is implemented"))
 
         tensor_bytes = sum(int(t.nbytes or 0) for t in bundle.tensors)
         routed_bytes = sum(

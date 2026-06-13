@@ -90,11 +90,40 @@ class MiniMaxM2MoERuntimePlan:
                 return item
         raise KeyError(f"MiniMax-M2 MoE tensor not planned for layer={layer} role={role}")
 
+
+@dataclass(frozen=True)
+class MiniMaxM2TPRankResidentPlan:
+    tp_rank: int
+    expert_start: int
+    expert_count: int
+    routed_resident_bytes: int
+    replicated_non_routed_moe_bytes: int
+    estimated_bytes_per_gpu: int
+    usable_bytes_per_gpu: int
+    fits: bool
+
+
+@dataclass(frozen=True)
+class MiniMaxM2TPRoutedResidentPlan:
+    architecture: str
+    status: str
+    ok: bool
+    tp_world: int
+    gpu_memory_gib: float
+    total_tensor_bytes: int
+    moe_bytes: int
+    routed_bytes: int
+    non_routed_moe_bytes: int
+    usable_bytes_per_gpu: int
+    ranks: tuple[MiniMaxM2TPRankResidentPlan, ...]
+    errors: tuple[str, ...] = field(default_factory=tuple)
+    warnings: tuple[str, ...] = field(default_factory=tuple)
+
 def _skip_reason(role: str, type_name: str) -> str:
     if role in {"embedding", "lm_head"} and type_name == "q4_k":
-        return "q4_k embedding/head payload and MiniMax generation runtime are deferred"
+        return "q4_k embedding/head payload is handled by the full MiniMax raw-block CUDA runtime"
     if role in {"attn_q", "attn_k", "attn_v", "attn_o"} and type_name == "q5_k":
-        return "q5_k attention kernels and MiniMax GQA runtime are deferred"
+        return "q5_k attention payload is handled by the full MiniMax raw-block CUDA runtime"
     if role == "attn_norm":
         return "attention normalization belongs to deferred MiniMax GQA runtime"
     if role == "final_norm":
@@ -121,6 +150,22 @@ def _layer_role_counts(items: Iterable[MiniMaxM2MoETensorPlan]) -> dict[tuple[in
         if item.layer is not None:
             counts[(int(item.layer), item.role)] += 1
     return dict(counts)
+
+
+def minimax_m2_tp_expert_range(n_experts: int, tp_world: int, tp_rank: int) -> tuple[int, int]:
+    n_experts = int(n_experts)
+    tp_world = int(tp_world)
+    tp_rank = int(tp_rank)
+    if n_experts <= 0:
+        raise ValueError(f"n_experts must be positive, got {n_experts}")
+    if tp_world <= 0:
+        raise ValueError(f"tp_world must be positive, got {tp_world}")
+    if tp_rank < 0 or tp_rank >= tp_world:
+        raise ValueError(f"tp_rank {tp_rank} outside [0, {tp_world})")
+    start = (n_experts * tp_rank) // tp_world
+    end = (n_experts * (tp_rank + 1)) // tp_world
+    return start, end - start
+
 
 
 def build_minimax_m2_moe_runtime_plan(
@@ -229,6 +274,80 @@ def build_minimax_m2_moe_runtime_plan(
         bytes_by_role=bytes_by_role,
         bytes_by_type=bytes_by_type,
         placements=placements,
+        errors=tuple(errors),
+        warnings=tuple(warnings),
+    )
+
+
+
+def build_minimax_m2_tp_routed_resident_plan(
+    bundle: GGUFBundle,
+    *,
+    tp_world: int = 4,
+    gpu_memory_gib: float = 22.0,
+    reserve_fraction: float = 0.15,
+) -> MiniMaxM2TPRoutedResidentPlan:
+    runtime_plan = build_minimax_m2_moe_runtime_plan(
+        bundle,
+        gpu_count=tp_world,
+        gpu_memory_gib=gpu_memory_gib,
+    )
+    errors = list(runtime_plan.errors)
+    warnings = list(runtime_plan.warnings)
+    tp_world = int(tp_world)
+    if tp_world <= 0:
+        errors.append(f"tp_world must be positive, got {tp_world}")
+        tp_world = 1
+    if runtime_plan.params.n_routed_experts % tp_world != 0:
+        warnings.append(
+            f"n_routed_experts={runtime_plan.params.n_routed_experts} is not divisible by tp_world={tp_world}; "
+            "expert ranges will differ by at most one expert"
+        )
+    per_gpu_bytes = int(float(gpu_memory_gib) * (1024 ** 3))
+    usable_bytes = int(per_gpu_bytes * (1.0 - float(reserve_fraction)))
+    routed_bytes = runtime_plan.routed_bytes
+    moe_bytes = runtime_plan.moe_bytes
+    non_routed_moe_bytes = max(0, moe_bytes - routed_bytes)
+    ranks: list[MiniMaxM2TPRankResidentPlan] = []
+    for tp_rank in range(tp_world):
+        expert_start, expert_count = minimax_m2_tp_expert_range(runtime_plan.params.n_routed_experts, tp_world, tp_rank)
+        routed_rank_bytes = 0
+        for item in runtime_plan.tensor_plans:
+            if item.role not in ROUTED_ROLES:
+                continue
+            if item.nbytes is None:
+                continue
+            routed_rank_bytes += (int(item.nbytes) * int(expert_count) + runtime_plan.params.n_routed_experts - 1) // runtime_plan.params.n_routed_experts
+        estimated = routed_rank_bytes + non_routed_moe_bytes
+        ranks.append(
+            MiniMaxM2TPRankResidentPlan(
+                tp_rank=tp_rank,
+                expert_start=expert_start,
+                expert_count=expert_count,
+                routed_resident_bytes=routed_rank_bytes,
+                replicated_non_routed_moe_bytes=non_routed_moe_bytes,
+                estimated_bytes_per_gpu=estimated,
+                usable_bytes_per_gpu=usable_bytes,
+                fits=estimated <= usable_bytes,
+            )
+        )
+    if any(not rank.fits for rank in ranks):
+        errors.append(
+            f"MiniMax-M2 TP routed-resident plan exceeds usable per-GPU memory budget {usable_bytes} bytes"
+        )
+    status = "candidate" if not errors else "failed"
+    return MiniMaxM2TPRoutedResidentPlan(
+        architecture=MINIMAX_M2_ARCHITECTURE,
+        status=status,
+        ok=not errors,
+        tp_world=tp_world,
+        gpu_memory_gib=float(gpu_memory_gib),
+        total_tensor_bytes=sum(int(t.nbytes or 0) for t in bundle.tensors),
+        moe_bytes=moe_bytes,
+        routed_bytes=routed_bytes,
+        non_routed_moe_bytes=non_routed_moe_bytes,
+        usable_bytes_per_gpu=usable_bytes,
+        ranks=tuple(ranks),
         errors=tuple(errors),
         warnings=tuple(warnings),
     )

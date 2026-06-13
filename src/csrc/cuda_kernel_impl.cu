@@ -5470,6 +5470,206 @@ __device__ __forceinline__ float gguf_block_scale_f16(const uint8_t* ptr) {
     return __half2float(__ushort_as_half(bits));
 }
 
+// GGML/llama.cpp K-quant 6-bit scale/min unpacker used by Q4_K and Q5_K.
+// Mirrors get_scale_min_k4(j, scales, &d, &m): for j=0..7 returns one
+// quantized scale and one quantized minimum from the 12-byte scales payload.
+__device__ __forceinline__ void gguf_get_scale_min_k4(
+    const uint8_t* __restrict__ scales,
+    int idx,
+    int& d,
+    int& m) {
+    if (idx < 4) {
+        d = static_cast<int>(scales[idx] & 63);
+        m = static_cast<int>(scales[idx + 4] & 63);
+    } else {
+        d = static_cast<int>((scales[idx + 4] & 0x0F) | ((scales[idx - 4] >> 6) << 4));
+        m = static_cast<int>((scales[idx + 4] >> 4) | ((scales[idx] >> 6) << 4));
+    }
+}
+
+__device__ __forceinline__ float q4k_dequant_value(
+    const uint8_t* __restrict__ block,
+    int k) {
+    const float d = gguf_block_scale_f16(block);
+    const float dmin = gguf_block_scale_f16(block + 2);
+    const uint8_t* scales = block + 4;
+    const uint8_t* qs = block + 16;
+    const int pair = k >> 6;          // 0..3, each pair covers 64 values
+    const int in_pair = k & 63;
+    const int q_index = pair * 32 + (in_pair & 31);
+    const int scale_idx = pair * 2 + (in_pair >= 32 ? 1 : 0);
+    int sc = 0;
+    int mn = 0;
+    gguf_get_scale_min_k4(scales, scale_idx, sc, mn);
+    const int q = in_pair < 32 ? static_cast<int>(qs[q_index] & 0x0F) : static_cast<int>(qs[q_index] >> 4);
+    return d * static_cast<float>(sc) * static_cast<float>(q) - dmin * static_cast<float>(mn);
+}
+
+__device__ __forceinline__ float q5k_dequant_value(
+    const uint8_t* __restrict__ block,
+    int k) {
+    const float d = gguf_block_scale_f16(block);
+    const float dmin = gguf_block_scale_f16(block + 2);
+    const uint8_t* scales = block + 4;
+    const uint8_t* qh = block + 16;
+    const uint8_t* qs = block + 48;
+    const int pair = k >> 6;          // 0..3, each pair covers 64 values
+    const int in_pair = k & 63;
+    const int byte = in_pair & 31;
+    const int q_index = pair * 32 + byte;
+    const int scale_idx = pair * 2 + (in_pair >= 32 ? 1 : 0);
+    const int high_mask = 1 << (2 * pair + (in_pair >= 32 ? 1 : 0));
+    int sc = 0;
+    int mn = 0;
+    gguf_get_scale_min_k4(scales, scale_idx, sc, mn);
+    const int low = in_pair < 32 ? static_cast<int>(qs[q_index] & 0x0F) : static_cast<int>(qs[q_index] >> 4);
+    const int q = low + ((qh[byte] & high_mask) ? 16 : 0);
+    return d * static_cast<float>(sc) * static_cast<float>(q) - dmin * static_cast<float>(mn);
+}
+
+// Full Q4_K/Q5_K block dot for 256 float activations.  Must be entered by all
+// 32 lanes of a warp; returned value is valid on lane 0.  The formulas and byte
+// layout follow llama.cpp/ggml dequantize_row_q4_K/dequantize_row_q5_K exactly.
+__device__ __forceinline__ float q4k_block_dot_256(
+    const float* __restrict__ x_shared,
+    const uint8_t* __restrict__ block,
+    int lane) {
+    const float d = gguf_block_scale_f16(block);
+    const float dmin = gguf_block_scale_f16(block + 2);
+    const uint8_t* scales = block + 4;
+    const uint8_t* qs = block + 16;
+    float acc = 0.0f;
+    #pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+        int sc0 = 0, mn0 = 0, sc1 = 0, mn1 = 0;
+        gguf_get_scale_min_k4(scales, pair * 2, sc0, mn0);
+        gguf_get_scale_min_k4(scales, pair * 2 + 1, sc1, mn1);
+        const uint8_t q = qs[pair * 32 + lane];
+        const float w0 = d * static_cast<float>(sc0) * static_cast<float>(q & 0x0F) - dmin * static_cast<float>(mn0);
+        const float w1 = d * static_cast<float>(sc1) * static_cast<float>(q >> 4) - dmin * static_cast<float>(mn1);
+        float local = x_shared[pair * 64 + lane] * w0 + x_shared[pair * 64 + 32 + lane] * w1;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            local += __shfl_down_sync(0xffffffff, local, offset);
+        }
+        if (lane == 0) acc += local;
+    }
+    return acc;
+}
+
+__device__ __forceinline__ float q5k_block_dot_256(
+    const float* __restrict__ x_shared,
+    const uint8_t* __restrict__ block,
+    int lane) {
+    const float d = gguf_block_scale_f16(block);
+    const float dmin = gguf_block_scale_f16(block + 2);
+    const uint8_t* scales = block + 4;
+    const uint8_t* qh = block + 16;
+    const uint8_t* qs = block + 48;
+    float acc = 0.0f;
+    #pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+        int sc0 = 0, mn0 = 0, sc1 = 0, mn1 = 0;
+        gguf_get_scale_min_k4(scales, pair * 2, sc0, mn0);
+        gguf_get_scale_min_k4(scales, pair * 2 + 1, sc1, mn1);
+        const uint8_t q = qs[pair * 32 + lane];
+        const int high0 = (qh[lane] & (1 << (2 * pair))) ? 16 : 0;
+        const int high1 = (qh[lane] & (1 << (2 * pair + 1))) ? 16 : 0;
+        const float w0 = d * static_cast<float>(sc0) * static_cast<float>((q & 0x0F) + high0) - dmin * static_cast<float>(mn0);
+        const float w1 = d * static_cast<float>(sc1) * static_cast<float>((q >> 4) + high1) - dmin * static_cast<float>(mn1);
+        float local = x_shared[pair * 64 + lane] * w0 + x_shared[pair * 64 + 32 + lane] * w1;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            local += __shfl_down_sync(0xffffffff, local, offset);
+        }
+        if (lane == 0) acc += local;
+    }
+    return acc;
+}
+
+__device__ __forceinline__ void q4k_block_dot_256_rows4(
+    const float* __restrict__ x_shared,
+    const uint8_t* __restrict__ block,
+    int lane,
+    int valid_rows,
+    float* __restrict__ acc) {
+    const float d = gguf_block_scale_f16(block);
+    const float dmin = gguf_block_scale_f16(block + 2);
+    const uint8_t* scales = block + 4;
+    const uint8_t* qs = block + 16;
+    #pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+        int sc0 = 0, mn0 = 0, sc1 = 0, mn1 = 0;
+        gguf_get_scale_min_k4(scales, pair * 2, sc0, mn0);
+        gguf_get_scale_min_k4(scales, pair * 2 + 1, sc1, mn1);
+        const uint8_t q = qs[pair * 32 + lane];
+        const float w0 = d * static_cast<float>(sc0) * static_cast<float>(q & 0x0F) - dmin * static_cast<float>(mn0);
+        const float w1 = d * static_cast<float>(sc1) * static_cast<float>(q >> 4) - dmin * static_cast<float>(mn1);
+        const int k0 = pair * 64 + lane;
+        const int k1 = pair * 64 + 32 + lane;
+        float local0 = valid_rows > 0 ? x_shared[k0] * w0 + x_shared[k1] * w1 : 0.0f;
+        float local1 = valid_rows > 1 ? x_shared[256 + k0] * w0 + x_shared[256 + k1] * w1 : 0.0f;
+        float local2 = valid_rows > 2 ? x_shared[512 + k0] * w0 + x_shared[512 + k1] * w1 : 0.0f;
+        float local3 = valid_rows > 3 ? x_shared[768 + k0] * w0 + x_shared[768 + k1] * w1 : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            local0 += __shfl_down_sync(0xffffffff, local0, offset);
+            local1 += __shfl_down_sync(0xffffffff, local1, offset);
+            local2 += __shfl_down_sync(0xffffffff, local2, offset);
+            local3 += __shfl_down_sync(0xffffffff, local3, offset);
+        }
+        if (lane == 0) {
+            acc[0] += local0;
+            if (valid_rows > 1) acc[1] += local1;
+            if (valid_rows > 2) acc[2] += local2;
+            if (valid_rows > 3) acc[3] += local3;
+        }
+    }
+}
+
+__device__ __forceinline__ void q5k_block_dot_256_rows4(
+    const float* __restrict__ x_shared,
+    const uint8_t* __restrict__ block,
+    int lane,
+    int valid_rows,
+    float* __restrict__ acc) {
+    const float d = gguf_block_scale_f16(block);
+    const float dmin = gguf_block_scale_f16(block + 2);
+    const uint8_t* scales = block + 4;
+    const uint8_t* qh = block + 16;
+    const uint8_t* qs = block + 48;
+    #pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+        int sc0 = 0, mn0 = 0, sc1 = 0, mn1 = 0;
+        gguf_get_scale_min_k4(scales, pair * 2, sc0, mn0);
+        gguf_get_scale_min_k4(scales, pair * 2 + 1, sc1, mn1);
+        const uint8_t q = qs[pair * 32 + lane];
+        const int high0 = (qh[lane] & (1 << (2 * pair))) ? 16 : 0;
+        const int high1 = (qh[lane] & (1 << (2 * pair + 1))) ? 16 : 0;
+        const float w0 = d * static_cast<float>(sc0) * static_cast<float>((q & 0x0F) + high0) - dmin * static_cast<float>(mn0);
+        const float w1 = d * static_cast<float>(sc1) * static_cast<float>((q >> 4) + high1) - dmin * static_cast<float>(mn1);
+        const int k0 = pair * 64 + lane;
+        const int k1 = pair * 64 + 32 + lane;
+        float local0 = valid_rows > 0 ? x_shared[k0] * w0 + x_shared[k1] * w1 : 0.0f;
+        float local1 = valid_rows > 1 ? x_shared[256 + k0] * w0 + x_shared[256 + k1] * w1 : 0.0f;
+        float local2 = valid_rows > 2 ? x_shared[512 + k0] * w0 + x_shared[512 + k1] * w1 : 0.0f;
+        float local3 = valid_rows > 3 ? x_shared[768 + k0] * w0 + x_shared[768 + k1] * w1 : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            local0 += __shfl_down_sync(0xffffffff, local0, offset);
+            local1 += __shfl_down_sync(0xffffffff, local1, offset);
+            local2 += __shfl_down_sync(0xffffffff, local2, offset);
+            local3 += __shfl_down_sync(0xffffffff, local3, offset);
+        }
+        if (lane == 0) {
+            acc[0] += local0;
+            if (valid_rows > 1) acc[1] += local1;
+            if (valid_rows > 2) acc[2] += local2;
+            if (valid_rows > 3) acc[3] += local3;
+        }
+    }
+}
+
 // Decode the shared f16 super-block scale of an IQ1_M block from the high
 // nibbles of its four uint16 scale words.  Mirrors gguf-py IQ1_M.dequantize.
 __device__ __forceinline__ float iq1m_super_scale(const uint16_t* sc) {
@@ -5823,61 +6023,8 @@ __global__ void gguf_quant_gemm_kernel(
         __syncthreads();
         if (out_col < n) {
             const uint8_t* block = weight_row + static_cast<size_t>(block_idx) * block_bytes;
-            if (type_id == 0) {
-                const float d = gguf_block_scale_f16(block);
-                const uint8_t* qs = block + 2;
-                for (int sub = 0; sub < 8; ++sub) {
-                    const uint8_t* chunk = qs + sub * 8;
-                    const uint32_t aux = static_cast<uint32_t>(chunk[4]) |
-                        (static_cast<uint32_t>(chunk[5]) << 8) |
-                        (static_cast<uint32_t>(chunk[6]) << 16) |
-                        (static_cast<uint32_t>(chunk[7]) << 24);
-                    const float scale = 0.125f * d * static_cast<float>(2 * (aux >> 28) + 1);
-                    for (int part = 0; part < 4; ++part) {
-                        const int grid_id = static_cast<int>(chunk[part]);
-                        const int sign_idx = static_cast<int>((aux >> (7 * part)) & 127);
-                        const int8_t* vals = signed_grid + ((grid_id * 128 + sign_idx) * 8);
-                        const int k_start = sub * 32 + part * 8;
-                        float local = 0.0f;
-                        if (lane < 8) {
-                            local = x_shared[k_start + lane] * static_cast<float>(vals[lane]) * scale;
-                            #pragma unroll
-                            for (int offset = 4; offset > 0; offset >>= 1) {
-                                local += __shfl_down_sync(0xff, local, offset);
-                            }
-                            if (lane == 0) acc += local;
-                        }
-                    }
-                }
-            } else if (type_id == 2) {
-                const float blk = iq1m_block_dot_256(x_shared, block, signed_grid, lane);
-                if (lane == 0) acc += blk;
-            } else {
-                const uint8_t* scales = block;
-                const uint8_t* qs = block + 16;
-                const float d = gguf_block_scale_f16(block + 80);
-                const float dmin = gguf_block_scale_f16(block + 82);
-                for (int group = 0; group < 16; ++group) {
-                    const int half_block = group / 8;
-                    const int group_in_half = group % 8;
-                    const int shift = (group_in_half / 2) * 2;
-                    const int byte_start = half_block * 32 + (group_in_half % 2) * 16;
-                    const float qscale = d * static_cast<float>(scales[group] & 0x0f);
-                    const float base = dmin * static_cast<float>(scales[group] >> 4);
-                    const int k_start = group * 16;
-                    float local = 0.0f;
-                    if (lane < 16) {
-                        const uint8_t q = static_cast<uint8_t>((qs[byte_start + lane] >> shift) & 0x03);
-                        const float xv = x_shared[k_start + lane];
-                        local = qscale * xv * static_cast<float>(q) - base * xv;
-                        #pragma unroll
-                        for (int offset = 8; offset > 0; offset >>= 1) {
-                            local += __shfl_down_sync(0xffff, local, offset);
-                        }
-                        if (lane == 0) acc += local;
-                    }
-                }
-            }
+            const float blk = gguf_quant_block_dot_256(x_shared, block, signed_grid, type_id, lane);
+            if (lane == 0) acc += blk;
         }
         __syncthreads();
     }
@@ -6016,6 +6163,12 @@ __device__ __forceinline__ float gguf_quant_block_dot_256(
     } else if (type_id == 2) {
         const float blk = iq1m_block_dot_256(x_shared, block, signed_grid, lane);
         if (lane == 0) acc += blk;
+    } else if (type_id == 3) {
+        const float blk = q4k_block_dot_256(x_shared, block, lane);
+        if (lane == 0) acc += blk;
+    } else if (type_id == 4) {
+        const float blk = q5k_block_dot_256(x_shared, block, lane);
+        if (lane == 0) acc += blk;
     } else {
         const uint8_t* scales = block;
         const uint8_t* qs = block + 16;
@@ -6091,6 +6244,10 @@ __device__ __forceinline__ void gguf_quant_block_dot_256_rows4(
         }
     } else if (type_id == 2) {
         iq1m_block_dot_256_rows4(x_shared, block, signed_grid, lane, valid_rows, acc);
+    } else if (type_id == 3) {
+        q4k_block_dot_256_rows4(x_shared, block, lane, valid_rows, acc);
+    } else if (type_id == 4) {
+        q5k_block_dot_256_rows4(x_shared, block, lane, valid_rows, acc);
     } else {
         const uint8_t* scales = block;
         const uint8_t* qs = block + 16;
@@ -7171,6 +7328,44 @@ __global__ void q8_0_gemm_kernel(
     }
 }
 
+template <typename out_t>
+__global__ void gguf_quant_embedding_kernel(
+    const int64_t* __restrict__ token_ids,
+    const uint8_t* __restrict__ blocks,
+    out_t* __restrict__ out,
+    int tokens,
+    int vocab,
+    int row_elems,
+    int blocks_per_row,
+    int block_bytes,
+    int type_id) {
+    const int token = blockIdx.x;
+    const int block_idx = blockIdx.y;
+    const int lane = threadIdx.x;
+    if (token >= tokens || block_idx >= blocks_per_row) return;
+
+    const int64_t token_id64 = token_ids[token];
+    if (token_id64 < 0 || token_id64 >= static_cast<int64_t>(vocab)) {
+        const int k = block_idx * 256 + lane;
+        if (k < row_elems) {
+            out[static_cast<int64_t>(token) * row_elems + k] = out_t(0.0f);
+        }
+        return;
+    }
+    const int token_id = static_cast<int>(token_id64);
+    const uint8_t* block = blocks + (static_cast<int64_t>(token_id) * blocks_per_row + block_idx) * block_bytes;
+    const int k = block_idx * 256 + lane;
+    if (k >= row_elems || lane >= 256) return;
+
+    float v = 0.0f;
+    if (type_id == 3) {
+        v = q4k_dequant_value(block, lane);
+    } else if (type_id == 4) {
+        v = q5k_dequant_value(block, lane);
+    }
+    out[static_cast<int64_t>(token) * row_elems + k] = out_t(v);
+}
+
 
 }  // namespace
 
@@ -7384,6 +7579,42 @@ torch::Tensor gguf_quant_gemm_pair_forward_cuda(
     auto out_shape = x.sizes().vec();
     out_shape.back() = n;
     return torch::stack({out0.view(out_shape), out1.view(out_shape)}, 0);
+}
+
+torch::Tensor gguf_quant_embedding_forward_cuda(
+    const torch::Tensor& token_ids,
+    const torch::Tensor& blocks,
+    int64_t row_elems,
+    int64_t type_id,
+    const torch::Tensor& signed_grid) {
+    (void)signed_grid;
+    c10::cuda::CUDAGuard device_guard(blocks.device());
+    auto token_ids_contig = token_ids.contiguous();
+    auto blocks_contig = blocks.contiguous();
+    const int tokens = static_cast<int>(token_ids_contig.numel());
+    const int vocab = static_cast<int>(blocks_contig.size(0));
+    const int k = static_cast<int>(row_elems);
+    const int blocks_per_row = static_cast<int>(blocks_contig.size(1));
+    const int block_bytes = static_cast<int>(blocks_contig.size(2));
+    auto out = torch::empty({tokens, k}, blocks.options().dtype(torch::kBFloat16));
+    if (tokens > 0) {
+        const dim3 grid(tokens, blocks_per_row);
+        const dim3 block(256);
+        gguf_quant_embedding_kernel<c10::BFloat16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            token_ids_contig.data_ptr<int64_t>(),
+            blocks_contig.data_ptr<uint8_t>(),
+            out.data_ptr<c10::BFloat16>(),
+            tokens,
+            vocab,
+            k,
+            blocks_per_row,
+            block_bytes,
+            static_cast<int>(type_id));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    auto out_shape = token_ids.sizes().vec();
+    out_shape.push_back(k);
+    return out.view(out_shape);
 }
 
 torch::Tensor gguf_moe_prefill_grouped_forward_cuda(

@@ -235,12 +235,17 @@ class MiniMaxM2Spec:
 
         t_load = time.perf_counter()
 
-        # Enable GGUF Q2 DP4A for MoE prefill acceleration (validated +35~55% on long prompts)
-        # MiniMax routed experts are ALL iq2_xxs (w1/w3/w2), so these gates directly accelerate
-        # the 66% MoE bottleneck. Short prompts may regress 1~2% due to quantization overhead.
-        # Can be disabled by setting env var to "0" before importing.
+        # Enable GGUF iq2_xxs/Q2 DP4A for MoE prefill acceleration.
+        # MiniMax routed experts are ALL iq2_xxs (w1/w3/w2), so these gates directly
+        # accelerate the MoE bottleneck. Measured on UD-IQ1_M TP4 (256-tok prefill):
+        #   - w13 DP4A: float 12.24 -> 24.46 TPS (+100%)
+        #   - w2  DP4A: 24.46 -> ~49 TPS (+100%), w2 kernel ~75ms -> ~10ms (8x)
+        # Combined ~4x over float baseline; token parity exact in both cases.
+        # Short prompts may regress slightly; disable via env var "0" before importing.
         if os.environ.get("DEEPSEEK_GGUF_IQ2_XXS_W13_DP4A") is None:
             os.environ["DEEPSEEK_GGUF_IQ2_XXS_W13_DP4A"] = "1"
+        if os.environ.get("DEEPSEEK_GGUF_IQ2_XXS_W2_DP4A") is None:
+            os.environ["DEEPSEEK_GGUF_IQ2_XXS_W2_DP4A"] = "1"
         if os.environ.get("DEEPSEEK_GGUF_Q2K_W2_DP4A") is None:
             os.environ["DEEPSEEK_GGUF_Q2K_W2_DP4A"] = "1"
 

@@ -6935,6 +6935,102 @@ __global__ void gguf_moe_w2_scatter_q2k_dp4a_kernel(
     }
 }
 
+// iq2_xxs w2 (ffn_down) DP4A scatter for prefill.  Mirrors the parity-validated
+// grid decode of gguf_moe_w13_iq2_xxs_dp4a_kernel (symmetric, no dmin term) and
+// the scatter output of gguf_moe_w2_scatter_q2k_dp4a_kernel.  Contraction is over
+// inter_dim; hidden activation must be Q8_1 quantized in 32-element groups (one
+// group per iq2_xxs sub-block), so hidden_groups == ceil(inter_dim/32).
+__global__ void gguf_moe_w2_scatter_iq2_xxs_dp4a_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ route_experts,
+    const uint8_t* __restrict__ w2_blocks,
+    const int8_t* __restrict__ signed_grid,
+    float* __restrict__ y,
+    int routes,
+    int dim,
+    int inter_dim,
+    int w2_blocks_per_row,
+    int hidden_groups) {
+    const int route = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int out_col = blockIdx.x * kGGUFQuantTileN + warp;
+    if (route >= routes || warp >= kGGUFQuantTileN) return;
+
+    const int64_t token = route_tokens[route];
+    const int expert = route_experts[route];
+    const int8_t* hidden_row = hidden_q + static_cast<int64_t>(route) * inter_dim;
+    const float* hs_row = hidden_scale + static_cast<int64_t>(route) * hidden_groups;
+    const uint8_t* w2_row = w2_blocks + (static_cast<int64_t>(expert) * dim + out_col) * w2_blocks_per_row * 66;
+
+    __shared__ int h_shared_q[64];
+    __shared__ float h_shared_scale[8];
+
+    float acc = 0.0f;
+
+    for (int block_idx = 0; block_idx < w2_blocks_per_row; ++block_idx) {
+        const int k_base = block_idx * 256;
+        const int tid = threadIdx.x;
+        if (tid < 64) {
+            const int byte_off = tid * 4;
+            int v = 0;
+            if (k_base + byte_off + 4 <= inter_dim) {
+                v = *reinterpret_cast<const int*>(hidden_row + k_base + byte_off);
+            }
+            h_shared_q[tid] = v;
+        }
+        if (tid < 8) {
+            const int sg_idx = block_idx * 8 + tid;
+            h_shared_scale[tid] = sg_idx < hidden_groups ? hs_row[sg_idx] : 0.0f;
+        }
+        __syncthreads();
+
+        if (out_col < dim) {
+            const int sub = lane >> 2;
+            const int part = lane & 3;
+            const uint8_t* w2_block = w2_row + static_cast<int64_t>(block_idx) * 66;
+            const uint8_t* chunk = w2_block + 2 + sub * 8;
+            const float d = gguf_block_scale_f16(w2_block);
+
+            const uint32_t aux = static_cast<uint32_t>(chunk[4]) |
+                (static_cast<uint32_t>(chunk[5]) << 8) |
+                (static_cast<uint32_t>(chunk[6]) << 16) |
+                (static_cast<uint32_t>(chunk[7]) << 24);
+
+            const int grid_id = chunk[part];
+            const int sign_idx = static_cast<int>((aux >> (7 * part)) & 127);
+            const float s = 0.125f * d * static_cast<float>(2 * (aux >> 28) + 1);
+
+            const int8_t* vals = signed_grid + (grid_id * 128 + sign_idx) * 8;
+            const int v_p0 = *reinterpret_cast<const int*>(vals);
+            const int v_p1 = *reinterpret_cast<const int*>(vals + 4);
+
+            const int hq_base = sub * 8 + part * 2;
+            const int h_p0 = h_shared_q[hq_base];
+            const int h_p1 = h_shared_q[hq_base + 1];
+
+            int sumi = __dp4a(v_p0, h_p0, 0);
+            sumi = __dp4a(v_p1, h_p1, sumi);
+
+            const float hs = h_shared_scale[sub];
+            float local = s * hs * static_cast<float>(sumi);
+
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                local += __shfl_down_sync(0xffffffff, local, offset);
+            }
+            if (lane == 0) acc += local;
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0 && out_col < dim) {
+        atomicAdd(y + token * dim + out_col, acc);
+    }
+}
+
 __global__ void gguf_moe_w2_scatter_q2k_dp4a_subwarp_kernel(
     const int8_t* __restrict__ hidden_q,
     const float* __restrict__ hidden_scale,
@@ -7790,11 +7886,57 @@ torch::Tensor gguf_moe_prefill_grouped_forward_cuda(
     }
 
     const dim3 w2_grid(ceil_div(dim, kGGUFQuantTileN), routes);
+    const bool use_iq2_xxs_w2_dp4a =
+        w2_type_id == 0 &&
+        w2_block_bytes == 66 &&
+        env_enabled_explicit("DEEPSEEK_GGUF_IQ2_XXS_W2_DP4A");
     const bool use_q2k_w2_dp4a =
         w2_type_id == 1 &&
         w2_block_bytes == 84 &&
         env_enabled_explicit("DEEPSEEK_GGUF_Q2K_W2_DP4A");
-    if (use_q2k_w2_dp4a) {
+    if (use_iq2_xxs_w2_dp4a) {
+        // iq2_xxs w2: hidden quantized in 32-element groups (one per iq2_xxs
+        // sub-block), matching the w13 activation quantizer.  Decode reuses the
+        // parity-validated grid lookup from gguf_moe_w13_iq2_xxs_dp4a_kernel.
+        const int hidden_groups = ceil_div(inter_dim, 32);
+        auto hidden = torch::empty({routes, inter_dim}, x.options().dtype(torch::kFloat32));
+        auto hidden_q = torch::empty({routes, inter_dim}, x.options().dtype(torch::kInt8));
+        auto hidden_scale = torch::empty({routes, hidden_groups}, x.options().dtype(torch::kFloat32));
+        const int hidden_threads = 256;
+        const int hidden_blocks = static_cast<int>((static_cast<int64_t>(routes) * inter_dim + hidden_threads - 1) / hidden_threads);
+        route_swiglu_cast_kernel<float><<<hidden_blocks, hidden_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            gate.data_ptr<float>(),
+            up.data_ptr<float>(),
+            route_weights_contig.data_ptr<float>(),
+            hidden.data_ptr<float>(),
+            routes,
+            inter_dim,
+            static_cast<float>(swiglu_limit));
+        const dim3 quant_grid(routes, hidden_groups);
+        gguf_q8_1_quantize_x_32_kernel<float><<<quant_grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
+            hidden.data_ptr<float>(),
+            hidden_q.data_ptr<int8_t>(),
+            hidden_scale.data_ptr<float>(),
+            routes,
+            inter_dim);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        if (emit_profile) {
+            check_cuda(cudaEventRecord(ev_hidden, at::cuda::getCurrentCUDAStream()), "record gguf prefill profile hidden event");
+        }
+        gguf_moe_w2_scatter_iq2_xxs_dp4a_kernel<<<w2_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            hidden_q.data_ptr<int8_t>(),
+            hidden_scale.data_ptr<float>(),
+            route_tokens_contig.data_ptr<int64_t>(),
+            route_experts.data_ptr<int32_t>(),
+            w2_contig.data_ptr<uint8_t>(),
+            grid_ptr,
+            y.data_ptr<float>(),
+            routes,
+            dim,
+            inter_dim,
+            w2_blocks_per_row,
+            hidden_groups);
+    } else if (use_q2k_w2_dp4a) {
         const int hidden_groups = ceil_div(inter_dim, 16);
         auto hidden_q = torch::empty({routes, inter_dim}, x.options().dtype(torch::kInt8));
         auto hidden_scale = torch::empty({routes, hidden_groups}, x.options().dtype(torch::kFloat32));
@@ -7926,7 +8068,7 @@ torch::Tensor gguf_moe_prefill_grouped_forward_cuda(
             dim,
             inter_dim,
             static_cast<int>(use_iq2_xxs_w13_dp4a),
-            static_cast<int>(use_q2k_w2_dp4a),
+            static_cast<int>(use_iq2_xxs_w2_dp4a || use_q2k_w2_dp4a),
             w13_ms,
             hidden_ms,
             w2_ms,
@@ -7969,8 +8111,10 @@ torch::Tensor gguf_moe_single_token_iq2_q2k_forward_cuda(
 
     const int w1_blocks_per_row = static_cast<int>(w1_contig.size(2));
     const int w2_blocks_per_row = static_cast<int>(w2_contig.size(2));
+    const int w2_block_bytes = static_cast<int>(w2_contig.size(3));
+    const bool w2_is_iq2_xxs = (w2_block_bytes == 66);
     const int x_groups = ceil_div(dim, 32);
-    const int hidden_groups = ceil_div(inter_dim, 16);
+    const int hidden_groups = w2_is_iq2_xxs ? ceil_div(inter_dim, 32) : ceil_div(inter_dim, 16);
 
     auto x_q = torch::empty({1, dim}, x.options().dtype(torch::kInt8));
     auto x_scale = torch::empty({1, x_groups}, x.options().dtype(torch::kFloat32));
@@ -8009,7 +8153,26 @@ torch::Tensor gguf_moe_single_token_iq2_q2k_forward_cuda(
     auto hidden_q = torch::empty({routes, inter_dim}, x.options().dtype(torch::kInt8));
     auto hidden_scale = torch::empty({routes, hidden_groups}, x.options().dtype(torch::kFloat32));
     const dim3 quant_h_grid(routes, hidden_groups);
-    if (env_enabled_explicit("DEEPSEEK_GGUF_Q2K_FUSED_SWIGLU_QUANT")) {
+    if (w2_is_iq2_xxs) {
+        // iq2_xxs w2: hidden quantized in 32-element groups (matches sub-block size).
+        auto hidden = torch::empty({routes, inter_dim}, x.options().dtype(torch::kFloat32));
+        const int hidden_threads = 256;
+        const int hidden_blocks = static_cast<int>((static_cast<int64_t>(routes) * inter_dim + hidden_threads - 1) / hidden_threads);
+        route_swiglu_cast_kernel<float><<<hidden_blocks, hidden_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            gate.data_ptr<float>(),
+            up.data_ptr<float>(),
+            route_weights_contig.data_ptr<float>(),
+            hidden.data_ptr<float>(),
+            routes,
+            inter_dim,
+            static_cast<float>(swiglu_limit));
+        gguf_q8_1_quantize_x_32_kernel<float><<<quant_h_grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
+            hidden.data_ptr<float>(),
+            hidden_q.data_ptr<int8_t>(),
+            hidden_scale.data_ptr<float>(),
+            routes,
+            inter_dim);
+    } else if (env_enabled_explicit("DEEPSEEK_GGUF_Q2K_FUSED_SWIGLU_QUANT")) {
         gguf_route_swiglu_quantize_hidden_16_kernel<<<quant_h_grid, 16, 0, at::cuda::getCurrentCUDAStream()>>>(
             gate.data_ptr<float>(),
             up.data_ptr<float>(),
@@ -8041,18 +8204,36 @@ torch::Tensor gguf_moe_single_token_iq2_q2k_forward_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     const dim3 w2_grid(ceil_div(dim, kGGUFQuantTileN), routes);
-    gguf_moe_single_w2_q2k_dp4a_kernel<<<w2_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        hidden_q.data_ptr<int8_t>(),
-        hidden_scale.data_ptr<float>(),
-        route_slots_contig.data_ptr<int64_t>(),
-        w2_contig.data_ptr<uint8_t>(),
-        y.data_ptr<float>(),
-        routes,
-        n_experts,
-        dim,
-        inter_dim,
-        w2_blocks_per_row,
-        hidden_groups);
+    if (w2_is_iq2_xxs) {
+        auto route_tokens = torch::zeros({routes}, route_slots_contig.options());
+        auto route_experts = route_slots_contig.to(torch::kInt32);
+        gguf_moe_w2_scatter_iq2_xxs_dp4a_kernel<<<w2_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            hidden_q.data_ptr<int8_t>(),
+            hidden_scale.data_ptr<float>(),
+            route_tokens.data_ptr<int64_t>(),
+            route_experts.data_ptr<int32_t>(),
+            w2_contig.data_ptr<uint8_t>(),
+            grid_contig.data_ptr<int8_t>(),
+            y.data_ptr<float>(),
+            routes,
+            dim,
+            inter_dim,
+            w2_blocks_per_row,
+            hidden_groups);
+    } else {
+        gguf_moe_single_w2_q2k_dp4a_kernel<<<w2_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            hidden_q.data_ptr<int8_t>(),
+            hidden_scale.data_ptr<float>(),
+            route_slots_contig.data_ptr<int64_t>(),
+            w2_contig.data_ptr<uint8_t>(),
+            y.data_ptr<float>(),
+            routes,
+            n_experts,
+            dim,
+            inter_dim,
+            w2_blocks_per_row,
+            hidden_groups);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }

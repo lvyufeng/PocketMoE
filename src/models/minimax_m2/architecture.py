@@ -230,36 +230,86 @@ class MiniMaxMoE:
         x_flat = x.reshape(-1, original_shape[-1]).contiguous()
         indices, weights = self.route(x_flat)
         layer = self.cache.layer(self.layer_id)
-        grouped = self._cuda.moe_group_routes(
-            indices,
-            weights,
-            int(self.cache.expert_start),
-            int(self.cache.expert_count),
-        )
-        _local_ids, route_tokens, route_weights, seg_starts = grouped
-        if int(route_tokens.numel()) == 0:
-            y = torch.zeros((x_flat.size(0), self.args.dim), device=x.device, dtype=torch.float32)
+
+        # Separate prefill (T>1) and decode (T=1) paths
+        num_tokens = x_flat.size(0)
+        if num_tokens == 1:
+            # Decode: single-token DP4A path (iq2_xxs w1/w3/w2)
+            # route_slots: [top_k] expert IDs for the single token
+            # route_weights: [top_k] normalized weights
+            route_slots = indices[0, :].contiguous()  # [top_k]
+            route_weights_1d = weights[0, :].contiguous()  # [top_k]
+
+            # Filter to local experts
+            expert_start = int(self.cache.expert_start)
+            expert_end = expert_start + int(self.cache.expert_count)
+            local_mask = (route_slots >= expert_start) & (route_slots < expert_end)
+            local_slots = route_slots[local_mask] - expert_start  # map to [0, expert_count)
+            local_weights = route_weights_1d[local_mask]
+
+            if local_slots.numel() == 0:
+                y = torch.zeros((1, self.args.dim), device=x.device, dtype=torch.float32)
+            else:
+                grid = self.cache._quant_grid(layer.w1.type_name)
+                y = self._cuda.gguf_moe_single_token_iq2_q2k_forward(
+                    x_flat,
+                    local_slots,
+                    local_weights,
+                    layer.w1.blocks,
+                    layer.w3.blocks,
+                    layer.w2.blocks,
+                    grid,
+                    0.0,
+                )
         else:
-            grid = self.cache._quant_grid(layer.w1.type_name)
-            y = self._cuda.gguf_moe_prefill_grouped_forward(
-                x_flat,
-                route_tokens,
-                route_weights,
-                seg_starts,
-                layer.w1.blocks,
-                layer.w3.blocks,
-                layer.w2.blocks,
-                int(layer.w1.in_dim),
-                int(layer.w1.type_id),
-                int(layer.w3.in_dim),
-                int(layer.w3.type_id),
-                int(layer.w2.in_dim),
-                int(layer.w2.type_id),
-                grid,
-                0.0,
+            # Prefill: grouped batched path
+            grouped = self._cuda.moe_group_routes(
+                indices,
+                weights,
+                int(self.cache.expert_start),
+                int(self.cache.expert_count),
             )
+            _local_ids, route_tokens, route_weights, seg_starts = grouped
+            if int(route_tokens.numel()) == 0:
+                y = torch.zeros((x_flat.size(0), self.args.dim), device=x.device, dtype=torch.float32)
+            else:
+                grid = self.cache._quant_grid(layer.w1.type_name)
+                y = self._cuda.gguf_moe_prefill_grouped_forward(
+                    x_flat,
+                    route_tokens,
+                    route_weights,
+                    seg_starts,
+                    layer.w1.blocks,
+                    layer.w3.blocks,
+                    layer.w2.blocks,
+                    int(layer.w1.in_dim),
+                    int(layer.w1.type_id),
+                    int(layer.w3.in_dim),
+                    int(layer.w3.type_id),
+                    int(layer.w2.in_dim),
+                    int(layer.w2.type_id),
+                    grid,
+                    0.0,
+                )
+
         if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(y)
+            # Decode (T=1) all_reduce is latency-bound on a tiny [1, dim] message
+            # (e.g. 12 KB for fp32). Down-casting the reduce to bf16/fp16 halves the
+            # payload and shaves latency off the 62 per-token collectives. Prefill
+            # keeps fp32 for numerical fidelity across many tokens.
+            reduce_dtype = torch.float32
+            if num_tokens == 1:
+                gate = os.environ.get("MINIMAX_M2_DECODE_REDUCE_DTYPE", "").strip().lower()
+                if gate in {"bf16", "bfloat16"}:
+                    reduce_dtype = torch.bfloat16
+                elif gate in {"fp16", "float16", "half"}:
+                    reduce_dtype = torch.float16
+            if reduce_dtype != torch.float32:
+                y = y.to(reduce_dtype)
+                dist.all_reduce(y)
+                y = y.to(torch.float32)
+            else:
+                dist.all_reduce(y)
         return y.reshape(original_shape).to(self.dtype)
 
 

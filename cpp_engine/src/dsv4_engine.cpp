@@ -1,6 +1,7 @@
 #include "dsv4_engine.hpp"
 
 #include "cuda_ops.hpp"
+#include "flashmemory_ops.hpp"
 #include "cmd_channel.hpp"
 #include "persistent_engine.hpp"
 #include "safetensors_reader.hpp"
@@ -137,6 +138,50 @@ struct FlashMemoryDeviceWeights {
     }
 };
 
+struct FlashMemoryRuntimeState {
+    bool enabled = false;
+    int src_layer = -1;
+    int source_ratio = 0;
+    int source_compressed_cap = 0;
+    bool ensemble_use_max = true;
+    int n_heads = 128;
+    int head_dim = 128;
+    int q_lora_rank = 2048;
+    int hidden_dim = 4096;
+    int rope_dim = 64;
+    float rms_eps = 1e-6f;
+    int n_fm_layers = 0;
+    int max_chunks = 0;
+    int global_keep_capacity = 0;
+    int global_keep = 0;
+    int global_available = 0;
+    const FlashMemoryDeviceWeights* weights = nullptr;
+    float* d_inv_freqs = nullptr;
+    float* d_q_scratch = nullptr;
+    float* d_qlora_scratch = nullptr;
+    float* d_fused_w = nullptr;
+    float* d_layer_scores = nullptr;
+    float* d_ensemble_scores = nullptr;
+    int* d_global_topk = nullptr;
+    float* d_global_topk_scores = nullptr;
+
+    ~FlashMemoryRuntimeState() { release(); }
+
+    void release() {
+        cudaFree(d_inv_freqs); d_inv_freqs = nullptr;
+        cudaFree(d_q_scratch); d_q_scratch = nullptr;
+        cudaFree(d_qlora_scratch); d_qlora_scratch = nullptr;
+        cudaFree(d_fused_w); d_fused_w = nullptr;
+        cudaFree(d_layer_scores); d_layer_scores = nullptr;
+        cudaFree(d_ensemble_scores); d_ensemble_scores = nullptr;
+        cudaFree(d_global_topk); d_global_topk = nullptr;
+        cudaFree(d_global_topk_scores); d_global_topk_scores = nullptr;
+        enabled = false;
+        weights = nullptr;
+        global_keep = 0;
+        global_available = 0;
+    }
+};
 
 FlashMemoryPluginMetadata inspect_flashmemory_checkpoint_metadata(const std::string& ckpt_path) {
     SafeTensorsShard shard(ckpt_path);
@@ -4178,6 +4223,7 @@ struct GgufLayerDeviceWeights {
     const GgufCompressorDeviceWeights* compressor = nullptr;
     const GgufIndexerDeviceWeights* indexer = nullptr;
     GgufSparseLayerState* sparse_state = nullptr;
+    const FlashMemoryRuntimeState* fm_runtime = nullptr;
     GgufKvSwapLayerState* kv_swap = nullptr;
     cudaStream_t kv_swap_stream = nullptr;
     cudaEvent_t kv_swap_stage_event = nullptr;
@@ -4389,6 +4435,7 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
     if (!rmsnorm_bf16_gamma_cuda(s.d_q_a, w.d_q_gamma, s.d_q_normed, d.q_a_dim, 1e-6f))
         throw std::runtime_error("q_norm failed");
     if (use_sparse_attention && w.indexer != nullptr && w.indexer->present &&
+        (w.fm_runtime == nullptr || !w.fm_runtime->enabled) &&
         s.d_index_q != nullptr) {
         const int index_q_dim = w.indexer->heads * w.indexer->head_dim;
         if (!bf16_matvec_cuda(s.d_q_normed, w.indexer->wq_b, s.d_index_q,
@@ -4442,20 +4489,34 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
                 w.sparse_state->indexer_kv_cache != nullptr && s.d_index_scores != nullptr &&
                 s.d_index_q != nullptr && w.index_topk > 0) {
                 const int available = std::min(compressed_ready, compressed_cap);
-                const int keep = std::min(available, w.index_topk);
-                if (!indexer_select_topk_cuda(s.d_index_q,
-                                              w.sparse_state->indexer_kv_cache,
-                                              w.indexer->weights_proj,
-                                              s.d_x,
-                                              s.d_index_scores,
-                                              s.d_kv_indices + window_len,
-                                              available,
-                                              keep,
-                                              w.indexer->heads,
-                                              w.indexer->head_dim,
-                                              d.dim,
-                                              window))
-                    throw std::runtime_error("GGUF sparse indexer topk failed");
+                int keep = std::min(available, w.index_topk);
+                if (w.fm_runtime != nullptr && w.fm_runtime->enabled) {
+                    if (available < w.fm_runtime->global_available) {
+                        throw std::runtime_error("FlashMemory global selection has more chunks than this layer has ready");
+                    }
+                    keep = std::min(available, w.fm_runtime->global_keep);
+                    if (keep > 0) {
+                        if (!flashmemory_write_global_indices_cuda(w.fm_runtime->d_global_topk,
+                                                                   keep,
+                                                                   window,
+                                                                   s.d_kv_indices + window_len))
+                            throw std::runtime_error("FlashMemory write global indices failed");
+                    }
+                } else {
+                    if (!indexer_select_topk_cuda(s.d_index_q,
+                                                  w.sparse_state->indexer_kv_cache,
+                                                  w.indexer->weights_proj,
+                                                  s.d_x,
+                                                  s.d_index_scores,
+                                                  s.d_kv_indices + window_len,
+                                                  available,
+                                                  keep,
+                                                  w.indexer->heads,
+                                                  w.indexer->head_dim,
+                                                  d.dim,
+                                                  window))
+                        throw std::runtime_error("GGUF sparse indexer topk failed");
+                }
                 extra_count = keep;
             } else {
                 if (w.kv_swap != nullptr && w.kv_swap->enabled) {
@@ -6916,6 +6977,10 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     const int gguf_flashmemory_metadata_only = env_int_or_default("DSV4_GGUF_FLASHMEMORY_METADATA_ONLY", 1);
     const int gguf_flashmemory_load_device = env_int_or_default("DSV4_GGUF_FLASHMEMORY_LOAD_DEVICE", 0);
     const int gguf_flashmemory_mock_smoke = env_int_or_default("DSV4_GGUF_FLASHMEMORY_MOCK_SCORER_SMOKE", 0);
+    const int gguf_flashmemory_runtime_scoring = env_int_or_default("DSV4_GGUF_FLASHMEMORY_RUNTIME_SCORING", 0);
+    const int gguf_flashmemory_src_layer = env_int_or_default("DSV4_GGUF_FLASHMEMORY_SRC_LAYER", -1);
+    const char* gguf_flashmemory_ensemble_env = std::getenv("DSV4_GGUF_FLASHMEMORY_ENSEMBLE");
+    const std::string gguf_flashmemory_ensemble = gguf_flashmemory_ensemble_env == nullptr ? std::string("max") : std::string(gguf_flashmemory_ensemble_env);
     const char* gguf_flashmemory_ckpt_env = std::getenv("DSV4_GGUF_FLASHMEMORY_CKPT");
     const std::string gguf_flashmemory_ckpt = gguf_flashmemory_ckpt_env == nullptr ? std::string() : std::string(gguf_flashmemory_ckpt_env);
     if (gguf_flashmemory_plugin && gguf_flashmemory_metadata_only != 0 && gguf_flashmemory_metadata_only != 1)
@@ -6924,12 +6989,24 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         throw std::runtime_error("DSV4_GGUF_FLASHMEMORY_LOAD_DEVICE must be 0 or 1");
     if (gguf_flashmemory_plugin && gguf_flashmemory_mock_smoke != 0 && gguf_flashmemory_mock_smoke != 1)
         throw std::runtime_error("DSV4_GGUF_FLASHMEMORY_MOCK_SCORER_SMOKE must be 0 or 1");
+    if (gguf_flashmemory_plugin && gguf_flashmemory_runtime_scoring != 0 && gguf_flashmemory_runtime_scoring != 1)
+        throw std::runtime_error("DSV4_GGUF_FLASHMEMORY_RUNTIME_SCORING must be 0 or 1");
+    if (gguf_flashmemory_plugin && gguf_flashmemory_src_layer < -1)
+        throw std::runtime_error("DSV4_GGUF_FLASHMEMORY_SRC_LAYER must be -1 or a non-negative layer id");
+    if (gguf_flashmemory_plugin && gguf_flashmemory_ensemble != "max" && gguf_flashmemory_ensemble != "mean")
+        throw std::runtime_error("DSV4_GGUF_FLASHMEMORY_ENSEMBLE must be 'max' or 'mean'");
     if (gguf_flashmemory_plugin && gguf_flashmemory_ckpt.empty())
         throw std::runtime_error("DSV4_GGUF_FLASHMEMORY_PLUGIN requires DSV4_GGUF_FLASHMEMORY_CKPT=/path/flashmemory_ds_v4.safetensors");
     if (gguf_flashmemory_plugin && gguf_flashmemory_mock_smoke && !gguf_flashmemory_load_device)
         throw std::runtime_error("DSV4_GGUF_FLASHMEMORY_MOCK_SCORER_SMOKE requires DSV4_GGUF_FLASHMEMORY_LOAD_DEVICE=1");
-    if (gguf_flashmemory_plugin && gguf_flashmemory_metadata_only == 0)
-        throw std::runtime_error("FlashMemory retriever runtime scoring is not wired yet; keep DSV4_GGUF_FLASHMEMORY_METADATA_ONLY=1 for the isolated paper-reproduction plugin path");
+    if (gguf_flashmemory_plugin && gguf_flashmemory_runtime_scoring && !gguf_flashmemory_load_device)
+        throw std::runtime_error("DSV4_GGUF_FLASHMEMORY_RUNTIME_SCORING requires DSV4_GGUF_FLASHMEMORY_LOAD_DEVICE=1");
+    if (gguf_flashmemory_plugin && gguf_flashmemory_runtime_scoring && !gguf_sparse_compressor)
+        throw std::runtime_error("DSV4_GGUF_FLASHMEMORY_RUNTIME_SCORING requires DSV4_GGUF_SPARSE_COMPRESSOR=1");
+    if (gguf_flashmemory_plugin && gguf_flashmemory_runtime_scoring && !gguf_sparse_indexer)
+        throw std::runtime_error("DSV4_GGUF_FLASHMEMORY_RUNTIME_SCORING requires DSV4_GGUF_SPARSE_INDEXER=1");
+    if (gguf_flashmemory_plugin && gguf_flashmemory_metadata_only == 0 && !gguf_flashmemory_runtime_scoring)
+        throw std::runtime_error("FlashMemory retriever runtime scoring requires DSV4_GGUF_FLASHMEMORY_RUNTIME_SCORING=1; otherwise keep DSV4_GGUF_FLASHMEMORY_METADATA_ONLY=1");
     if (gguf_kv_swap_requested && !gguf_sparse_compressor)
         throw std::runtime_error("DSV4_GGUF_KV_SWAP requires DSV4_GGUF_SPARSE_COMPRESSOR=1");
     if (gguf_kv_swap_requested && gguf_kv_swap_pinned_mib <= 0)
@@ -6990,7 +7067,9 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 std::cout << " mock_probed_ptrs=" << flashmemory_probed
                           << " mock_probe_checksum=" << flashmemory_device_weights->device_probe_checksum;
             }
-            std::cout << " runtime_scoring=0"
+            std::cout << " runtime_scoring=" << gguf_flashmemory_runtime_scoring
+                      << " ensemble=" << gguf_flashmemory_ensemble
+                      << " src_layer=" << gguf_flashmemory_src_layer
                       << "\n";
         }
     }
@@ -7465,6 +7544,94 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             }
         }
     }
+
+    FlashMemoryRuntimeState fm_runtime;
+    if (gguf_flashmemory_plugin && gguf_flashmemory_runtime_scoring) {
+        if (!flashmemory_device_weights || !flashmemory_device_weights->loaded || flashmemory_device_weights->layers.empty())
+            throw std::runtime_error("FlashMemory runtime scoring requires loaded device weights");
+        if (full_index_topk <= 0)
+            throw std::runtime_error("FlashMemory runtime scoring requires non-zero index_topk in model config");
+        int src_layer = gguf_flashmemory_src_layer;
+        auto valid_src_layer = [&](int L) {
+            return L >= 0 && L < n_layers && d_indexer_w[L].present && d_indexer_w[L].comp.present &&
+                   d_sparse_state[L].indexer_kv_cache != nullptr && layer_compressed_cap[L] > 0;
+        };
+        if (src_layer < 0) {
+            for (int L = 0; L < n_layers; ++L) {
+                if (valid_src_layer(L)) { src_layer = L; break; }
+            }
+        }
+        if (!valid_src_layer(src_layer)) {
+            std::ostringstream oss;
+            oss << "FlashMemory runtime scoring source layer invalid or missing indexer cache: src_layer=" << src_layer;
+            throw std::runtime_error(oss.str());
+        }
+        if (d_indexer_w[src_layer].head_dim != 128) {
+            std::ostringstream oss;
+            oss << "FlashMemory runtime scoring requires indexer head_dim=128, got " << d_indexer_w[src_layer].head_dim;
+            throw std::runtime_error(oss.str());
+        }
+        if (dim != 4096) {
+            std::ostringstream oss;
+            oss << "FlashMemory runtime scoring requires hidden_dim=4096, got " << dim;
+            throw std::runtime_error(oss.str());
+        }
+        for (const auto& lw : flashmemory_device_weights->layers) {
+            if (lw.wq_a_dtype != SafeDType::F32 || lw.wq_b_dtype != SafeDType::F32 ||
+                lw.q_norm_dtype != SafeDType::F32 || lw.weights_proj_dtype != SafeDType::F32) {
+                throw std::runtime_error("FlashMemory runtime scoring currently requires fp32 retriever weights");
+            }
+        }
+        fm_runtime.enabled = true;
+        fm_runtime.src_layer = src_layer;
+        fm_runtime.source_ratio = d_indexer_w[src_layer].comp.ratio;
+        fm_runtime.source_compressed_cap = layer_compressed_cap[src_layer];
+        fm_runtime.ensemble_use_max = (gguf_flashmemory_ensemble == "max");
+        fm_runtime.n_heads = 128;
+        fm_runtime.head_dim = 128;
+        fm_runtime.q_lora_rank = 2048;
+        fm_runtime.hidden_dim = 4096;
+        fm_runtime.rope_dim = 64;
+        fm_runtime.rms_eps = 1e-6f;
+        fm_runtime.n_fm_layers = static_cast<int>(flashmemory_device_weights->layers.size());
+        fm_runtime.max_chunks = std::max(1, max_sparse_compressed_cap);
+        fm_runtime.global_keep_capacity = std::min(full_index_topk, fm_runtime.max_chunks);
+        fm_runtime.global_keep = 0;
+        fm_runtime.weights = flashmemory_device_weights.get();
+
+        std::vector<float> fm_inv_freqs = flashmemory_yarn_inv_freqs(
+            fm_runtime.rope_dim, 160000.0, 16.0, 65536, 32.0, 1.0);
+        check_cuda(cudaMalloc(&fm_runtime.d_inv_freqs, fm_inv_freqs.size() * sizeof(float)),
+                   "alloc FlashMemory inv freqs");
+        check_cuda(cudaMemcpy(fm_runtime.d_inv_freqs, fm_inv_freqs.data(), fm_inv_freqs.size() * sizeof(float), cudaMemcpyHostToDevice),
+                   "copy FlashMemory inv freqs");
+        check_cuda(cudaMalloc(&fm_runtime.d_q_scratch, static_cast<size_t>(fm_runtime.n_heads) * fm_runtime.head_dim * sizeof(float)),
+                   "alloc FlashMemory q scratch");
+        check_cuda(cudaMalloc(&fm_runtime.d_qlora_scratch, static_cast<size_t>(fm_runtime.q_lora_rank) * sizeof(float)),
+                   "alloc FlashMemory qlora scratch");
+        check_cuda(cudaMalloc(&fm_runtime.d_fused_w, static_cast<size_t>(fm_runtime.n_heads) * sizeof(float)),
+                   "alloc FlashMemory fused_w scratch");
+        check_cuda(cudaMalloc(&fm_runtime.d_layer_scores, static_cast<size_t>(fm_runtime.n_fm_layers) * fm_runtime.max_chunks * sizeof(float)),
+                   "alloc FlashMemory layer scores");
+        check_cuda(cudaMalloc(&fm_runtime.d_ensemble_scores, static_cast<size_t>(fm_runtime.max_chunks) * sizeof(float)),
+                   "alloc FlashMemory ensemble scores");
+        check_cuda(cudaMalloc(&fm_runtime.d_global_topk, static_cast<size_t>(fm_runtime.global_keep_capacity) * sizeof(int)),
+                   "alloc FlashMemory global topk");
+        check_cuda(cudaMalloc(&fm_runtime.d_global_topk_scores, static_cast<size_t>(fm_runtime.global_keep_capacity) * sizeof(float)),
+                   "alloc FlashMemory global topk scores");
+        if (tp_rank == 0) {
+            std::cout << "gguf_flashmemory_runtime_scoring=1 src_layer=" << fm_runtime.src_layer
+                      << " source_ratio=" << fm_runtime.source_ratio
+                      << " source_cap=" << fm_runtime.source_compressed_cap
+                      << " ensemble=" << (fm_runtime.ensemble_use_max ? "max" : "mean")
+                      << " fm_layers=" << fm_runtime.n_fm_layers
+                      << " global_keep_cap=" << fm_runtime.global_keep_capacity
+                      << " max_chunks=" << fm_runtime.max_chunks
+                      << "\n";
+        }
+    }
+    if (gguf_mem_profile) gguf_log_mem("after_flashmemory_runtime", tp_rank);
+
     uint64_t kv_cache_elems = 0;
     for (int cap : layer_cache_capacity) {
         kv_cache_elems += static_cast<uint64_t>(cap) * static_cast<uint64_t>(kv_dim);
@@ -7808,6 +7975,57 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 prof_indexed_attn_indices += gguf_kv_index_count;
             }
         }
+        if (fm_runtime.enabled) {
+            const int fm_available = std::max(0, std::min(
+                position / std::max(1, fm_runtime.source_ratio), fm_runtime.source_compressed_cap));
+            const int fm_keep = std::min(fm_runtime.global_keep_capacity, fm_available);
+            fm_runtime.global_available = fm_available;
+            fm_runtime.global_keep = fm_keep;
+            if (fm_keep > 0) {
+                const float* d_float_keys = d_sparse_state[fm_runtime.src_layer].indexer_kv_cache;
+                if (d_float_keys == nullptr) throw std::runtime_error("FlashMemory runtime source indexer_kv_cache is null");
+                for (int i = 0; i < fm_runtime.n_fm_layers; ++i) {
+                    const auto& fw = fm_runtime.weights->layers[static_cast<size_t>(i)];
+                    float* d_scores_i = fm_runtime.d_layer_scores + static_cast<size_t>(i) * fm_runtime.max_chunks;
+                    if (!flashmemory_score_layer_floatk_cuda(
+                            d_x,
+                            static_cast<const float*>(fw.wq_a),
+                            static_cast<const float*>(fw.wq_b),
+                            static_cast<const float*>(fw.q_norm_weight),
+                            static_cast<const float*>(fw.weights_proj),
+                            fm_runtime.d_inv_freqs,
+                            d_float_keys,
+                            fm_runtime.d_q_scratch,
+                            fm_runtime.d_qlora_scratch,
+                            fm_runtime.d_fused_w,
+                            d_scores_i,
+                            fm_available,
+                            fm_runtime.n_heads,
+                            fm_runtime.head_dim,
+                            fm_runtime.q_lora_rank,
+                            fm_runtime.hidden_dim,
+                            fm_runtime.rope_dim,
+                            fm_runtime.rms_eps,
+                            position,
+                            /*apply_sigmoid=*/true)) {
+                        throw std::runtime_error("FlashMemory float-key scorer failed");
+                    }
+                }
+                if (!flashmemory_ensemble_cuda(fm_runtime.d_layer_scores,
+                                               fm_runtime.n_fm_layers,
+                                               fm_available,
+                                               fm_runtime.max_chunks,
+                                               fm_runtime.ensemble_use_max,
+                                               fm_runtime.d_ensemble_scores))
+                    throw std::runtime_error("FlashMemory ensemble failed");
+                if (!flashmemory_topk_cuda(fm_runtime.d_ensemble_scores,
+                                           fm_available,
+                                           fm_keep,
+                                           fm_runtime.d_global_topk,
+                                           fm_runtime.d_global_topk_scores))
+                    throw std::runtime_error("FlashMemory global topk failed");
+            }
+        }
         for (int L = 0; L < n_layers; ++L) {
             auto t_layer_start = sync_now();
             const bool is_hash = (L < n_hash);
@@ -7839,6 +8057,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             lw.compressor = layer_sparse_enabled ? &d_compressor_w[L] : nullptr;
             lw.indexer = (layer_sparse_enabled && d_indexer_w[L].present) ? &d_indexer_w[L] : nullptr;
             lw.sparse_state = (layer_sparse_enabled && d_sparse_state[L].compressor_kv != nullptr) ? &d_sparse_state[L] : nullptr;
+            lw.fm_runtime = (layer_sparse_enabled && fm_runtime.enabled) ? &fm_runtime : nullptr;
             lw.kv_swap = (layer_sparse_enabled && d_kv_swap_state[L].enabled) ? &d_kv_swap_state[L] : nullptr;
             lw.kv_swap_stream = (lw.kv_swap != nullptr && gguf_kv_swap_async_h2d) ? gguf_kv_swap_copy_stream : nullptr;
             lw.kv_swap_stage_event = (lw.kv_swap != nullptr && gguf_kv_swap_async_h2d) ? gguf_kv_swap_stage_event : nullptr;
@@ -8620,6 +8839,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         cudaFree(const_cast<float*>(idx.comp.ape));
         cudaFree(const_cast<uint16_t*>(idx.comp.norm));
     }
+    fm_runtime.release();
     for (auto& st : d_sparse_state) {
         cudaFree(st.compressor_kv);
         cudaFree(st.compressor_score);

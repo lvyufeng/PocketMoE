@@ -57,6 +57,10 @@ __device__ float fp8_e4m3_to_float_device(uint8_t b) {
     return sign ? -value : value;
 }
 
+bool valid_hadamard_dim(int dim) {
+    return dim > 0 && dim <= 1024 && (dim & (dim - 1)) == 0;
+}
+
 // Normalized Walsh-Hadamard transform in shared memory over HEAD_DIM (power of 2).
 // vec has HEAD_DIM entries; tid in [0, HEAD_DIM).
 __device__ void hadamard_inplace_device(float* vec, int tid, int dim) {
@@ -181,6 +185,135 @@ __global__ void flashmemory_score_chunks_kernel(
     }
 }
 
+// Per-chunk scoring for pre-dequantized float keys. This is used when the GGUF
+// engine reuses its native indexer_kv_cache as FlashMemory K^IComp: the keys are
+// already 128-dim, Hadamard-rotated, and fp4-fake-quantized but stored as float.
+// One block per chunk; the score math is identical to the fp8 path above.
+__global__ void flashmemory_score_float_keys_kernel(
+    const float* q,            // [n_heads, head_dim]
+    const float* fused_w,      // [n_heads]
+    const float* keys,         // [n_chunks, head_dim]
+    float* scores,             // [n_chunks]
+    int n_chunks,
+    int n_heads,
+    int head_dim,
+    bool apply_sigmoid) {
+    const int chunk = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (chunk >= n_chunks) return;
+
+    extern __shared__ float smem[];
+    float* k = smem;                  // [head_dim]
+    float* reduce = smem + head_dim;  // [blockDim.x]
+
+    const float* row = keys + static_cast<size_t>(chunk) * head_dim;
+    for (int d = tid; d < head_dim; d += blockDim.x) k[d] = row[d];
+    __syncthreads();
+
+    float local = 0.0f;
+    for (int h = tid; h < n_heads; h += blockDim.x) {
+        const float* qh = q + static_cast<size_t>(h) * head_dim;
+        float dot = 0.0f;
+        #pragma unroll 4
+        for (int d = 0; d < head_dim; ++d) dot += qh[d] * k[d];
+        local += fmaxf(dot, 0.0f) * fused_w[h];
+    }
+    reduce[tid] = local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        const float logit = reduce[0];
+        scores[chunk] = apply_sigmoid ? (1.0f / (1.0f + expf(-logit))) : logit;
+    }
+}
+
+__global__ void flashmemory_ensemble_kernel(
+    const float* layer_scores,  // [n_layers, score_stride]
+    float* out,                 // [n_chunks]
+    int n_layers,
+    int n_chunks,
+    int score_stride,
+    bool use_max) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_chunks) return;
+    if (use_max) {
+        float best = -INFINITY;
+        for (int l = 0; l < n_layers; ++l) {
+            const float v = layer_scores[static_cast<size_t>(l) * score_stride + i];
+            best = fmaxf(best, v);
+        }
+        out[i] = best;
+    } else {
+        float sum = 0.0f;
+        for (int l = 0; l < n_layers; ++l) sum += layer_scores[static_cast<size_t>(l) * score_stride + i];
+        out[i] = sum / static_cast<float>(n_layers);
+    }
+}
+
+__global__ void flashmemory_topk_kernel(
+    const float* scores,
+    int n_chunks,
+    int keep,
+    int* out_indices,
+    float* out_scores) {
+    const int tid = threadIdx.x;
+    extern __shared__ char smem_raw[];
+    float* best_vals = reinterpret_cast<float*>(smem_raw);
+    int* best_idxs = reinterpret_cast<int*>(best_vals + blockDim.x);
+
+    for (int k = 0; k < keep; ++k) {
+        float local_best = -INFINITY;
+        int local_idx = n_chunks;
+        for (int i = tid; i < n_chunks; i += blockDim.x) {
+            bool already_selected = false;
+            for (int prev = 0; prev < k; ++prev) {
+                if (out_indices[prev] == i) {
+                    already_selected = true;
+                    break;
+                }
+            }
+            if (already_selected) continue;
+            const float v = scores[i];
+            if (v > local_best || (v == local_best && i < local_idx)) {
+                local_best = v;
+                local_idx = i;
+            }
+        }
+        best_vals[tid] = local_best;
+        best_idxs[tid] = local_idx;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                const float other_v = best_vals[tid + stride];
+                const int other_i = best_idxs[tid + stride];
+                if (other_v > best_vals[tid] || (other_v == best_vals[tid] && other_i < best_idxs[tid])) {
+                    best_vals[tid] = other_v;
+                    best_idxs[tid] = other_i;
+                }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const int idx = best_idxs[0] < 0 ? 0 : best_idxs[0];
+            out_indices[k] = idx;
+            if (out_scores != nullptr) out_scores[k] = best_vals[0];
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void flashmemory_write_global_indices_kernel(
+    const int* logical,
+    int keep,
+    int offset,
+    int* out_indices) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < keep) out_indices[i] = offset + logical[i];
+}
+
 // hidden [hidden_dim] @ W [out_dim, hidden_dim]^T -> y [out_dim]. One block per
 // output row, blockDim threads reduce over hidden_dim. fp32.
 __global__ void flashmemory_matvec_kernel(
@@ -264,7 +397,7 @@ bool flashmemory_score_layer_cuda(
         d_weights_proj == nullptr || d_inv_freqs == nullptr || d_compressed_k == nullptr ||
         d_q_scratch == nullptr || d_qlora_scratch == nullptr || d_fused_w == nullptr || d_scores == nullptr)
         return false;
-    if (n_chunks <= 0 || n_heads <= 0 || head_dim <= 0 || q_lora_rank <= 0 || hidden_dim <= 0 ||
+    if (n_chunks <= 0 || n_heads <= 0 || !valid_hadamard_dim(head_dim) || q_lora_rank <= 0 || hidden_dim <= 0 ||
         rope_dim <= 0 || rope_dim > head_dim || (rope_dim % 2) != 0)
         return false;
     auto cs = reinterpret_cast<cudaStream_t>(stream);
@@ -295,6 +428,112 @@ bool flashmemory_score_layer_cuda(
     flashmemory_score_chunks_kernel<<<n_chunks, score_threads, score_smem, cs>>>(
         d_q_scratch, d_fused_w, d_compressed_k, d_scores, n_chunks, n_heads, head_dim, apply_sigmoid);
 
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool flashmemory_score_layer_floatk_cuda(
+    const float* d_hidden,
+    const float* d_wq_a,
+    const float* d_wq_b,
+    const float* d_q_norm,
+    const float* d_weights_proj,
+    const float* d_inv_freqs,
+    const float* d_float_keys,
+    float* d_q_scratch,
+    float* d_qlora_scratch,
+    float* d_fused_w,
+    float* d_scores,
+    int n_chunks,
+    int n_heads,
+    int head_dim,
+    int q_lora_rank,
+    int hidden_dim,
+    int rope_dim,
+    float rms_norm_eps,
+    long long position,
+    bool apply_sigmoid,
+    void* stream) {
+    if (d_hidden == nullptr || d_wq_a == nullptr || d_wq_b == nullptr || d_q_norm == nullptr ||
+        d_weights_proj == nullptr || d_inv_freqs == nullptr || d_float_keys == nullptr ||
+        d_q_scratch == nullptr || d_qlora_scratch == nullptr || d_fused_w == nullptr || d_scores == nullptr)
+        return false;
+    if (n_chunks <= 0 || n_heads <= 0 || !valid_hadamard_dim(head_dim) || q_lora_rank <= 0 || hidden_dim <= 0 ||
+        rope_dim <= 0 || rope_dim > head_dim || (rope_dim % 2) != 0)
+        return false;
+    auto cs = reinterpret_cast<cudaStream_t>(stream);
+    const int q_out = n_heads * head_dim;
+
+    // q_lora = wq_a @ hidden  -> [q_lora_rank]
+    flashmemory_matvec_kernel<<<q_lora_rank, 256, 256 * sizeof(float), cs>>>(
+        d_hidden, d_wq_a, d_qlora_scratch, q_lora_rank, hidden_dim);
+    // RMSNorm(q_lora, q_norm)
+    flashmemory_rmsnorm_kernel<<<1, 256, 256 * sizeof(float), cs>>>(
+        d_qlora_scratch, d_q_norm, q_lora_rank, rms_norm_eps);
+    // q = wq_b @ q_lora -> [n_heads*head_dim]
+    flashmemory_matvec_kernel<<<q_out, 256, 256 * sizeof(float), cs>>>(
+        d_qlora_scratch, d_wq_b, d_q_scratch, q_out, q_lora_rank);
+    // RoPE (bf16) + Hadamard per head
+    flashmemory_rope_hadamard_kernel<<<n_heads, head_dim, head_dim * sizeof(float), cs>>>(
+        d_q_scratch, d_inv_freqs, n_heads, head_dim, rope_dim, position);
+
+    // fused_w = (weights_proj @ hidden) * weight_scale
+    flashmemory_matvec_kernel<<<n_heads, 256, 256 * sizeof(float), cs>>>(
+        d_hidden, d_weights_proj, d_fused_w, n_heads, hidden_dim);
+    const float weight_scale = rsqrtf(static_cast<float>(head_dim)) * rsqrtf(static_cast<float>(n_heads));
+    flashmemory_scale_kernel<<<(n_heads + 255) / 256, 256, 0, cs>>>(d_fused_w, weight_scale, n_heads);
+
+    // Per-chunk scores against pre-dequantized float keys.
+    const int score_threads = 128;
+    const size_t score_smem = (static_cast<size_t>(head_dim) + score_threads) * sizeof(float);
+    flashmemory_score_float_keys_kernel<<<n_chunks, score_threads, score_smem, cs>>>(
+        d_q_scratch, d_fused_w, d_float_keys, d_scores, n_chunks, n_heads, head_dim, apply_sigmoid);
+
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool flashmemory_ensemble_cuda(
+    const float* d_layer_scores,
+    int n_layers,
+    int n_chunks,
+    int score_stride,
+    bool use_max,
+    float* d_ensemble_scores,
+    void* stream) {
+    if (d_layer_scores == nullptr || d_ensemble_scores == nullptr) return false;
+    if (n_layers <= 0 || n_chunks <= 0 || score_stride < n_chunks) return false;
+    auto cs = reinterpret_cast<cudaStream_t>(stream);
+    flashmemory_ensemble_kernel<<<(n_chunks + 255) / 256, 256, 0, cs>>>(
+        d_layer_scores, d_ensemble_scores, n_layers, n_chunks, score_stride, use_max);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool flashmemory_topk_cuda(
+    const float* d_scores,
+    int n_chunks,
+    int keep,
+    int* d_out_indices,
+    float* d_out_scores,
+    void* stream) {
+    if (d_scores == nullptr || d_out_indices == nullptr) return false;
+    if (n_chunks <= 0 || keep <= 0 || keep > n_chunks) return false;
+    auto cs = reinterpret_cast<cudaStream_t>(stream);
+    flashmemory_topk_kernel<<<1, 256, 256 * (sizeof(float) + sizeof(int)), cs>>>(
+        d_scores, n_chunks, keep, d_out_indices, d_out_scores);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool flashmemory_write_global_indices_cuda(
+    const int* d_logical,
+    int keep,
+    int offset,
+    int* d_out_indices,
+    void* stream) {
+    if (d_logical == nullptr || d_out_indices == nullptr) return false;
+    if (keep < 0 || offset < 0) return false;
+    if (keep == 0) return true;
+    auto cs = reinterpret_cast<cudaStream_t>(stream);
+    flashmemory_write_global_indices_kernel<<<(keep + 255) / 256, 256, 0, cs>>>(
+        d_logical, keep, offset, d_out_indices);
     return cudaGetLastError() == cudaSuccess;
 }
 
